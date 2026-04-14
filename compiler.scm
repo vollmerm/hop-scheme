@@ -1,6 +1,6 @@
-;;; Scheme Compiler - Initial Passes (Corrected)
+;;; Scheme Compiler - Initial Pass Pipeline
 ;;; Supports: arithmetic, booleans, conditionals, boxes, lambda, letrec
-;;; Passes: uniquify -> letrec-desugar -> closure-conversion -> TAC CFG
+;;; Passes: uniquify -> letrec-desugar -> closure-conversion -> TAC -> CFG
 
 (import (scheme base)
         (scheme write))
@@ -64,8 +64,284 @@
       `(let (,(car bindings))
          ,(nest-let-bindings (cdr bindings) body-exprs))))
 
+;;; ============================================================================
+;;; Pass 2: Letrec Desugaring
+;;; Rewrites lambda-only letrec groups into explicit initialization, while
+;;; preserving direct tail recursion as internal loop markers.
+;;; ============================================================================
+
 (define (desugar-letrec expr)
-  (define (rewrite expr env)
+  (define (all-same-arity? bindings)
+    (or (null? bindings)
+        (let ((arity (length (cadr (cadar bindings)))))
+          (all (lambda (binding)
+                 (= (length (cadr (cadr binding))) arity))
+               bindings))))
+
+  (define (tail-recursion-safe? expr group-names tail?)
+    (cond
+      ((symbol? expr)
+       (not (memq expr group-names)))
+      
+      ((or (number? expr) (boolean? expr)) #t)
+      
+      ((pair? expr)
+       (case (car expr)
+         ((begin)
+          (let loop ((rest (cdr expr)))
+            (cond
+              ((null? rest) #t)
+              ((null? (cdr rest))
+               (tail-recursion-safe? (car rest) group-names tail?))
+              (else
+               (and (tail-recursion-safe? (car rest) group-names #f)
+                    (loop (cdr rest)))))))
+         
+         ((primop)
+          (all (lambda (e) (tail-recursion-safe? e group-names #f))
+               (cddr expr)))
+         
+         ((if)
+          (and (tail-recursion-safe? (cadr expr) group-names #f)
+               (tail-recursion-safe? (caddr expr) group-names tail?)
+               (tail-recursion-safe? (cadddr expr) group-names tail?)))
+         
+         ((let)
+          (and (tail-recursion-safe? (cadr (caadr expr)) group-names #f)
+               (let loop ((rest (cddr expr)))
+                 (cond
+                   ((null? rest) #t)
+                   ((null? (cdr rest))
+                    (tail-recursion-safe? (car rest) group-names tail?))
+                   (else
+                    (and (tail-recursion-safe? (car rest) group-names #f)
+                         (loop (cdr rest))))))))
+         
+         ((lambda)
+          (tail-recursion-safe? (body->expr (cddr expr)) group-names #f))
+         
+         ((letrec)
+          (and (all (lambda (binding)
+                      (tail-recursion-safe? (cadr binding) group-names #f))
+                    (cadr expr))
+               (tail-recursion-safe? (body->expr (cddr expr)) group-names tail?)))
+         
+         ((app)
+          (let ((rator (cadr expr))
+                (args (cddr expr)))
+            (if (and (symbol? rator) (memq rator group-names))
+                (and tail?
+                     (all (lambda (arg)
+                            (tail-recursion-safe? arg group-names #f))
+                          args))
+                (and (tail-recursion-safe? rator group-names #f)
+                     (all (lambda (arg)
+                            (tail-recursion-safe? arg group-names #f))
+                          args)))))
+         
+         ((box unbox)
+          (tail-recursion-safe? (cadr expr) group-names #f))
+         
+         ((set-box!)
+          (and (tail-recursion-safe? (cadr expr) group-names #f)
+               (tail-recursion-safe? (caddr expr) group-names #f)))
+         
+         (else #f)))
+      
+      (else #f)))
+
+  (define (free-vars-outside-group expr bound group-names)
+    (define (collect expr bound)
+      (cond
+        ((symbol? expr)
+         (if (or (memq expr bound) (memq expr group-names))
+             '()
+             (list expr)))
+        
+        ((or (number? expr) (boolean? expr)) '())
+        
+        ((pair? expr)
+         (case (car expr)
+           ((begin)
+            (append-map (lambda (e) (collect e bound)) (cdr expr)))
+           
+           ((primop)
+            (append-map (lambda (e) (collect e bound)) (cddr expr)))
+           
+           ((if)
+            (append (collect (cadr expr) bound)
+                    (collect (caddr expr) bound)
+                    (collect (cadddr expr) bound)))
+           
+           ((let)
+            (let* ((binding (caadr expr))
+                   (var (car binding))
+                   (val (cadr binding))
+                   (body (body->expr (cddr expr))))
+              (append (collect val bound)
+                      (collect body (cons var bound)))))
+           
+           ((lambda)
+            (collect (body->expr (cddr expr))
+                     (append (cadr expr) bound)))
+           
+           ((letrec)
+            (let* ((bindings (cadr expr))
+                   (names (map car bindings))
+                   (new-bound (append names bound)))
+              (append (append-map (lambda (binding)
+                                    (collect (cadr binding) new-bound))
+                                  bindings)
+                      (append-map (lambda (body-expr)
+                                    (collect body-expr new-bound))
+                                  (cddr expr)))))
+           
+           ((app)
+            (append-map (lambda (e) (collect e bound)) (cdr expr)))
+           
+           ((box unbox)
+            (collect (cadr expr) bound))
+           
+           ((set-box!)
+            (append (collect (cadr expr) bound)
+                    (collect (caddr expr) bound)))
+           
+           (else '())))
+        
+        (else '())))
+    
+    (dedupe-symbols (collect expr bound)))
+
+  (define (tail-call-targets expr group-names tail?)
+    (cond
+      ((or (symbol? expr) (number? expr) (boolean? expr)) '())
+      
+      ((pair? expr)
+       (case (car expr)
+         ((begin)
+          (let loop ((rest (cdr expr)))
+            (cond
+              ((null? rest) '())
+              ((null? (cdr rest))
+               (tail-call-targets (car rest) group-names tail?))
+              (else
+               (append (tail-call-targets (car rest) group-names #f)
+                       (loop (cdr rest)))))))
+         
+         ((primop)
+          (append-map (lambda (e) (tail-call-targets e group-names #f))
+                      (cddr expr)))
+         
+         ((if)
+          (append (tail-call-targets (cadr expr) group-names #f)
+                  (tail-call-targets (caddr expr) group-names tail?)
+                  (tail-call-targets (cadddr expr) group-names tail?)))
+         
+         ((let)
+          (append (tail-call-targets (cadr (caadr expr)) group-names #f)
+                  (let loop ((rest (cddr expr)))
+                    (cond
+                      ((null? rest) '())
+                      ((null? (cdr rest))
+                       (tail-call-targets (car rest) group-names tail?))
+                      (else
+                       (append (tail-call-targets (car rest) group-names #f)
+                               (loop (cdr rest))))))))
+         
+         ((lambda)
+          (tail-call-targets (body->expr (cddr expr)) group-names #f))
+         
+         ((letrec)
+          (append (append-map (lambda (binding)
+                                (tail-call-targets (cadr binding) group-names #f))
+                              (cadr expr))
+                  (append-map (lambda (body-expr)
+                                (tail-call-targets body-expr group-names tail?))
+                              (cddr expr))))
+         
+         ((app)
+          (let ((rator (cadr expr))
+                (args (cddr expr)))
+            (append (if (and tail? (symbol? rator) (memq rator group-names))
+                        (list rator)
+                        (tail-call-targets rator group-names #f))
+                    (append-map (lambda (arg)
+                                  (tail-call-targets arg group-names #f))
+                                args))))
+         
+         ((box unbox)
+          (tail-call-targets (cadr expr) group-names #f))
+         
+         ((set-box!)
+          (append (tail-call-targets (cadr expr) group-names #f)
+                  (tail-call-targets (caddr expr) group-names #f)))
+         
+         (else '())))
+      
+      (else '())))
+
+  (define (mutually-tail-recursive? bindings)
+    (let* ((group-names (map car bindings))
+           (graph
+            (map (lambda (binding)
+                   (let* ((lambda-expr (cadr binding))
+                          (body (body->expr (cddr lambda-expr))))
+                     (list (car binding)
+                           (dedupe-symbols
+                            (tail-call-targets body group-names #t)))))
+                 bindings)))
+      (define (neighbors name)
+        (let ((entry (assoc name graph)))
+          (if entry (cadr entry) '())))
+      (define (reachable? start target visited)
+        (cond
+          ((eq? start target) #t)
+          ((memq start visited) #f)
+          (else
+           (let loop ((rest (neighbors start)))
+             (cond
+               ((null? rest) #f)
+               ((reachable? (car rest) target (cons start visited)) #t)
+               (else (loop (cdr rest))))))))
+      (and (all (lambda (name)
+                  (not (null? (neighbors name))))
+                group-names)
+           (all (lambda (name)
+                  (all (lambda (other)
+                         (reachable? name other '()))
+                       group-names))
+                group-names))))
+
+  (define (eligible-mutual-tail-group? bindings)
+    (let ((group-names (map car bindings)))
+      (and (> (length bindings) 1)
+           (all-same-arity? bindings)
+           (mutually-tail-recursive? bindings)
+           (all (lambda (binding)
+                  (let* ((lambda-expr (cadr binding))
+                         (params (cadr lambda-expr))
+                         (body (body->expr (cddr lambda-expr))))
+                    (and (tail-recursion-safe? body group-names #t)
+                         (null? (free-vars-outside-group body params group-names)))))
+                bindings))))
+
+  (define (rewrite-sequence exprs env current-group tail?)
+    (let loop ((rest exprs) (result '()))
+      (cond
+        ((null? rest) (reverse result))
+        ((null? (cdr rest))
+         (reverse (cons (rewrite (car rest) env current-group tail?) result)))
+        (else
+         (loop (cdr rest)
+               (cons (rewrite (car rest) env current-group #f) result))))))
+
+  (define (rewrite-lambda expr env current-group)
+    (let* ((params (cadr expr))
+           (body-env (remove-shadowed-bindings env params))
+           (body-exprs (rewrite-sequence (cddr expr) body-env current-group #t)))
+      `(lambda ,params ,@body-exprs)))
+
+  (define (rewrite expr env current-group tail?)
     (cond
       ((symbol? expr)
        (let ((binding (assoc expr env)))
@@ -78,82 +354,92 @@
       ((pair? expr)
        (case (car expr)
          ((begin)
-          `(begin ,@(map (lambda (e) (rewrite e env)) (cdr expr))))
+          `(begin ,@(rewrite-sequence (cdr expr) env current-group tail?)))
          
          ((primop)
           `(primop ,(cadr expr)
-                   ,@(map (lambda (e) (rewrite e env)) (cddr expr))))
+                   ,@(map (lambda (e) (rewrite e env current-group #f)) (cddr expr))))
          
          ((if)
-          `(if ,(rewrite (cadr expr) env)
-               ,(rewrite (caddr expr) env)
-               ,(rewrite (cadddr expr) env)))
+          `(if ,(rewrite (cadr expr) env current-group #f)
+               ,(rewrite (caddr expr) env current-group tail?)
+               ,(rewrite (cadddr expr) env current-group tail?)))
          
          ((let)
           (let* ((binding (caadr expr))
                  (var (car binding))
-                 (val-expr (rewrite (cadr binding) env))
+                 (val-expr (rewrite (cadr binding) env current-group #f))
                  (body-env (remove-shadowed-bindings env (list var)))
-                 (body-exprs (map (lambda (body-expr)
-                                    (rewrite body-expr body-env))
-                                  (cddr expr))))
+                 (body-exprs (rewrite-sequence (cddr expr) body-env current-group tail?)))
             `(let ((,var ,val-expr)) ,@body-exprs)))
          
          ((lambda)
-          (let* ((params (cadr expr))
-                 (body-env (remove-shadowed-bindings env params))
-                 (body-exprs (map (lambda (body-expr)
-                                    (rewrite body-expr body-env))
-                                  (cddr expr))))
-            `(lambda ,params ,@body-exprs)))
+          (rewrite-lambda expr env #f))
          
-          ((letrec)
-           (let* ((bindings (cadr expr))
-                  (names (map car bindings)))
-             (if (not (all (lambda (binding)
+         ((letrec)
+          (let* ((bindings (cadr expr))
+                 (names (map car bindings))
+                 (group-eligible? (eligible-mutual-tail-group? bindings)))
+            (if (not (all (lambda (binding)
                             (and (single-binding? binding)
-                                  (lambda-expr? (cadr binding))))
+                                 (lambda-expr? (cadr binding))))
                           bindings))
-                 (error "letrec requires lambda bindings" expr)
+                (error "letrec requires lambda bindings" expr)
                 (let* ((base-env (remove-shadowed-bindings env names))
                        (rec-env (append (map (lambda (name) (list name name)) names)
                                         base-env))
-                        (box-bindings
-                         (map (lambda (name) (list name '(box #f))) names))
-                        (init-exprs
-                         (map (lambda (binding)
-                                `(set-box! ,(car binding)
-                                          ,(rewrite (cadr binding) rec-env)))
+                       (box-bindings
+                        (map (lambda (name) (list name '(box #f))) names))
+                       (init-exprs
+                        (map (lambda (binding)
+                               `(set-box! ,(car binding)
+                                          ,(rewrite-lambda (cadr binding)
+                                                           rec-env
+                                                           (if group-eligible?
+                                                               names
+                                                               (list (car binding))))))
                              bindings))
                        (body-exprs
                         (append init-exprs
-                                (map (lambda (body-expr)
-                                       (rewrite body-expr rec-env))
-                                     (cddr expr)))))
+                                (rewrite-sequence (cddr expr)
+                                                  rec-env
+                                                  current-group
+                                                  tail?))))
                   (nest-let-bindings box-bindings body-exprs)))))
          
          ((app)
-          `(app ,(rewrite (cadr expr) env)
-                ,@(map (lambda (e) (rewrite e env)) (cddr expr))))
+          (let ((rator (cadr expr))
+                (args (cddr expr)))
+            (if (and tail?
+                     current-group
+                     (symbol? rator)
+                     (memq rator current-group))
+                (if (> (length current-group) 1)
+                    `(group-tail-call ,rator
+                                      ,@(map (lambda (e) (rewrite e env current-group #f)) args))
+                    `(self-tail-call
+                      ,@(map (lambda (e) (rewrite e env current-group #f)) args)))
+                `(app ,(rewrite rator env current-group #f)
+                      ,@(map (lambda (e) (rewrite e env current-group #f)) args)))))
          
          ((box)
-          `(box ,(rewrite (cadr expr) env)))
+          `(box ,(rewrite (cadr expr) env current-group #f)))
          
          ((unbox)
-          `(unbox ,(rewrite (cadr expr) env)))
+          `(unbox ,(rewrite (cadr expr) env current-group #f)))
          
          ((set-box!)
           (let ((target (cadr expr)))
             (when (and (symbol? target) (assoc target env))
               (error "Cannot mutate letrec function binding" target))
-            `(set-box! ,(rewrite target env)
-                       ,(rewrite (caddr expr) env))))
+            `(set-box! ,(rewrite target env current-group #f)
+                       ,(rewrite (caddr expr) env current-group #f))))
          
          (else (error "Unknown expression type in letrec desugaring" (car expr)))))
       
       (else (error "Invalid expression in letrec desugaring" expr))))
   
-  (rewrite expr '()))
+  (rewrite expr '() #f #t))
 
 ;;; ============================================================================
 ;;; Pass 1: Uniquify
@@ -265,7 +551,7 @@
   (uniquify-expr expr '()))
 
 ;;; ============================================================================
-;;; Pass 2: Closure Conversion
+;;; Pass 3: Closure Conversion
 ;;; ============================================================================
 
 (define (free-vars expr bound)
@@ -303,11 +589,17 @@
                  (body (body->expr (cddr expr))))
             (collect body (append params bound))))
          
-         ((app)
-          (append-map (lambda (e) (collect e bound)) (cdr expr)))
-         
-         ((box unbox)
-          (collect (cadr expr) bound))
+          ((app)
+           (append-map (lambda (e) (collect e bound)) (cdr expr)))
+
+          ((self-tail-call)
+           (append-map (lambda (e) (collect e bound)) (cdr expr)))
+
+          ((group-tail-call)
+           (append-map (lambda (e) (collect e bound)) (cddr expr)))
+           
+           ((box unbox)
+            (collect (cadr expr) bound))
          
          ((set-box!)
           (append (collect (cadr expr) bound)
@@ -393,14 +685,23 @@
                              fv)))  ; Global/primitive
                      fvs))))
          
-         ((app)
-          (let ((rator (cadr expr))
-                (rands (cddr expr)))
-            `(closure-call ,(convert rator env)
-                           ,@(map (lambda (e) (convert e env)) rands))))
-         
-         ((box)
-          `(box ,(convert (cadr expr) env)))
+          ((app)
+           (let ((rator (cadr expr))
+                 (rands (cddr expr)))
+             `(closure-call ,(convert rator env)
+                            ,@(map (lambda (e) (convert e env)) rands))))
+
+           ((self-tail-call)
+            `(self-tail-call
+              ,@(map (lambda (e) (convert e env)) (cdr expr))))
+
+           ((group-tail-call)
+            `(group-tail-call
+              ,(cadr expr)
+              ,@(map (lambda (e) (convert e env)) (cddr expr))))
+           
+           ((box)
+            `(box ,(convert (cadr expr) env)))
          
          ((unbox)
           `(unbox ,(convert (cadr expr) env)))
@@ -416,7 +717,7 @@
   (convert expr '()))
 
 ;;; ============================================================================
-;;; Pass 3: Convert to Three-Address Code (TAC)
+;;; Pass 4: Convert to Three-Address Code (TAC)
 ;;; ============================================================================
 
 (define-record-type <procedure>
@@ -473,8 +774,225 @@
               closure-var
               arg-vars
               (append closure-procedures arg-procedures))))
-  
-  (define (convert-tail expr)
+
+  (define (local-name expr)
+    (and (pair? expr)
+         (eq? (car expr) 'local)
+         (pair? (cdr expr))
+         (symbol? (cadr expr))
+         (cadr expr)))
+
+  (define (match-cluster-init expr)
+    (and (pair? expr)
+         (eq? (car expr) 'set-box!)
+         (let ((name (local-name (cadr expr)))
+               (value (caddr expr)))
+           (and name
+                (pair? value)
+                (eq? (car value) 'make-closure)
+                (pair? (cdr value))
+                (null? (cddr value))
+                 (let ((lambda-expr (cadr value)))
+                   (and (pair? lambda-expr)
+                        (eq? (car lambda-expr) 'lambda)
+                        (list name
+                              (cadr lambda-expr)
+                              (body->expr (cddr lambda-expr)))))))))
+
+  (define (cluster-body-compatible? expr names)
+    (cond
+      ((or (symbol? expr) (number? expr) (boolean? expr)) #t)
+      ((pair? expr)
+       (case (car expr)
+         ((begin)
+          (all (lambda (e) (cluster-body-compatible? e names)) (cdr expr)))
+         ((primop)
+          (all (lambda (e) (cluster-body-compatible? e names)) (cddr expr)))
+         ((if)
+          (and (cluster-body-compatible? (cadr expr) names)
+               (cluster-body-compatible? (caddr expr) names)
+               (cluster-body-compatible? (cadddr expr) names)))
+         ((let)
+          (and (cluster-body-compatible? (cadr (caadr expr)) names)
+               (all (lambda (e) (cluster-body-compatible? e names))
+                    (cddr expr))))
+         ((lambda)
+          (cluster-body-compatible? (body->expr (cddr expr)) names))
+         ((group-tail-call)
+          (and (symbol? (cadr expr))
+               (memq (cadr expr) names)
+               (all (lambda (e) (cluster-body-compatible? e names))
+                    (cddr expr))))
+         ((self-tail-call) #f)
+         ((app closure-call set-box!)
+          (all (lambda (e) (cluster-body-compatible? e names)) (cdr expr)))
+         ((box unbox)
+          (cluster-body-compatible? (cadr expr) names))
+         ((local closure) #t)
+         (else #f)))
+      (else #f)))
+
+  (define (collect-group-tail-targets expr)
+    (cond
+      ((or (symbol? expr) (number? expr) (boolean? expr)) '())
+      ((pair? expr)
+       (case (car expr)
+         ((group-tail-call)
+          (cons (cadr expr)
+                (append-map collect-group-tail-targets (cddr expr))))
+         ((begin app closure-call set-box!)
+          (append-map collect-group-tail-targets (cdr expr)))
+         ((primop)
+          (append-map collect-group-tail-targets (cddr expr)))
+         ((if)
+          (append (collect-group-tail-targets (cadr expr))
+                  (collect-group-tail-targets (caddr expr))
+                  (collect-group-tail-targets (cadddr expr))))
+         ((let)
+          (append (collect-group-tail-targets (cadr (caadr expr)))
+                  (append-map collect-group-tail-targets (cddr expr))))
+         ((lambda)
+          (collect-group-tail-targets (body->expr (cddr expr))))
+         ((box unbox)
+          (collect-group-tail-targets (cadr expr)))
+         (else '())))
+      (else '())))
+
+  (define (all-same-member-arity? members)
+    (or (null? members)
+        (let ((arity (length (cadr (car members)))))
+          (all (lambda (member)
+                 (= (length (cadr member)) arity))
+               members))))
+
+  (define (has-cross-group-tail-call? members names)
+    (let loop ((rest members))
+      (cond
+        ((null? rest) #f)
+        (else
+         (let ((name (car (car rest)))
+               (targets (collect-group-tail-targets (caddr (car rest)))))
+           (if (let inner ((remaining-targets targets))
+                 (cond
+                   ((null? remaining-targets) #f)
+                   ((and (memq (car remaining-targets) names)
+                         (not (eq? (car remaining-targets) name)))
+                    #t)
+                   (else
+                    (inner (cdr remaining-targets)))))
+               #t
+               (loop (cdr rest))))))))
+
+  (define (extract-cluster-prefix exprs)
+    (define (finish members rest)
+      (let ((names (map car members)))
+        (if (and (> (length members) 1)
+                 (all-same-member-arity? members)
+                 (all (lambda (member)
+                        (cluster-body-compatible? (caddr member) names))
+                      members)
+                 (has-cross-group-tail-call? members names))
+            (cons members rest)
+            #f)))
+    (let loop ((rest exprs) (members '()))
+      (cond
+        ((null? rest) (finish members '()))
+        (else
+         (let ((member (match-cluster-init (car rest))))
+           (if member
+               (loop (cdr rest) (append members (list member)))
+               (finish members rest)))))))
+
+  (define (build-dispatch-instructions entry-tag dispatch-label member-labels)
+    (let loop ((rest member-labels)
+               (index 0)
+               (current-label dispatch-label)
+               (instrs '()))
+      (if (null? (cdr rest))
+          (append instrs
+                  (list `(label ,current-label)
+                        `(goto ,(car rest))))
+          (let ((next-label (fresh-temp))
+                (cmp-var (fresh-temp)))
+            (loop (cdr rest)
+                  (+ index 1)
+                  next-label
+                  (append instrs
+                          (list `(label ,current-label)
+                                `(assign ,cmp-var (primop = ,entry-tag ,index))
+                                `(if ,cmp-var ,(car rest) ,next-label))))))))
+
+  (define (convert-cluster-prefix exprs)
+    (let ((cluster (extract-cluster-prefix exprs)))
+      (if (not cluster)
+          (values '() '() exprs)
+          (let* ((members (car cluster))
+                 (remaining-exprs (cdr cluster))
+                 (cluster-proc (fresh-proc))
+                 (shared-params (map (lambda (ignored) (fresh-temp))
+                                     (cadr (car members))))
+                 (entry-tag (fresh-temp))
+                 (dispatch-label
+                  (string->symbol
+                   (string-append "dispatch." (symbol->string cluster-proc))))
+                 (member-labels
+                  (map (lambda (member)
+                         (string->symbol
+                          (string-append "entry."
+                                         (symbol->string (car member)))))
+                       members))
+                 (group-context
+                  (map (lambda (member label)
+                         (list (car member) label))
+                       members
+                       member-labels))
+                 (init-instrs
+                  (let loop ((rest members) (index 0) (instrs '()))
+                    (if (null? rest)
+                        instrs
+                        (let ((closure-temp (fresh-temp))
+                              (box-name (car (car rest))))
+                          (loop (cdr rest)
+                                (+ index 1)
+                                (append instrs
+                                        (list `(assign ,closure-temp
+                                                       (make-closure ,cluster-proc ,index))
+                                              `(set-box! ,box-name ,closure-temp)))))))))
+            (let loop ((rest members)
+                       (labels member-labels)
+                       (instrs (build-dispatch-instructions entry-tag
+                                                           dispatch-label
+                                                           member-labels))
+                       (procedures '()))
+              (if (null? rest)
+                  (values init-instrs
+                          (append procedures
+                                  (list (make-procedure cluster-proc
+                                                        (cons entry-tag shared-params)
+                                                        instrs)))
+                          remaining-exprs)
+                  (let* ((member (car rest))
+                         (params (cadr member))
+                         (body (caddr member))
+                         (entry-label (car labels)))
+                    (let-values (((body-instrs body-procedures)
+                                  (convert-tail body
+                                                params
+                                                entry-label
+                                                group-context
+                                                shared-params)))
+                      (loop (cdr rest)
+                            (cdr labels)
+                            (append instrs
+                                    (list `(label ,entry-label))
+                                    (map (lambda (param shared)
+                                           `(assign ,param ,shared))
+                                         params
+                                         shared-params)
+                                    body-instrs)
+                            (append procedures body-procedures))))))))))
+
+  (define (convert-tail expr current-params current-entry-label group-context shared-params)
     (cond
       ((simple? expr)
        (values (list `(return ,(simple-value expr))) '()))
@@ -483,23 +1001,29 @@
        (case (car expr)
          ((begin)
           (let ((body-exprs (cdr expr)))
-            (let loop ((rest body-exprs)
-                       (instrs '())
-                       (procedures '()))
-              (cond
-                ((null? rest)
-                 (error "begin requires at least one expression"))
-                ((null? (cdr rest))
-                 (let-values (((tail-instrs tail-procedures)
-                               (convert-tail (car rest))))
-                   (values (append instrs tail-instrs)
-                           (append procedures tail-procedures))))
-                (else
-                 (let-values (((new-instrs ignored-result new-procedures)
-                               (convert-value (car rest) #f)))
-                   (loop (cdr rest)
-                         (append instrs new-instrs)
-                         (append procedures new-procedures))))))))
+            (let-values (((cluster-instrs cluster-procedures remaining-exprs)
+                          (convert-cluster-prefix body-exprs)))
+              (let loop ((rest remaining-exprs)
+                         (instrs cluster-instrs)
+                         (procedures cluster-procedures))
+                (cond
+                  ((null? rest)
+                   (error "begin requires at least one expression"))
+                  ((null? (cdr rest))
+                   (let-values (((tail-instrs tail-procedures)
+                                 (convert-tail (car rest)
+                                               current-params
+                                               current-entry-label
+                                               group-context
+                                               shared-params)))
+                     (values (append instrs tail-instrs)
+                             (append procedures tail-procedures))))
+                  (else
+                   (let-values (((new-instrs ignored-result new-procedures)
+                                 (convert-value (car rest) #f)))
+                     (loop (cdr rest)
+                           (append instrs new-instrs)
+                           (append procedures new-procedures)))))))))
          
          ((if)
           (let* ((then-label (fresh-temp))
@@ -507,9 +1031,17 @@
             (let-values (((test-instrs test-var test-procedures)
                           (convert-value (cadr expr) #f))
                          ((then-instrs then-procedures)
-                          (convert-tail (caddr expr)))
+                          (convert-tail (caddr expr)
+                                        current-params
+                                        current-entry-label
+                                        group-context
+                                        shared-params))
                          ((else-instrs else-procedures)
-                          (convert-tail (cadddr expr))))
+                          (convert-tail (cadddr expr)
+                                        current-params
+                                        current-entry-label
+                                        group-context
+                                        shared-params)))
               (values
                (append test-instrs
                        (list `(if ,test-var ,then-label ,else-label))
@@ -529,11 +1061,51 @@
             (let-values (((val-instrs val-result val-procedures)
                           (convert-value val #f))
                          ((body-instrs body-procedures)
-                          (convert-tail body)))
+                          (convert-tail body
+                                        current-params
+                                        current-entry-label
+                                        group-context
+                                        shared-params)))
               (values (append val-instrs
                               (list `(assign ,var ,val-result))
                               body-instrs)
                       (append val-procedures body-procedures)))))
+         
+         ((self-tail-call)
+          (if (not current-entry-label)
+              (error "self-tail-call outside of procedure" expr)
+              (let ((args (cdr expr)))
+                (when (not (= (length args) (length current-params)))
+                  (error "Arity mismatch in self-tail-call" expr))
+                (let-values (((arg-instrs arg-vars arg-procedures)
+                              (convert-list args)))
+                  (values (append arg-instrs
+                                  (map (lambda (param arg)
+                                         `(assign ,param ,arg))
+                                       current-params
+                                       arg-vars)
+                                  (list `(goto ,current-entry-label)))
+                          arg-procedures)))))
+         
+         ((group-tail-call)
+          (if (or (not group-context) (not shared-params))
+              (error "group-tail-call outside of cluster" expr)
+              (let* ((target (cadr expr))
+                     (args (cddr expr))
+                     (entry (assoc target group-context)))
+                (when (not entry)
+                  (error "Unknown group-tail-call target" target))
+                (when (not (= (length args) (length shared-params)))
+                  (error "Arity mismatch in group-tail-call" expr))
+                (let-values (((arg-instrs arg-vars arg-procedures)
+                              (convert-list args)))
+                  (values (append arg-instrs
+                                  (map (lambda (shared arg)
+                                         `(assign ,shared ,arg))
+                                       shared-params
+                                       arg-vars)
+                                  (list `(goto ,(cadr entry))))
+                          arg-procedures)))))
          
          ((closure-call)
           (let ((closure-expr (cadr expr))
@@ -550,12 +1122,12 @@
             (values (append instrs (list `(return ,result-var)))
                     procedures)))))
       
-      (else (error "Invalid expression in tail position" expr))))
+      (else
+       (error "Invalid expression in tail position" expr))))
   
   (define (convert-value expr dest)
     ;; dest: optional destination variable
     ;; Returns: (values instructions result-var procedures)
-    
     (cond
       ((simple? expr)
        (let ((value (simple-value expr)))
@@ -567,161 +1139,169 @@
       
       ((pair? expr)
        (case (car expr)
-          ((begin)
-           (let ((body-exprs (cdr expr)))
-             (let loop ((rest body-exprs)
-                        (instrs '())
-                       (procedures '()))
-              (cond
-                ((null? rest)
-                 (error "begin requires at least one expression"))
-                ((null? (cdr rest))
-                  (let-values (((last-instrs last-result last-procedures)
-                                (convert-value (car rest) dest)))
-                    (values (append instrs last-instrs)
-                            last-result
-                            (append procedures last-procedures))))
-                (else
-                  (let-values (((new-instrs ignored-result new-procedures)
-                                (convert-value (car rest) #f)))
-                    (loop (cdr rest)
-                          (append instrs new-instrs)
-                          (append procedures new-procedures))))))))
+         ((begin)
+          (let ((body-exprs (cdr expr)))
+            (let-values (((cluster-instrs cluster-procedures remaining-exprs)
+                          (convert-cluster-prefix body-exprs)))
+              (let loop ((rest remaining-exprs)
+                         (instrs cluster-instrs)
+                         (procedures cluster-procedures))
+                (cond
+                  ((null? rest)
+                   (error "begin requires at least one expression"))
+                  ((null? (cdr rest))
+                   (let-values (((last-instrs last-result last-procedures)
+                                 (convert-value (car rest) dest)))
+                     (values (append instrs last-instrs)
+                             last-result
+                             (append procedures last-procedures))))
+                  (else
+                   (let-values (((new-instrs ignored-result new-procedures)
+                                 (convert-value (car rest) #f)))
+                     (loop (cdr rest)
+                           (append instrs new-instrs)
+                           (append procedures new-procedures)))))))))
          
-          ((primop)
-           (let ((op (cadr expr))
-                 (args (cddr expr)))
-             (let-values (((arg-instrs arg-vars arg-procedures)
-                           (convert-list args)))
-               (let ((result-var (or dest (fresh-temp))))
-                 (values (append arg-instrs
-                                 (list `(assign ,result-var 
-                                                (primop ,op ,@arg-vars))))
-                         result-var
-                         arg-procedures)))))
-          
-          ((box)
-           (let-values (((instrs val-var procedures) (convert-value (cadr expr) #f)))
+         ((primop)
+          (let ((op (cadr expr))
+                (args (cddr expr)))
+            (let-values (((arg-instrs arg-vars arg-procedures)
+                          (convert-list args)))
               (let ((result-var (or dest (fresh-temp))))
-                (values (append instrs 
-                                (list `(assign ,result-var (box ,val-var))))
+                (values (append arg-instrs
+                                (list `(assign ,result-var
+                                               (primop ,op ,@arg-vars))))
                         result-var
-                        procedures))))
-          
-          ((unbox)
-           (let-values (((instrs box-var procedures) (convert-value (cadr expr) #f)))
-             (let ((result-var (or dest (fresh-temp))))
-               (values (append instrs
-                               (list `(assign ,result-var (unbox ,box-var))))
-                       result-var
-                       procedures))))
-          
-          ((if)
-           (let* ((then-label (fresh-temp))
-                  (else-label (fresh-temp))
-                  (join-label (fresh-temp))
-                  (result-var (or dest (fresh-temp))))
-             
-              (let-values (((test-instrs test-var test-procedures)
-                            (convert-value (cadr expr) #f))
-                           ((then-instrs then-result then-procedures)
-                            (convert-value (caddr expr) result-var))
-                           ((else-instrs else-result else-procedures)
-                            (convert-value (cadddr expr) result-var)))
-                
-                (values
-                 (append test-instrs
-                        (list `(if ,test-var ,then-label ,else-label))
+                        arg-procedures)))))
+         
+         ((box)
+          (let-values (((instrs val-var procedures)
+                        (convert-value (cadr expr) #f)))
+            (let ((result-var (or dest (fresh-temp))))
+              (values (append instrs
+                              (list `(assign ,result-var (box ,val-var))))
+                      result-var
+                      procedures))))
+         
+         ((unbox)
+          (let-values (((instrs box-var procedures)
+                        (convert-value (cadr expr) #f)))
+            (let ((result-var (or dest (fresh-temp))))
+              (values (append instrs
+                              (list `(assign ,result-var (unbox ,box-var))))
+                      result-var
+                      procedures))))
+         
+         ((if)
+          (let* ((then-label (fresh-temp))
+                 (else-label (fresh-temp))
+                 (join-label (fresh-temp))
+                 (result-var (or dest (fresh-temp))))
+            (let-values (((test-instrs test-var test-procedures)
+                          (convert-value (cadr expr) #f))
+                         ((then-instrs then-result then-procedures)
+                          (convert-value (caddr expr) result-var))
+                         ((else-instrs else-result else-procedures)
+                          (convert-value (cadddr expr) result-var)))
+              (values
+               (append test-instrs
+                       (list `(if ,test-var ,then-label ,else-label))
                        (list `(label ,then-label))
                        then-instrs
                        (list `(goto ,join-label))
                        (list `(label ,else-label))
                        else-instrs
-                        (list `(goto ,join-label))
-                        (list `(label ,join-label)))
-                result-var
-                (append test-procedures
-                        then-procedures
-                        else-procedures)))))
-          
-          ((let)
-           (let* ((binding (caadr expr))
-                  (var (car binding))
-                  (val (cadr binding))
-                  (body (body->expr (cddr expr))))
-              
-             (let-values (((val-instrs val-result val-procedures) (convert-value val #f)))
-                ;; Generate assignment for the let-bound variable
-                 (let ((assign-instr `(assign ,var ,val-result)))
-                   (let-values (((body-instrs body-result body-procedures)
-                                 (convert-value body dest)))
-                     (values (append val-instrs (list assign-instr) body-instrs) 
-                            body-result
-                            (append val-procedures body-procedures)))))))
-          
-          ((make-closure)
-           ;; Convert closure creation
-           (let* ((lambda-expr (cadr expr))
-                  (free-vars (cddr expr))
-                  (proc-name (fresh-proc))
-                  (proc-params (cadr lambda-expr))
-                  (proc-body (body->expr (cddr lambda-expr))))
-             
-             (let-values (((body-instrs body-procedures)
-                            (convert-tail proc-body))
+                       (list `(goto ,join-label))
+                       (list `(label ,join-label)))
+               result-var
+               (append test-procedures
+                       then-procedures
+                       else-procedures)))))
+         
+         ((let)
+          (let* ((binding (caadr expr))
+                 (var (car binding))
+                 (val (cadr binding))
+                 (body (body->expr (cddr expr))))
+            (let-values (((val-instrs val-result val-procedures)
+                          (convert-value val #f)))
+              (let ((assign-instr `(assign ,var ,val-result)))
+                (let-values (((body-instrs body-result body-procedures)
+                              (convert-value body dest)))
+                  (values (append val-instrs (list assign-instr) body-instrs)
+                          body-result
+                          (append val-procedures body-procedures)))))))
+         
+         ((make-closure)
+          (let* ((lambda-expr (cadr expr))
+                 (free-vars (cddr expr))
+                 (proc-name (fresh-proc))
+                 (proc-params (cadr lambda-expr))
+                 (proc-body (body->expr (cddr lambda-expr))))
+            (let ((entry-label (fresh-temp)))
+              (let-values (((body-instrs body-procedures)
+                            (convert-tail proc-body
+                                          proc-params
+                                          entry-label
+                                          #f
+                                          #f))
                            ((fv-instrs fv-vars fv-procedures)
                             (convert-list free-vars)))
                 (let ((result-var (or dest (fresh-temp)))
                       (procedure
-                      (make-procedure proc-name
-                                      proc-params
-                                      body-instrs)))
+                       (make-procedure proc-name
+                                       proc-params
+                                       (cons `(label ,entry-label) body-instrs))))
                   (values (append fv-instrs
-                                  (list `(assign ,result-var 
-                                                 (make-closure ,proc-name 
-                                                              ,@fv-vars))))
-                         result-var
-                         (append body-procedures
-                                 fv-procedures
-                                 (list procedure)))))))
-          
-          ((closure-call)
-           ;; Convert closure call
-           (let* ((closure-expr (cadr expr))
-                  (args (cddr expr)))
-
-             (let-values (((call-instrs closure-var arg-vars procedures)
-                           (convert-call closure-expr args)))
-               (let ((result-var (or dest (fresh-temp))))
-                 (values (append call-instrs
-                                  (list `(assign ,result-var 
-                                                 (closure-call ,closure-var 
-                                                               ,@arg-vars))))
+                                  (list `(assign ,result-var
+                                                 (make-closure ,proc-name
+                                                               ,@fv-vars))))
                           result-var
-                          procedures)))))
-          
-           ((set-box!)
-           (let-values (((box-instrs box-var box-procedures) (convert-value (cadr expr) #f))
-                         ((val-instrs val-var val-procedures) (convert-value (caddr expr) #f)))
-              (let ((result-var (or dest val-var)))
-                (values (append box-instrs
-                                val-instrs
-                               (list `(set-box! ,box-var ,val-var))
-                               (if (eq? result-var val-var)
-                                   '()
-                                   (list `(assign ,result-var ,val-var))))
-                       result-var
-                       (append box-procedures val-procedures)))))
-          
-          ((local closure)
-           ;; These should have been handled by the simple? check above
-           (values '() (cadr expr) '()))
-          
-          (else (error "Unknown expression in expr->tac" (car expr)))))
+                          (append body-procedures
+                                  fv-procedures
+                                  (list procedure))))))))
+         
+         ((closure-call)
+          (let* ((closure-expr (cadr expr))
+                 (args (cddr expr)))
+            (let-values (((call-instrs closure-var arg-vars procedures)
+                          (convert-call closure-expr args)))
+              (let ((result-var (or dest (fresh-temp))))
+                (values (append call-instrs
+                                (list `(assign ,result-var
+                                               (closure-call ,closure-var
+                                                             ,@arg-vars))))
+                        result-var
+                        procedures)))))
+         
+         ((group-tail-call)
+          (error "group-tail-call is only valid in tail position" expr))
+         
+         ((set-box!)
+          (let-values (((box-instrs box-var box-procedures)
+                        (convert-value (cadr expr) #f))
+                       ((val-instrs val-var val-procedures)
+                        (convert-value (caddr expr) #f)))
+            (let ((result-var (or dest val-var)))
+              (values (append box-instrs
+                              val-instrs
+                              (list `(set-box! ,box-var ,val-var))
+                              (if (eq? result-var val-var)
+                                  '()
+                                  (list `(assign ,result-var ,val-var))))
+                      result-var
+                      (append box-procedures val-procedures)))))
+         
+         ((local closure)
+          (values '() (cadr expr) '()))
+         
+         (else
+          (error "Unknown expression in expr->tac" (car expr)))))
       
-       (else (error "Invalid expression in expr->tac" expr))))
+      (else
+       (error "Invalid expression in expr->tac" expr))))
   
-  (convert-tail expr))
+  (convert-tail expr '() #f #f #f))
 
 ;;; ============================================================================
 ;;; Data Structures for CFG
@@ -737,7 +1317,7 @@
   (successors basic-block-successors set-basic-block-successors!))
 
 ;;; ============================================================================
-;;; Build Control Flow Graph (CFG)
+;;; Pass 5: Build Control Flow Graph (CFG)
 ;;; ============================================================================
 
 (define (build-cfg tac-instrs)
@@ -1060,6 +1640,29 @@
      (app id 1)
      (app id 2)))
 
+(define test16
+  '(letrec ((sum-down
+             (lambda (n acc)
+               (if (primop = n 0)
+                   acc
+                   (app sum-down
+                        (primop - n 1)
+                        (primop + acc n))))))
+     (app sum-down 3 0)))
+
+(define test17
+  '(letrec ((walk
+             (lambda (n)
+               (if (primop = n 0)
+                   0
+                   (app jump (primop - n 1) 1))))
+            (jump
+             (lambda (n extra)
+               (if (primop = n 0)
+                   extra
+                   (app walk (primop - n 1))))))
+     (app walk 3)))
+
 ;; Run tests
 (display "\nTest 1: Simple arithmetic\n")
 (compile-program test1)
@@ -1102,3 +1705,9 @@
 
 (display "\n\nTest 15: Sequencing in letrec body\n")
 (compile-program test15)
+
+(display "\n\nTest 16: Self-recursive letrec with accumulator\n")
+(compile-program test16)
+
+(display "\n\nTest 17: Mutual letrec fallback with incompatible arities\n")
+(compile-program test17)
