@@ -65,6 +65,115 @@
          ,(nest-let-bindings (cdr bindings) body-exprs))))
 
 ;;; ============================================================================
+;;; Pass 1: Uniquify
+;;; Renames all variables to unique names while respecting scope
+;;; ============================================================================
+
+(define (uniquify expr)
+  (define counter 0)
+  
+  (define (fresh-name name)
+    (set! counter (+ counter 1))
+    (string->symbol 
+     (string-append (symbol->string name) 
+                    "." 
+                    (number->string counter))))
+  
+  (define (uniquify-expr expr env)
+    (cond
+      ((symbol? expr)
+       ;; Variable reference
+       (let ((binding (assoc expr env)))
+         (if binding
+             (cadr binding)  ; Return the unique name
+             expr)))         ; Keep global/primitive names as-is
+      
+      ((or (number? expr) (boolean? expr)) expr)
+      
+      ((pair? expr)
+       (case (car expr)
+         ((begin)
+          `(begin ,@(map (lambda (e) (uniquify-expr e env)) (cdr expr))))
+         
+          ((primop)
+           `(primop ,(cadr expr) 
+                    ,@(map (lambda (e) (uniquify-expr e env)) (cddr expr))))
+         
+         ((if)
+          `(if ,(uniquify-expr (cadr expr) env)
+               ,(uniquify-expr (caddr expr) env)
+               ,(uniquify-expr (cadddr expr) env)))
+         
+          ((let)
+           (let* ((binding (caadr expr))
+                  (var (car binding))
+                  (val-expr (cadr binding))
+                  (body-exprs (cddr expr))
+                  (unique-var (fresh-name var))
+                  (new-env (cons (list var unique-var) env))
+                  (val-expr-unique (uniquify-expr val-expr env))
+                  (body-unique
+                   (map (lambda (body-expr)
+                          (uniquify-expr body-expr new-env))
+                        body-exprs)))
+             `(let ((,unique-var ,val-expr-unique)) ,@body-unique)))
+          
+          ((lambda)
+           (let* ((params (cadr expr))
+                  (body-exprs (cddr expr))
+                  (unique-params (map fresh-name params))
+                  (new-env (append (map (lambda (old new) (list old new)) 
+                                        params unique-params)
+                                   env))
+                  (body-unique
+                   (map (lambda (body-expr)
+                          (uniquify-expr body-expr new-env))
+                        body-exprs)))
+             `(lambda ,unique-params ,@body-unique)))
+          
+          ((letrec)
+           (let* ((bindings (cadr expr))
+                  (vars (map car bindings))
+                  (unique-vars (map fresh-name vars))
+                  (rec-bindings (map (lambda (old new) (list old new))
+                                     vars unique-vars))
+                  (new-env (append rec-bindings env))
+                  (unique-bindings
+                   (map (lambda (binding unique-var)
+                          (let ((value-expr (cadr binding)))
+                            (if (not (lambda-expr? value-expr))
+                                (error "letrec requires lambda bindings" value-expr)
+                                (list unique-var
+                                      (uniquify-expr value-expr new-env)))))
+                        bindings
+                        unique-vars))
+                  (body-unique
+                   (map (lambda (body-expr)
+                          (uniquify-expr body-expr new-env))
+                        (cddr expr))))
+             `(letrec ,unique-bindings ,@body-unique)))
+          
+           ((app)
+            `(app ,(uniquify-expr (cadr expr) env)
+                  ,@(map (lambda (e) (uniquify-expr e env)) (cddr expr))))
+         
+         ((box)
+          `(box ,(uniquify-expr (cadr expr) env)))
+         
+         ((unbox)
+          `(unbox ,(uniquify-expr (cadr expr) env)))
+         
+         ((set-box!)
+          `(set-box! ,(uniquify-expr (cadr expr) env) 
+                     ,(uniquify-expr (caddr expr) env)))
+         
+         (else (error "Unknown expression type" (car expr)))))
+      
+      (else (error "Invalid expression" expr))))
+  
+  (uniquify-expr expr '()))
+
+;;; ============================================================================
 ;;; Pass 2: Letrec Desugaring
 ;;; Rewrites lambda-only letrec groups into explicit initialization, while
 ;;; preserving direct tail recursion as internal loop markers.
@@ -319,11 +428,45 @@
            (mutually-tail-recursive? bindings)
            (all (lambda (binding)
                   (let* ((lambda-expr (cadr binding))
-                         (params (cadr lambda-expr))
                          (body (body->expr (cddr lambda-expr))))
-                    (and (tail-recursion-safe? body group-names #t)
-                         (null? (free-vars-outside-group body params group-names)))))
+                    (tail-recursion-safe? body group-names #t)))
                 bindings))))
+
+  (define (group-entry-safe? expr group-names)
+    (cond
+      ((symbol? expr) (not (memq expr group-names)))
+      ((or (number? expr) (boolean? expr)) #t)
+      ((pair? expr)
+       (case (car expr)
+         ((begin)
+          (all (lambda (e) (group-entry-safe? e group-names)) (cdr expr)))
+         ((primop)
+          (all (lambda (e) (group-entry-safe? e group-names)) (cddr expr)))
+         ((if)
+          (and (group-entry-safe? (cadr expr) group-names)
+               (group-entry-safe? (caddr expr) group-names)
+               (group-entry-safe? (cadddr expr) group-names)))
+         ((let)
+          (and (group-entry-safe? (cadr (caadr expr)) group-names)
+               (all (lambda (e) (group-entry-safe? e group-names)) (cddr expr))))
+         ((lambda)
+          #f)
+         ((app)
+          (let ((rator (cadr expr))
+                (args (cddr expr)))
+            (and (if (and (symbol? rator) (memq rator group-names))
+                     #t
+                     (group-entry-safe? rator group-names))
+                 (all (lambda (arg) (group-entry-safe? arg group-names)) args))))
+         ((box)
+          (group-entry-safe? (cadr expr) group-names))
+         ((unbox)
+          (group-entry-safe? (cadr expr) group-names))
+         ((set-box!)
+          (and (group-entry-safe? (cadr expr) group-names)
+               (group-entry-safe? (caddr expr) group-names)))
+         (else #f)))
+      (else #f)))
 
   (define (rewrite-sequence exprs env current-group tail?)
     (let loop ((rest exprs) (result '()))
@@ -376,13 +519,15 @@
          ((lambda)
           (rewrite-lambda expr env #f))
          
-         ((letrec)
-          (let* ((bindings (cadr expr))
-                 (names (map car bindings))
-                 (group-eligible? (eligible-mutual-tail-group? bindings)))
-            (if (not (all (lambda (binding)
-                            (and (single-binding? binding)
-                                 (lambda-expr? (cadr binding))))
+          ((letrec)
+           (let* ((bindings (cadr expr))
+                  (names (map car bindings))
+                  (group-eligible?
+                   (and (eligible-mutual-tail-group? bindings)
+                        (group-entry-safe? (body->expr (cddr expr)) names))))
+             (if (not (all (lambda (binding)
+                             (and (single-binding? binding)
+                                  (lambda-expr? (cadr binding))))
                           bindings))
                 (error "letrec requires lambda bindings" expr)
                 (let* ((base-env (remove-shadowed-bindings env names))
@@ -440,115 +585,6 @@
       (else (error "Invalid expression in letrec desugaring" expr))))
   
   (rewrite expr '() #f #t))
-
-;;; ============================================================================
-;;; Pass 1: Uniquify
-;;; Renames all variables to unique names while respecting scope
-;;; ============================================================================
-
-(define (uniquify expr)
-  (define counter 0)
-  
-  (define (fresh-name name)
-    (set! counter (+ counter 1))
-    (string->symbol 
-     (string-append (symbol->string name) 
-                    "." 
-                    (number->string counter))))
-  
-  (define (uniquify-expr expr env)
-    (cond
-      ((symbol? expr)
-       ;; Variable reference
-       (let ((binding (assoc expr env)))
-         (if binding
-             (cadr binding)  ; Return the unique name
-             expr)))         ; Keep global/primitive names as-is
-      
-      ((or (number? expr) (boolean? expr)) expr)
-      
-      ((pair? expr)
-       (case (car expr)
-         ((begin)
-          `(begin ,@(map (lambda (e) (uniquify-expr e env)) (cdr expr))))
-         
-          ((primop)
-           `(primop ,(cadr expr) 
-                    ,@(map (lambda (e) (uniquify-expr e env)) (cddr expr))))
-         
-         ((if)
-          `(if ,(uniquify-expr (cadr expr) env)
-               ,(uniquify-expr (caddr expr) env)
-               ,(uniquify-expr (cadddr expr) env)))
-         
-          ((let)
-           (let* ((binding (caadr expr))
-                  (var (car binding))
-                  (val-expr (cadr binding))
-                  (body-exprs (cddr expr))
-                  (unique-var (fresh-name var))
-                  (new-env (cons (list var unique-var) env))
-                  (val-expr-unique (uniquify-expr val-expr env))
-                  (body-unique
-                   (map (lambda (body-expr)
-                          (uniquify-expr body-expr new-env))
-                        body-exprs)))
-             `(let ((,unique-var ,val-expr-unique)) ,@body-unique)))
-          
-          ((lambda)
-           (let* ((params (cadr expr))
-                  (body-exprs (cddr expr))
-                  (unique-params (map fresh-name params))
-                  (new-env (append (map (lambda (old new) (list old new)) 
-                                        params unique-params)
-                                   env))
-                  (body-unique
-                   (map (lambda (body-expr)
-                          (uniquify-expr body-expr new-env))
-                        body-exprs)))
-             `(lambda ,unique-params ,@body-unique)))
-          
-          ((letrec)
-           (let* ((bindings (cadr expr))
-                  (vars (map car bindings))
-                  (unique-vars (map fresh-name vars))
-                  (rec-bindings (map (lambda (old new) (list old new))
-                                     vars unique-vars))
-                  (new-env (append rec-bindings env))
-                  (unique-bindings
-                   (map (lambda (binding unique-var)
-                          (let ((value-expr (cadr binding)))
-                            (if (not (lambda-expr? value-expr))
-                                (error "letrec requires lambda bindings" value-expr)
-                                (list unique-var
-                                      (uniquify-expr value-expr new-env)))))
-                        bindings
-                        unique-vars))
-                  (body-unique
-                   (map (lambda (body-expr)
-                          (uniquify-expr body-expr new-env))
-                        (cddr expr))))
-             `(letrec ,unique-bindings ,@body-unique)))
-          
-           ((app)
-            `(app ,(uniquify-expr (cadr expr) env)
-                  ,@(map (lambda (e) (uniquify-expr e env)) (cddr expr))))
-         
-         ((box)
-          `(box ,(uniquify-expr (cadr expr) env)))
-         
-         ((unbox)
-          `(unbox ,(uniquify-expr (cadr expr) env)))
-         
-         ((set-box!)
-          `(set-box! ,(uniquify-expr (cadr expr) env) 
-                     ,(uniquify-expr (caddr expr) env)))
-         
-         (else (error "Unknown expression type" (car expr)))))
-      
-      (else (error "Invalid expression" expr))))
-  
-  (uniquify-expr expr '()))
 
 ;;; ============================================================================
 ;;; Pass 3: Closure Conversion
@@ -612,6 +648,224 @@
   (dedupe-symbols (collect expr bound)))
 
 (define (closure-convert expr)
+  (define (any predicate lst)
+    (cond
+      ((null? lst) #f)
+      ((predicate (car lst)) #t)
+      (else (any predicate (cdr lst)))))
+
+  (define (make-env-vars prefix count)
+    (let loop ((i 0) (result '()))
+      (if (= i count)
+          (reverse result)
+          (loop (+ i 1)
+                (cons (string->symbol
+                       (string-append prefix (number->string i)))
+                      result)))))
+
+  (define (local-repr-name repr)
+    (and (pair? repr)
+         (eq? (car repr) 'local)
+         (pair? (cdr repr))
+         (symbol? (cadr repr))
+         (cadr repr)))
+
+  (define (lookup-repr name env)
+    (let ((binding (assoc name env)))
+      (if binding
+          (cadr binding)
+          name)))
+
+  (define (collect-group-tail-targets expr)
+    (cond
+      ((or (symbol? expr) (number? expr) (boolean? expr)) '())
+      ((pair? expr)
+       (case (car expr)
+         ((group-tail-call)
+          (cons (cadr expr)
+                (append-map collect-group-tail-targets (cddr expr))))
+         ((begin app set-box!)
+          (append-map collect-group-tail-targets (cdr expr)))
+         ((primop)
+          (append-map collect-group-tail-targets (cddr expr)))
+         ((if)
+          (append (collect-group-tail-targets (cadr expr))
+                  (collect-group-tail-targets (caddr expr))
+                  (collect-group-tail-targets (cadddr expr))))
+         ((let)
+          (append (collect-group-tail-targets (cadr (caadr expr)))
+                  (append-map collect-group-tail-targets (cddr expr))))
+         ((lambda)
+          (collect-group-tail-targets (body->expr (cddr expr))))
+         ((box unbox)
+          (collect-group-tail-targets (cadr expr)))
+         (else '())))
+      (else '())))
+
+  (define (mentions-box-var? expr box-vars)
+    (cond
+      ((symbol? expr) (memq expr box-vars))
+      ((or (number? expr) (boolean? expr)) #f)
+      ((pair? expr)
+       (case (car expr)
+         ((begin app primop set-box!)
+          (any (lambda (e) (mentions-box-var? e box-vars)) (cdr expr)))
+         ((if)
+          (or (mentions-box-var? (cadr expr) box-vars)
+              (mentions-box-var? (caddr expr) box-vars)
+              (mentions-box-var? (cadddr expr) box-vars)))
+         ((let)
+          (or (mentions-box-var? (cadr (caadr expr)) box-vars)
+              (any (lambda (e) (mentions-box-var? e box-vars)) (cddr expr))))
+         ((lambda)
+          (mentions-box-var? (body->expr (cddr expr)) box-vars))
+         ((box unbox)
+          (mentions-box-var? (cadr expr) box-vars))
+         (else #f)))
+      (else #f)))
+
+  (define (safe-group-body? expr box-vars)
+    (cond
+      ((symbol? expr) (not (memq expr box-vars)))
+      ((or (number? expr) (boolean? expr)) #t)
+      ((pair? expr)
+       (case (car expr)
+         ((begin)
+          (all (lambda (e) (safe-group-body? e box-vars)) (cdr expr)))
+         ((primop)
+          (all (lambda (e) (safe-group-body? e box-vars)) (cddr expr)))
+         ((if)
+          (and (safe-group-body? (cadr expr) box-vars)
+               (safe-group-body? (caddr expr) box-vars)
+               (safe-group-body? (cadddr expr) box-vars)))
+         ((let)
+          (and (safe-group-body? (cadr (caadr expr)) box-vars)
+               (all (lambda (e) (safe-group-body? e box-vars)) (cddr expr))))
+         ((lambda)
+          (not (mentions-box-var? (body->expr (cddr expr)) box-vars)))
+         ((app)
+          (let ((rator (cadr expr))
+                (args (cddr expr)))
+            (if (and (pair? rator)
+                     (eq? (car rator) 'unbox)
+                     (symbol? (cadr rator))
+                     (memq (cadr rator) box-vars))
+                (all (lambda (arg) (safe-group-body? arg box-vars)) args)
+                (and (safe-group-body? rator box-vars)
+                     (all (lambda (arg) (safe-group-body? arg box-vars)) args)))))
+         ((box)
+          (safe-group-body? (cadr expr) box-vars))
+         ((unbox)
+          (let ((target (cadr expr)))
+            (if (and (symbol? target) (memq target box-vars))
+                #f
+                (safe-group-body? target box-vars))))
+         ((set-box!)
+          (and (not (and (symbol? (cadr expr)) (memq (cadr expr) box-vars)))
+               (safe-group-body? (cadr expr) box-vars)
+               (safe-group-body? (caddr expr) box-vars)))
+         (else #f)))
+      (else #f)))
+
+  (define (extract-group-prefix exprs env)
+    (define (links-other-member? member names)
+      (let ((name (cadr member))
+            (targets (collect-group-tail-targets (cadddr member))))
+        (let loop ((rest-targets targets))
+          (cond
+            ((null? rest-targets) #f)
+            ((and (memq (car rest-targets) names)
+                  (not (eq? (car rest-targets) name)))
+             #t)
+            (else
+             (loop (cdr rest-targets)))))))
+
+    (define (finish members rest)
+      (let ((names (map cadr members))
+            (box-vars (map cadr members)))
+        (if (and (> (length members) 1)
+                 (safe-group-body? (body->expr rest) box-vars)
+                 (any (lambda (member)
+                        (links-other-member? member names))
+                      members))
+            (cons members rest)
+            #f)))
+
+    (let loop ((rest exprs) (members '()))
+      (if (null? rest)
+          (finish members '())
+          (let ((expr (car rest)))
+            (if (and (pair? expr)
+                     (eq? (car expr) 'set-box!)
+                     (symbol? (cadr expr))
+                     (pair? (caddr expr))
+                     (eq? (car (caddr expr)) 'lambda))
+                (let* ((box-name (cadr expr))
+                       (box-repr (lookup-repr box-name env))
+                       (local-box (local-repr-name box-repr))
+                       (lambda-expr (caddr expr)))
+                  (if local-box
+                      (loop (cdr rest)
+                            (append members
+                                    (list (list local-box
+                                                box-name
+                                                (cadr lambda-expr)
+                                                (body->expr (cddr lambda-expr))))))
+                      (finish members rest)))
+                (finish members rest))))))
+
+  (define (convert-group-prefix exprs env)
+    (let ((prefix (extract-group-prefix exprs env)))
+      (and prefix
+           (let* ((members (car prefix))
+                  (remaining (cdr prefix))
+                  (member-names (map cadr members))
+                  (shared-captures
+                   (dedupe-symbols
+                    (append-map
+                     (lambda (member)
+                       (free-vars (cadddr member)
+                                  (append (caddr member) member-names)))
+                     members)))
+                  (capture-params
+                   (make-env-vars "group.env." (length shared-captures)))
+                  (capture-bindings
+                   (map (lambda (fv capture-param)
+                          (list fv `(local ,capture-param)))
+                        shared-captures
+                        capture-params))
+                  (group-env (append capture-bindings env))
+                  (converted-members
+                   (map (lambda (member)
+                          (let* ((box-var (car member))
+                                 (member-name (cadr member))
+                                 (params (caddr member))
+                                 (body (cadddr member))
+                                 (param-bindings
+                                  (map (lambda (param)
+                                         (list param `(local ,param)))
+                                       params))
+                                 (body-env (append param-bindings group-env)))
+                            (list box-var
+                                  member-name
+                                  params
+                                  (convert body body-env))))
+                        members))
+                  (capture-values
+                   (map (lambda (fv capture-param)
+                          (list capture-param (lookup-repr fv env)))
+                        shared-captures
+                        capture-params)))
+             (cons (cons `(group-closures ,converted-members ,capture-values)
+                         (map (lambda (e) (convert e env)) remaining))
+                   #t)))))
+
+  (define (convert-sequence exprs env)
+    (let ((group-result (convert-group-prefix exprs env)))
+      (if group-result
+          (car group-result)
+          (map (lambda (e) (convert e env)) exprs))))
+
   (define (convert expr env)
     ;; env: association list mapping variable names to their representation
     ;; Either (local var) or (closure env-var) for captured variables.
@@ -629,7 +883,7 @@
       ((pair? expr)
        (case (car expr)
          ((begin)
-          `(begin ,@(map (lambda (e) (convert e env)) (cdr expr))))
+          `(begin ,@(convert-sequence (cdr expr) env)))
          
           ((primop)
            `(primop ,(cadr expr) 
@@ -695,10 +949,13 @@
             `(self-tail-call
               ,@(map (lambda (e) (convert e env)) (cdr expr))))
 
-           ((group-tail-call)
-            `(group-tail-call
-              ,(cadr expr)
-              ,@(map (lambda (e) (convert e env)) (cddr expr))))
+         ((group-tail-call)
+          `(group-tail-call
+            ,(cadr expr)
+            ,@(map (lambda (e) (convert e env)) (cddr expr))))
+
+          ((group-closures)
+           expr)
            
            ((box)
             `(box ,(convert (cadr expr) env)))
@@ -798,6 +1055,14 @@
                         (list name
                               (cadr lambda-expr)
                               (body->expr (cddr lambda-expr)))))))))
+
+  (define (match-group-closures expr)
+    (and (pair? expr)
+         (eq? (car expr) 'group-closures)
+         (pair? (cdr expr))
+         (pair? (cddr expr))
+         (null? (cdddr expr))
+         (list (cadr expr) (caddr expr))))
 
   (define (cluster-body-compatible? expr names)
     (cond
@@ -923,57 +1188,59 @@
                                 `(if ,cmp-var ,(car rest) ,next-label))))))))
 
   (define (convert-cluster-prefix exprs)
-    (let ((cluster (extract-cluster-prefix exprs)))
-      (if (not cluster)
-          (values '() '() exprs)
-          (let* ((members (car cluster))
-                 (remaining-exprs (cdr cluster))
-                 (cluster-proc (fresh-proc))
-                 (shared-params (map (lambda (ignored) (fresh-temp))
-                                     (cadr (car members))))
-                 (entry-tag (fresh-temp))
-                 (dispatch-label
-                  (string->symbol
-                   (string-append "dispatch." (symbol->string cluster-proc))))
-                 (member-labels
-                  (map (lambda (member)
-                         (string->symbol
-                          (string-append "entry."
-                                         (symbol->string (car member)))))
-                       members))
-                 (group-context
-                  (map (lambda (member label)
-                         (list (car member) label))
-                       members
-                       member-labels))
-                 (init-instrs
-                  (let loop ((rest members) (index 0) (instrs '()))
-                    (if (null? rest)
-                        instrs
-                        (let ((closure-temp (fresh-temp))
-                              (box-name (car (car rest))))
-                          (loop (cdr rest)
-                                (+ index 1)
-                                (append instrs
-                                        (list `(assign ,closure-temp
-                                                       (make-closure ,cluster-proc ,index))
-                                              `(set-box! ,box-name ,closure-temp)))))))))
+    (define (lower-cluster members capture-specs remaining-exprs)
+      (let* ((cluster-proc (fresh-proc))
+             (shared-params (map (lambda (ignored) (fresh-temp))
+                                 (caddr (car members))))
+             (entry-tag (fresh-temp))
+             (dispatch-label
+              (string->symbol
+               (string-append "dispatch." (symbol->string cluster-proc))))
+             (member-labels
+              (map (lambda (member)
+                     (string->symbol
+                      (string-append "entry."
+                                     (symbol->string (cadr member)))))
+                   members))
+             (group-context
+              (map (lambda (member label)
+                     (list (cadr member) label))
+                   members
+                   member-labels))
+             (capture-param-names (map car capture-specs))
+             (capture-value-exprs (map cadr capture-specs)))
+        (let-values (((capture-instrs capture-vars capture-procedures)
+                      (convert-list capture-value-exprs)))
+          (let ((init-instrs
+                 (let loop ((rest members) (index 0) (instrs capture-instrs))
+                   (if (null? rest)
+                       instrs
+                       (let ((closure-temp (fresh-temp))
+                             (box-name (car (car rest))))
+                         (loop (cdr rest)
+                               (+ index 1)
+                               (append instrs
+                                       (list `(assign ,closure-temp
+                                                      (make-closure ,cluster-proc ,index ,@capture-vars))
+                                             `(set-box! ,box-name ,closure-temp)))))))))
             (let loop ((rest members)
                        (labels member-labels)
                        (instrs (build-dispatch-instructions entry-tag
                                                            dispatch-label
                                                            member-labels))
-                       (procedures '()))
+                       (procedures capture-procedures))
               (if (null? rest)
                   (values init-instrs
                           (append procedures
                                   (list (make-procedure cluster-proc
-                                                        (cons entry-tag shared-params)
+                                                        (append (list entry-tag)
+                                                                capture-param-names
+                                                                shared-params)
                                                         instrs)))
                           remaining-exprs)
                   (let* ((member (car rest))
-                         (params (cadr member))
-                         (body (caddr member))
+                         (params (caddr member))
+                         (body (cadddr member))
                          (entry-label (car labels)))
                     (let-values (((body-instrs body-procedures)
                                   (convert-tail body
@@ -991,6 +1258,18 @@
                                          shared-params)
                                     body-instrs)
                             (append procedures body-procedures))))))))))
+    (let ((explicit (and (pair? exprs) (match-group-closures (car exprs)))))
+      (if explicit
+          (lower-cluster (car explicit) (cadr explicit) (cdr exprs))
+          (let ((cluster (extract-cluster-prefix exprs)))
+            (if (not cluster)
+                (values '() '() exprs)
+                (lower-cluster
+                 (map (lambda (member)
+                        (list (car member) (car member) (cadr member) (caddr member)))
+                      (car cluster))
+                 '()
+                 (cdr cluster)))))))
 
   (define (convert-tail expr current-params current-entry-label group-context shared-params)
     (cond
@@ -1663,6 +1942,34 @@
                    (app walk (primop - n 1))))))
      (app walk 3)))
 
+(define test18
+  '(let ((step 1))
+     (letrec ((even?
+               (lambda (n)
+                 (if (primop = n 0)
+                     #t
+                     (app odd? (primop - n step)))))
+              (odd?
+               (lambda (n)
+                 (if (primop = n 0)
+                     #f
+                     (app even? (primop - n step))))))
+       (app even? 4))))
+
+(define test19
+  '(let ((step 1))
+     (letrec ((even?
+               (lambda (n)
+                 (if (primop = n 0)
+                     #t
+                     (app odd? (primop - n step)))))
+              (odd?
+               (lambda (n)
+                 (if (primop = n 0)
+                     #f
+                     (app even? (primop - n step))))))
+       even?)))
+
 ;; Run tests
 (display "\nTest 1: Simple arithmetic\n")
 (compile-program test1)
@@ -1711,3 +2018,9 @@
 
 (display "\n\nTest 17: Mutual letrec fallback with incompatible arities\n")
 (compile-program test17)
+
+(display "\n\nTest 18: Capturing mutual letrec cluster\n")
+(compile-program test18)
+
+(display "\n\nTest 19: Capturing mutual letrec escape fallback\n")
+(compile-program test19)
