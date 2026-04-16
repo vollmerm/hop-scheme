@@ -1,5 +1,5 @@
 ;;; Scheme Compiler - Initial Pass Pipeline
-;;; Supports: arithmetic, booleans, conditionals, boxes, lambda, letrec
+;;; Supports: arithmetic, booleans, null, pairs, conditionals, boxes, lambda, letrec
 ;;; Passes: uniquify -> letrec-desugar -> closure-conversion -> TAC -> CFG
 
 (import (scheme base)
@@ -58,6 +58,9 @@
 (define (lambda-expr? expr)
   (and (pair? expr) (eq? (car expr) 'lambda)))
 
+(define (literal-expr? expr)
+  (or (number? expr) (boolean? expr) (null? expr)))
+
 (define (nest-let-bindings bindings body-exprs)
   (if (null? bindings)
       (body->expr body-exprs)
@@ -88,7 +91,7 @@
              (cadr binding)  ; Return the unique name
              expr)))         ; Keep global/primitive names as-is
       
-      ((or (number? expr) (boolean? expr)) expr)
+      ((literal-expr? expr) expr)
       
       ((pair? expr)
        (case (car expr)
@@ -153,19 +156,20 @@
                         (cddr expr))))
              `(letrec ,unique-bindings ,@body-unique)))
           
-           ((app)
-            `(app ,(uniquify-expr (cadr expr) env)
-                  ,@(map (lambda (e) (uniquify-expr e env)) (cddr expr))))
-         
-         ((box)
-          `(box ,(uniquify-expr (cadr expr) env)))
-         
-         ((unbox)
-          `(unbox ,(uniquify-expr (cadr expr) env)))
-         
-         ((set-box!)
-          `(set-box! ,(uniquify-expr (cadr expr) env) 
-                     ,(uniquify-expr (caddr expr) env)))
+          ((app)
+           `(app ,(uniquify-expr (cadr expr) env)
+                 ,@(map (lambda (e) (uniquify-expr e env)) (cddr expr))))
+
+          ((cons)
+           `(cons ,(uniquify-expr (cadr expr) env)
+                  ,(uniquify-expr (caddr expr) env)))
+          
+          ((box unbox car cdr pair? null?)
+           `(,(car expr) ,(uniquify-expr (cadr expr) env)))
+          
+          ((set-box!)
+           `(set-box! ,(uniquify-expr (cadr expr) env) 
+                      ,(uniquify-expr (caddr expr) env)))
          
          (else (error "Unknown expression type" (car expr)))))
       
@@ -192,7 +196,7 @@
       ((symbol? expr)
        (not (memq expr group-names)))
       
-      ((or (number? expr) (boolean? expr)) #t)
+      ((literal-expr? expr) #t)
       
       ((pair? expr)
        (case (car expr)
@@ -248,14 +252,14 @@
                             (tail-recursion-safe? arg group-names #f))
                           args)))))
          
-         ((box unbox)
-          (tail-recursion-safe? (cadr expr) group-names #f))
-         
-         ((set-box!)
-          (and (tail-recursion-safe? (cadr expr) group-names #f)
-               (tail-recursion-safe? (caddr expr) group-names #f)))
-         
-         (else #f)))
+          ((cons set-box!)
+           (and (tail-recursion-safe? (cadr expr) group-names #f)
+                (tail-recursion-safe? (caddr expr) group-names #f)))
+
+          ((box unbox car cdr pair? null?)
+           (tail-recursion-safe? (cadr expr) group-names #f))
+          
+          (else #f)))
       
       (else #f)))
 
@@ -267,7 +271,7 @@
              '()
              (list expr)))
         
-        ((or (number? expr) (boolean? expr)) '())
+        ((literal-expr? expr) '())
         
         ((pair? expr)
          (case (car expr)
@@ -308,14 +312,14 @@
            ((app)
             (append-map (lambda (e) (collect e bound)) (cdr expr)))
            
-           ((box unbox)
-            (collect (cadr expr) bound))
-           
-           ((set-box!)
+           ((cons set-box!)
             (append (collect (cadr expr) bound)
                     (collect (caddr expr) bound)))
-           
-           (else '())))
+
+           ((box unbox car cdr pair? null?)
+            (collect (cadr expr) bound))
+            
+            (else '())))
         
         (else '())))
     
@@ -323,7 +327,7 @@
 
   (define (tail-call-targets expr group-names tail?)
     (cond
-      ((or (symbol? expr) (number? expr) (boolean? expr)) '())
+      ((or (symbol? expr) (literal-expr? expr)) '())
       
       ((pair? expr)
        (case (car expr)
@@ -378,14 +382,14 @@
                                   (tail-call-targets arg group-names #f))
                                 args))))
          
-         ((box unbox)
-          (tail-call-targets (cadr expr) group-names #f))
-         
-         ((set-box!)
-          (append (tail-call-targets (cadr expr) group-names #f)
-                  (tail-call-targets (caddr expr) group-names #f)))
-         
-         (else '())))
+          ((cons set-box!)
+           (append (tail-call-targets (cadr expr) group-names #f)
+                   (tail-call-targets (caddr expr) group-names #f)))
+
+          ((box unbox car cdr pair? null?)
+           (tail-call-targets (cadr expr) group-names #f))
+          
+          (else '())))
       
       (else '())))
 
@@ -435,7 +439,7 @@
   (define (group-entry-safe? expr group-names)
     (cond
       ((symbol? expr) (not (memq expr group-names)))
-      ((or (number? expr) (boolean? expr)) #t)
+      ((literal-expr? expr) #t)
       ((pair? expr)
        (case (car expr)
          ((begin)
@@ -458,13 +462,13 @@
                      #t
                      (group-entry-safe? rator group-names))
                  (all (lambda (arg) (group-entry-safe? arg group-names)) args))))
-         ((box)
-          (group-entry-safe? (cadr expr) group-names))
-         ((unbox)
-          (group-entry-safe? (cadr expr) group-names))
-         ((set-box!)
+         ((cons set-box!)
           (and (group-entry-safe? (cadr expr) group-names)
                (group-entry-safe? (caddr expr) group-names)))
+         ((box)
+          (group-entry-safe? (cadr expr) group-names))
+         ((unbox car cdr pair? null?)
+          (group-entry-safe? (cadr expr) group-names))
          (else #f)))
       (else #f)))
 
@@ -492,7 +496,7 @@
              `(unbox ,(cadr binding))
              expr)))
       
-      ((or (number? expr) (boolean? expr)) expr)
+      ((literal-expr? expr) expr)
       
       ((pair? expr)
        (case (car expr)
@@ -552,9 +556,9 @@
                                                   tail?))))
                   (nest-let-bindings box-bindings body-exprs)))))
          
-         ((app)
-          (let ((rator (cadr expr))
-                (args (cddr expr)))
+          ((app)
+           (let ((rator (cadr expr))
+                 (args (cddr expr)))
             (if (and tail?
                      current-group
                      (symbol? rator)
@@ -564,17 +568,33 @@
                                       ,@(map (lambda (e) (rewrite e env current-group #f)) args))
                     `(self-tail-call
                       ,@(map (lambda (e) (rewrite e env current-group #f)) args)))
-                `(app ,(rewrite rator env current-group #f)
-                      ,@(map (lambda (e) (rewrite e env current-group #f)) args)))))
-         
-         ((box)
-          `(box ,(rewrite (cadr expr) env current-group #f)))
-         
-         ((unbox)
-          `(unbox ,(rewrite (cadr expr) env current-group #f)))
-         
-         ((set-box!)
-          (let ((target (cadr expr)))
+                 `(app ,(rewrite rator env current-group #f)
+                       ,@(map (lambda (e) (rewrite e env current-group #f)) args)))))
+
+          ((cons)
+           `(cons ,(rewrite (cadr expr) env current-group #f)
+                  ,(rewrite (caddr expr) env current-group #f)))
+          
+          ((box)
+           `(box ,(rewrite (cadr expr) env current-group #f)))
+          
+          ((unbox)
+           `(unbox ,(rewrite (cadr expr) env current-group #f)))
+
+          ((car)
+           `(car ,(rewrite (cadr expr) env current-group #f)))
+
+          ((cdr)
+           `(cdr ,(rewrite (cadr expr) env current-group #f)))
+
+          ((pair?)
+           `(pair? ,(rewrite (cadr expr) env current-group #f)))
+
+          ((null?)
+           `(null? ,(rewrite (cadr expr) env current-group #f)))
+          
+          ((set-box!)
+           (let ((target (cadr expr)))
             (when (and (symbol? target) (assoc target env))
               (error "Cannot mutate letrec function binding" target))
             `(set-box! ,(rewrite target env current-group #f)
@@ -597,7 +617,7 @@
       ((symbol? expr)
        (if (memq expr bound) '() (list expr)))
       
-      ((or (number? expr) (boolean? expr)) '())
+      ((literal-expr? expr) '())
       
       ((pair? expr)
        (case (car expr)
@@ -634,14 +654,14 @@
           ((group-tail-call)
            (append-map (lambda (e) (collect e bound)) (cddr expr)))
            
-           ((box unbox)
+           ((box unbox car cdr pair? null?)
             (collect (cadr expr) bound))
-         
-         ((set-box!)
-          (append (collect (cadr expr) bound)
-                  (collect (caddr expr) bound)))
-         
-         (else (error "Unknown expression in free-vars" (car expr)))))
+
+          ((cons set-box!)
+           (append (collect (cadr expr) bound)
+                   (collect (caddr expr) bound)))
+          
+          (else (error "Unknown expression in free-vars" (car expr)))))
       
       (else '())))
   
@@ -678,13 +698,13 @@
 
   (define (collect-group-tail-targets expr)
     (cond
-      ((or (symbol? expr) (number? expr) (boolean? expr)) '())
+      ((or (symbol? expr) (literal-expr? expr)) '())
       ((pair? expr)
        (case (car expr)
          ((group-tail-call)
           (cons (cadr expr)
                 (append-map collect-group-tail-targets (cddr expr))))
-         ((begin app set-box!)
+         ((begin app set-box! cons)
           (append-map collect-group-tail-targets (cdr expr)))
          ((primop)
           (append-map collect-group-tail-targets (cddr expr)))
@@ -697,7 +717,7 @@
                   (append-map collect-group-tail-targets (cddr expr))))
          ((lambda)
           (collect-group-tail-targets (body->expr (cddr expr))))
-         ((box unbox)
+         ((box unbox car cdr pair? null?)
           (collect-group-tail-targets (cadr expr)))
          (else '())))
       (else '())))
@@ -705,10 +725,10 @@
   (define (mentions-box-var? expr box-vars)
     (cond
       ((symbol? expr) (memq expr box-vars))
-      ((or (number? expr) (boolean? expr)) #f)
+      ((literal-expr? expr) #f)
       ((pair? expr)
        (case (car expr)
-         ((begin app primop set-box!)
+         ((begin app primop set-box! cons)
           (any (lambda (e) (mentions-box-var? e box-vars)) (cdr expr)))
          ((if)
           (or (mentions-box-var? (cadr expr) box-vars)
@@ -719,15 +739,15 @@
               (any (lambda (e) (mentions-box-var? e box-vars)) (cddr expr))))
          ((lambda)
           (mentions-box-var? (body->expr (cddr expr)) box-vars))
-         ((box unbox)
-          (mentions-box-var? (cadr expr) box-vars))
+         ((box unbox car cdr pair? null?)
+           (mentions-box-var? (cadr expr) box-vars))
          (else #f)))
       (else #f)))
 
   (define (safe-group-body? expr box-vars)
     (cond
       ((symbol? expr) (not (memq expr box-vars)))
-      ((or (number? expr) (boolean? expr)) #t)
+      ((literal-expr? expr) #t)
       ((pair? expr)
        (case (car expr)
          ((begin)
@@ -753,13 +773,16 @@
                 (all (lambda (arg) (safe-group-body? arg box-vars)) args)
                 (and (safe-group-body? rator box-vars)
                      (all (lambda (arg) (safe-group-body? arg box-vars)) args)))))
+         ((cons)
+          (and (safe-group-body? (cadr expr) box-vars)
+               (safe-group-body? (caddr expr) box-vars)))
          ((box)
-          (safe-group-body? (cadr expr) box-vars))
-         ((unbox)
-          (let ((target (cadr expr)))
-            (if (and (symbol? target) (memq target box-vars))
-                #f
-                (safe-group-body? target box-vars))))
+           (safe-group-body? (cadr expr) box-vars))
+         ((unbox car cdr pair? null?)
+           (let ((target (cadr expr)))
+             (if (and (symbol? target) (memq target box-vars))
+                 #f
+                 (safe-group-body? target box-vars))))
          ((set-box!)
           (and (not (and (symbol? (cadr expr)) (memq (cadr expr) box-vars)))
                (safe-group-body? (cadr expr) box-vars)
@@ -877,7 +900,7 @@
              (cadr binding)  ; Return the representation
              expr)))         ; Global/primitive
       
-      ((or (number? expr) (boolean? expr))
+      ((literal-expr? expr)
        expr)
       
       ((pair? expr)
@@ -904,26 +927,17 @@
                   (body-converted (convert body new-env)))
              `(let ((,var ,val-converted)) ,body-converted)))
           
-          ((lambda)
-           (let* ((params (cadr expr))
-                  (body (body->expr (cddr expr)))
-                  (fvs (free-vars body params))
-                  
-                  ;; Generate closure environment variables
-                  (env-vars (let loop ((i 0) (fv-list fvs) (result '()))
-                             (if (null? fv-list)
-                                 (reverse result)
-                                 (loop (+ i 1) 
-                                       (cdr fv-list) 
-                                       (cons (string->symbol 
-                                              (string-append "env." 
-                                                             (number->string i)))
-                                             result)))))
-                 
-                 ;; Build new environment for lambda body
-                 (param-bindings (map (lambda (p) (list p `(local ,p))) params))
-                 (env-bindings (map (lambda (fv env-var)
-                                      (list fv `(closure ,env-var)))
+           ((lambda)
+            (let* ((params (cadr expr))
+                   (body (body->expr (cddr expr)))
+                   (fvs (free-vars body params))
+
+                   (env-vars (make-env-vars "env." (length fvs)))
+
+                  ;; Build new environment for lambda body
+                  (param-bindings (map (lambda (p) (list p `(local ,p))) params))
+                  (env-bindings (map (lambda (fv env-var)
+                                       (list fv `(closure ,env-var)))
                                     fvs env-vars))
                  (new-env (append param-bindings env-bindings env))
                  
@@ -945,8 +959,12 @@
              `(closure-call ,(convert rator env)
                             ,@(map (lambda (e) (convert e env)) rands))))
 
-           ((self-tail-call)
-            `(self-tail-call
+           ((cons)
+            `(cons ,(convert (cadr expr) env)
+                   ,(convert (caddr expr) env)))
+
+            ((self-tail-call)
+             `(self-tail-call
               ,@(map (lambda (e) (convert e env)) (cdr expr))))
 
          ((group-tail-call)
@@ -957,14 +975,26 @@
           ((group-closures)
            expr)
            
-           ((box)
-            `(box ,(convert (cadr expr) env)))
-         
-         ((unbox)
-          `(unbox ,(convert (cadr expr) env)))
-         
-         ((set-box!)
-          `(set-box! ,(convert (cadr expr) env)
+            ((box)
+             `(box ,(convert (cadr expr) env)))
+          
+          ((unbox)
+           `(unbox ,(convert (cadr expr) env)))
+
+          ((car)
+           `(car ,(convert (cadr expr) env)))
+
+          ((cdr)
+           `(cdr ,(convert (cadr expr) env)))
+
+          ((pair?)
+           `(pair? ,(convert (cadr expr) env)))
+
+          ((null?)
+           `(null? ,(convert (cadr expr) env)))
+          
+          ((set-box!)
+           `(set-box! ,(convert (cadr expr) env)
                      ,(convert (caddr expr) env)))
          
          (else (error "Unknown expression in closure-convert" (car expr)))))
@@ -1018,7 +1048,7 @@
   
   (define (simple? expr)
     ;; Check if expression is simple (doesn't need temporaries)
-    (or (symbol? expr) (number? expr) (boolean? expr)
+    (or (symbol? expr) (literal-expr? expr)
         (and (pair? expr) (memq (car expr) '(local closure)))))
   
   (define (simple-value expr)
@@ -1084,7 +1114,7 @@
 
   (define (cluster-body-compatible? expr names)
     (cond
-      ((or (symbol? expr) (number? expr) (boolean? expr)) #t)
+      ((or (symbol? expr) (literal-expr? expr)) #t)
       ((pair? expr)
        (case (car expr)
          ((begin)
@@ -1101,30 +1131,30 @@
                     (cddr expr))))
          ((lambda)
           (cluster-body-compatible? (body->expr (cddr expr)) names))
-         ((group-tail-call)
-          (and (symbol? (cadr expr))
-               (memq (cadr expr) names)
-               (all (lambda (e) (cluster-body-compatible? e names))
-                    (cddr expr))))
-         ((self-tail-call) #f)
-         ((app closure-call set-box!)
-          (all (lambda (e) (cluster-body-compatible? e names)) (cdr expr)))
-         ((box unbox)
-          (cluster-body-compatible? (cadr expr) names))
-         ((local closure) #t)
-         (else #f)))
+          ((group-tail-call)
+           (and (symbol? (cadr expr))
+                (memq (cadr expr) names)
+                (all (lambda (e) (cluster-body-compatible? e names))
+                     (cddr expr))))
+          ((self-tail-call) #f)
+          ((app closure-call set-box! cons)
+           (all (lambda (e) (cluster-body-compatible? e names)) (cdr expr)))
+          ((box unbox car cdr pair? null?)
+           (cluster-body-compatible? (cadr expr) names))
+          ((local closure) #t)
+          (else #f)))
       (else #f)))
 
   (define (collect-group-tail-targets expr)
     (cond
-      ((or (symbol? expr) (number? expr) (boolean? expr)) '())
+      ((or (symbol? expr) (literal-expr? expr)) '())
       ((pair? expr)
        (case (car expr)
-         ((group-tail-call)
-          (cons (cadr expr)
-                (append-map collect-group-tail-targets (cddr expr))))
-         ((begin app closure-call set-box!)
-          (append-map collect-group-tail-targets (cdr expr)))
+          ((group-tail-call)
+           (cons (cadr expr)
+                 (append-map collect-group-tail-targets (cddr expr))))
+          ((begin app closure-call set-box! cons)
+           (append-map collect-group-tail-targets (cdr expr)))
          ((primop)
           (append-map collect-group-tail-targets (cddr expr)))
          ((if)
@@ -1136,9 +1166,9 @@
                   (append-map collect-group-tail-targets (cddr expr))))
          ((lambda)
           (collect-group-tail-targets (body->expr (cddr expr))))
-         ((box unbox)
-          (collect-group-tail-targets (cadr expr)))
-         (else '())))
+          ((box unbox car cdr pair? null?)
+           (collect-group-tail-targets (cadr expr)))
+          (else '())))
       (else '())))
 
   (define (all-same-member-arity? members)
@@ -1425,6 +1455,27 @@
   (define (convert-value expr dest)
     ;; dest: optional destination variable
     ;; Returns: (values instructions result-var procedures)
+    (define (convert-unary-value-op op arg-expr)
+      (let-values (((instrs arg-var procedures)
+                    (convert-value arg-expr #f)))
+        (let ((result-var (or dest (fresh-temp))))
+          (values (append instrs
+                          (list `(assign ,result-var (,op ,arg-var))))
+                  result-var
+                  procedures))))
+
+    (define (convert-binary-value-op op left-expr right-expr)
+      (let-values (((left-instrs left-var left-procedures)
+                    (convert-value left-expr #f))
+                   ((right-instrs right-var right-procedures)
+                    (convert-value right-expr #f)))
+        (let ((result-var (or dest (fresh-temp))))
+          (values (append left-instrs
+                          right-instrs
+                          (list `(assign ,result-var (,op ,left-var ,right-var))))
+                  result-var
+                  (append left-procedures right-procedures)))))
+
     (cond
       ((simple? expr)
        (let ((value (simple-value expr)))
@@ -1459,11 +1510,11 @@
                            (append instrs new-instrs)
                            (append procedures new-procedures)))))))))
          
-         ((primop)
-          (let ((op (cadr expr))
-                (args (cddr expr)))
-            (let-values (((arg-instrs arg-vars arg-procedures)
-                          (convert-list args)))
+          ((primop)
+           (let ((op (cadr expr))
+                 (args (cddr expr)))
+             (let-values (((arg-instrs arg-vars arg-procedures)
+                           (convert-list args)))
               (let ((result-var (or dest (fresh-temp))))
                 (values (append arg-instrs
                                 (list `(assign ,result-var
@@ -1471,23 +1522,14 @@
                         result-var
                         arg-procedures)))))
          
-         ((box)
-          (let-values (((instrs val-var procedures)
-                        (convert-value (cadr expr) #f)))
-            (let ((result-var (or dest (fresh-temp))))
-              (values (append instrs
-                              (list `(assign ,result-var (box ,val-var))))
-                      result-var
-                      procedures))))
-         
-         ((unbox)
-          (let-values (((instrs box-var procedures)
-                        (convert-value (cadr expr) #f)))
-            (let ((result-var (or dest (fresh-temp))))
-              (values (append instrs
-                              (list `(assign ,result-var (unbox ,box-var))))
-                      result-var
-                      procedures))))
+          ((cons)
+           (convert-binary-value-op 'cons (cadr expr) (caddr expr)))
+
+          ((box)
+           (convert-unary-value-op 'box (cadr expr)))
+           
+          ((unbox car cdr pair? null?)
+           (convert-unary-value-op (car expr) (cadr expr)))
          
          ((if)
           (let* ((then-label (fresh-temp))
@@ -1790,6 +1832,32 @@
     (else 0)))
 
 (define (select-machine-instruction instr)
+  (define (select-assignment-rhs dst rhs)
+    (cond
+      ((or (symbol? rhs) (literal-expr? rhs))
+       (list `(move ,dst ,rhs)))
+      ((and (pair? rhs) (eq? (car rhs) 'primop))
+       (list `(binop ,(cadr rhs) ,dst ,@(cddr rhs))))
+      ((and (pair? rhs) (eq? (car rhs) 'cons))
+       (list `(alloc-pair ,dst ,(cadr rhs) ,(caddr rhs))))
+      ((and (pair? rhs) (eq? (car rhs) 'box))
+       (list `(alloc-box ,dst ,(cadr rhs))))
+      ((and (pair? rhs) (eq? (car rhs) 'unbox))
+       (list `(load-box ,dst ,(cadr rhs))))
+      ((and (pair? rhs) (eq? (car rhs) 'car))
+       (list `(load-car ,dst ,(cadr rhs))))
+      ((and (pair? rhs) (eq? (car rhs) 'cdr))
+       (list `(load-cdr ,dst ,(cadr rhs))))
+      ((and (pair? rhs) (eq? (car rhs) 'pair?))
+       (list `(is-pair ,dst ,(cadr rhs))))
+      ((and (pair? rhs) (eq? (car rhs) 'null?))
+       (list `(is-null ,dst ,(cadr rhs))))
+      ((and (pair? rhs) (eq? (car rhs) 'make-closure))
+       (list `(alloc-closure ,dst ,@(cdr rhs))))
+      ((and (pair? rhs) (eq? (car rhs) 'closure-call))
+       (list `(call ,dst ,@(cdr rhs))))
+      (else
+       (error "Unknown assignment rhs during instruction selection" rhs))))
   (cond
     ((not (pair? instr))
      (error "Invalid TAC instruction for instruction selection" instr))
@@ -1797,21 +1865,7 @@
     ((eq? (car instr) 'assign)
      (let ((dst (cadr instr))
            (rhs (caddr instr)))
-       (cond
-         ((or (symbol? rhs) (number? rhs) (boolean? rhs))
-          (list `(move ,dst ,rhs)))
-         ((and (pair? rhs) (eq? (car rhs) 'primop))
-          (list `(binop ,(cadr rhs) ,dst ,@(cddr rhs))))
-         ((and (pair? rhs) (eq? (car rhs) 'box))
-          (list `(alloc-box ,dst ,(cadr rhs))))
-         ((and (pair? rhs) (eq? (car rhs) 'unbox))
-          (list `(load-box ,dst ,(cadr rhs))))
-         ((and (pair? rhs) (eq? (car rhs) 'make-closure))
-          (list `(alloc-closure ,dst ,@(cdr rhs))))
-         ((and (pair? rhs) (eq? (car rhs) 'closure-call))
-          (list `(call ,dst ,@(cdr rhs))))
-         (else
-          (error "Unknown assignment rhs during instruction selection" rhs)))))
+       (select-assignment-rhs dst rhs)))
     ((eq? (car instr) 'if)
      (list `(branch-if ,(cadr instr) ,(caddr instr) ,(cadddr instr))))
     ((eq? (car instr) 'goto)
@@ -1865,11 +1919,14 @@
     ((binop)
      (append (if (symbol? (cadddr instr)) (list (cadddr instr)) '())
              (if (symbol? (car (cddddr instr))) (list (car (cddddr instr))) '())))
-    ((alloc-box load-box)
-     (if (symbol? (caddr instr)) (list (caddr instr)) '()))
+    ((alloc-box load-box load-car load-cdr is-pair is-null)
+      (if (symbol? (caddr instr)) (list (caddr instr)) '()))
+    ((alloc-pair)
+     (append (if (symbol? (caddr instr)) (list (caddr instr)) '())
+             (if (symbol? (cadddr instr)) (list (cadddr instr)) '())))
     ((store-box)
-     (append (if (symbol? (cadr instr)) (list (cadr instr)) '())
-             (if (symbol? (caddr instr)) (list (caddr instr)) '())))
+      (append (if (symbol? (cadr instr)) (list (cadr instr)) '())
+              (if (symbol? (caddr instr)) (list (caddr instr)) '())))
     ((alloc-closure)
      (let loop ((rest (cdddr instr)) (result '()))
        (if (null? rest)
@@ -1907,8 +1964,9 @@
 
 (define (machine-instr-defs instr)
   (case (car instr)
-    ((move-in move alloc-box load-box alloc-closure call)
-     (list (cadr instr)))
+    ((move-in move alloc-pair alloc-box load-box load-car load-cdr
+              is-pair is-null alloc-closure call)
+      (list (cadr instr)))
     ((binop)
      (list (caddr instr)))
     ((store-box branch-if jump ret tail-call) '())
@@ -2146,12 +2204,28 @@
     ((alloc-box)
      `(alloc-box ,(lookup-home homes (cadr instr))
                  ,(lookup-home homes (caddr instr))))
+    ((alloc-pair)
+     `(alloc-pair ,(lookup-home homes (cadr instr))
+                  ,(lookup-home homes (caddr instr))
+                  ,(lookup-home homes (cadddr instr))))
     ((load-box)
      `(load-box ,(lookup-home homes (cadr instr))
                 ,(lookup-home homes (caddr instr))))
+    ((load-car)
+     `(load-car ,(lookup-home homes (cadr instr))
+                ,(lookup-home homes (caddr instr))))
+    ((load-cdr)
+     `(load-cdr ,(lookup-home homes (cadr instr))
+                ,(lookup-home homes (caddr instr))))
+    ((is-pair)
+     `(is-pair ,(lookup-home homes (cadr instr))
+               ,(lookup-home homes (caddr instr))))
+    ((is-null)
+     `(is-null ,(lookup-home homes (cadr instr))
+               ,(lookup-home homes (caddr instr))))
     ((store-box)
      `(store-box ,(lookup-home homes (cadr instr))
-                 ,(lookup-home homes (caddr instr))))
+                  ,(lookup-home homes (caddr instr))))
     ((alloc-closure)
      `(alloc-closure ,(lookup-home homes (cadr instr))
                      ,(caddr instr)
@@ -2411,14 +2485,25 @@
   (display text port)
   (newline port))
 
-(define (bool->int value)
-  (if value 1 0))
+(define fixnum-shift 3)
+(define tag-mask 7)
+(define pair-tag 1)
+(define box-tag 2)
+(define closure-tag 3)
+(define null-immediate 20)
+(define false-immediate 36)
+(define true-immediate 52)
+
+(define (encode-immediate value)
+  (cond
+    ((null? value) null-immediate)
+    ((eq? value #f) false-immediate)
+    ((eq? value #t) true-immediate)
+    ((number? value) (ash value fixnum-shift))
+    (else (error "Expected immediate value" value))))
 
 (define (immediate->string value)
-  (cond
-    ((boolean? value) (number->string (bool->int value)))
-    ((number? value) (number->string value))
-    (else (error "Expected immediate value" value))))
+  (number->string (encode-immediate value)))
 
 (define (register-operand? operand)
   (and (pair? operand)
@@ -2429,7 +2514,7 @@
 
 (define (emit-load-operand port target operand proc)
   (cond
-    ((or (number? operand) (boolean? operand))
+    ((literal-expr? operand)
      (emit-asm-line port
                     (string-append "    mov " target ", #"
                                    (immediate->string operand))))
@@ -2488,28 +2573,63 @@
                  (string-append "    add " reg ", " reg ", "
                                 (asm-name proc-name) "@PAGEOFF")))
 
+(define (emit-bool-result port condition dst proc)
+  (emit-asm-line port
+                 (string-append "    mov x11, #"
+                                (number->string false-immediate)))
+  (emit-asm-line port
+                 (string-append "    mov x12, #"
+                                (number->string true-immediate)))
+  (emit-asm-line port
+                 (string-append "    csel x11, x12, x11, " condition))
+  (emit-store-operand port "x11" dst proc))
+
+(define (emit-load-box-address port operand proc)
+  (emit-load-operand port "x9" operand proc)
+  (emit-asm-line port
+                 (string-append "    sub x9, x9, #"
+                                (number->string box-tag))))
+
+(define (emit-runtime-unary-call port helper dst operand proc)
+  (emit-load-operand port "x0" operand proc)
+  (emit-asm-line port (string-append "    bl " helper))
+  (emit-store-operand port "x0" dst proc))
+
+(define (emit-immediate-compare port operand immediate proc)
+  (emit-load-operand port "x9" operand proc)
+  (emit-asm-line port
+                 (string-append "    mov x10, #"
+                                (number->string immediate)))
+  (emit-asm-line port "    cmp x9, x10"))
+
 (define (emit-binop port op dst lhs rhs proc)
   (emit-load-operand port "x9" lhs proc)
   (emit-load-operand port "x10" rhs proc)
   (cond
     ((eq? op '+)
-     (emit-asm-line port "    add x11, x9, x10"))
+     (emit-asm-line port "    add x11, x9, x10")
+     (emit-store-operand port "x11" dst proc))
     ((eq? op '-)
-     (emit-asm-line port "    sub x11, x9, x10"))
+     (emit-asm-line port "    sub x11, x9, x10")
+     (emit-store-operand port "x11" dst proc))
     ((eq? op '*)
-     (emit-asm-line port "    mul x11, x9, x10"))
+     (emit-asm-line port "    mul x11, x9, x10")
+     (emit-asm-line port
+                    (string-append "    asr x11, x11, #"
+                                   (number->string fixnum-shift)))
+     (emit-store-operand port "x11" dst proc))
     ((eq? op '=)
-     (emit-asm-line port "    cmp x9, x10")
-     (emit-asm-line port "    cset x11, eq"))
+      (emit-asm-line port "    cmp x9, x10")
+      (emit-bool-result port "eq" dst proc))
     ((eq? op '<)
-     (emit-asm-line port "    cmp x9, x10")
-     (emit-asm-line port "    cset x11, lt"))
+      (emit-asm-line port "    cmp x9, x10")
+      (emit-bool-result port "lt" dst proc))
     ((eq? op '>)
-     (emit-asm-line port "    cmp x9, x10")
-     (emit-asm-line port "    cset x11, gt"))
+      (emit-asm-line port "    cmp x9, x10")
+      (emit-bool-result port "gt" dst proc))
     (else
      (error "Unsupported primop in assembly emission" op)))
-  (emit-store-operand port "x11" dst proc))
+  'done)
 
 (define (emit-alloc-closure port dst proc-name captures proc)
   (let ((count (length captures)))
@@ -2587,17 +2707,36 @@
                  (car (cddddr instr))
                  proc))
     ((alloc-box)
-     (emit-load-operand port "x0" (caddr instr) proc)
-     (emit-asm-line port "    bl _hop_alloc_box")
-     (emit-store-operand port "x0" (cadr instr) proc))
+      (emit-runtime-unary-call port "_hop_alloc_box" (cadr instr) (caddr instr) proc))
+    ((alloc-pair)
+      (emit-load-operand port "x0" (caddr instr) proc)
+      (emit-load-operand port "x1" (cadddr instr) proc)
+      (emit-asm-line port "    bl _hop_alloc_pair")
+      (emit-store-operand port "x0" (cadr instr) proc))
     ((load-box)
-     (emit-load-operand port "x9" (caddr instr) proc)
-     (emit-asm-line port "    ldr x10, [x9]")
-     (emit-store-operand port "x10" (cadr instr) proc))
+      (emit-load-box-address port (caddr instr) proc)
+      (emit-asm-line port "    ldr x10, [x9]")
+      (emit-store-operand port "x10" (cadr instr) proc))
+    ((load-car)
+      (emit-runtime-unary-call port "_hop_car" (cadr instr) (caddr instr) proc))
+    ((load-cdr)
+      (emit-runtime-unary-call port "_hop_cdr" (cadr instr) (caddr instr) proc))
+    ((is-pair)
+      (emit-load-operand port "x9" (caddr instr) proc)
+      (emit-asm-line port
+                     (string-append "    and x10, x9, #"
+                                    (number->string tag-mask)))
+      (emit-asm-line port
+                     (string-append "    cmp x10, #"
+                                     (number->string pair-tag)))
+      (emit-bool-result port "eq" (cadr instr) proc))
+    ((is-null)
+      (emit-immediate-compare port (caddr instr) null-immediate proc)
+      (emit-bool-result port "eq" (cadr instr) proc))
     ((store-box)
-     (emit-load-operand port "x9" (cadr instr) proc)
-     (emit-load-operand port "x10" (caddr instr) proc)
-     (emit-asm-line port "    str x10, [x9]"))
+      (emit-load-box-address port (cadr instr) proc)
+      (emit-load-operand port "x10" (caddr instr) proc)
+      (emit-asm-line port "    str x10, [x9]"))
     ((alloc-closure)
      (emit-alloc-closure port (cadr instr) (caddr instr) (cdddr instr) proc))
     ((call-indirect)
@@ -2605,12 +2744,12 @@
     ((tail-call-indirect)
      (emit-call-helper port (cadr instr) #t))
     ((branch-if)
-     (emit-load-operand port "x9" (cadr instr) proc)
-     (emit-asm-line port
-                    (string-append "    cbnz x9, L"
-                                   (symbol->string (caddr instr))))
-     (emit-asm-line port
-                    (string-append "    b L"
+      (emit-immediate-compare port (cadr instr) false-immediate proc)
+      (emit-asm-line port
+                     (string-append "    b.ne L"
+                                    (symbol->string (caddr instr))))
+      (emit-asm-line port
+                     (string-append "    b L"
                                    (symbol->string (cadddr instr)))))
     ((jump)
      (emit-asm-line port
@@ -2913,11 +3052,40 @@
                      #t
                      (app odd? (primop - n step)))))
               (odd?
-               (lambda (n)
-                 (if (primop = n 0)
-                     #f
-                     (app even? (primop - n step))))))
-       even?)))
+                (lambda (n)
+                  (if (primop = n 0)
+                      #f
+                      (app even? (primop - n step))))))
+        even?)))
+
+(define test20
+  '(car (cons 7 ())))
+
+(define test21
+  '(cdr (cons 7 ())))
+
+(define test22
+  '(pair? (cons 1 ())))
+
+(define test23
+  '(null? ()))
+
+(define test24
+  '(if ()
+       1
+       2))
+
+(define test25
+  '(letrec ((sum-list
+             (lambda (xs acc)
+               (if (null? xs)
+                   acc
+                   (app sum-list
+                        (cdr xs)
+                        (primop + acc (car xs)))))))
+     (app sum-list
+          (cons 1 (cons 2 (cons 3 ())))
+          0)))
 
 ;; Run tests
 (define sample-tests
@@ -2938,7 +3106,13 @@
         (cons "Test 16: Self-recursive letrec with accumulator" test16)
         (cons "Test 17: Mutual letrec fallback with incompatible arities" test17)
         (cons "Test 18: Capturing mutual letrec cluster" test18)
-        (cons "Test 19: Capturing mutual letrec escape fallback" test19)))
+        (cons "Test 19: Capturing mutual letrec escape fallback" test19)
+        (cons "Test 20: car of a cons cell" test20)
+        (cons "Test 21: cdr returns null" test21)
+        (cons "Test 22: pair? recognizes pairs" test22)
+        (cons "Test 23: null? recognizes the empty list" test23)
+        (cons "Test 24: only #f is false" test24)
+        (cons "Test 25: Recursive sum over a list" test25)))
 
 (define named-tests
   (list (cons 'test1 test1)
@@ -2958,7 +3132,13 @@
         (cons 'test16 test16)
         (cons 'test17 test17)
         (cons 'test18 test18)
-        (cons 'test19 test19)))
+        (cons 'test19 test19)
+        (cons 'test20 test20)
+        (cons 'test21 test21)
+        (cons 'test22 test22)
+        (cons 'test23 test23)
+        (cons 'test24 test24)
+        (cons 'test25 test25)))
 
 (define (lookup-named-test name)
   (let ((binding (assoc name named-tests)))

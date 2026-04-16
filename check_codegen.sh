@@ -30,5 +30,11 @@ build_and_run test1 6
 build_and_run test12 11
 build_and_run test15 2
 build_and_run test16 6
+build_and_run test20 7
+build_and_run test21 "()"
+build_and_run test22 "#t"
+build_and_run test23 "#t"
+build_and_run test24 1
+build_and_run test25 6
 
 echo "codegen checks passed"
