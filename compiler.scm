@@ -1,12 +1,29 @@
-;;; Scheme Compiler - Initial Pass Pipeline
-;;; Supports: arithmetic, booleans, null, pairs, conditionals, boxes, lambda, letrec
-;;; Passes: uniquify -> letrec-desugar -> closure-conversion -> TAC -> CFG
+;;; A small Scheme-to-AArch64 compiler.
+;;;
+;;; The file is organized as a sequence of explicit compilation passes so that
+;;; each stage has a single, teachable job:
+;;;
+;;;   source program
+;;;     -> uniquify
+;;;     -> letrec desugaring
+;;;     -> closure conversion
+;;;     -> three-address code (TAC)
+;;;     -> control-flow graph (CFG)
+;;;     -> machine-like backend IR
+;;;     -> register allocation / calling-convention lowering
+;;;     -> AArch64 assembly
+;;;
+;;; The source language supported here is intentionally small: arithmetic,
+;;; booleans, null, pairs, conditionals, boxes, lambdas, applications, and
+;;; lambda-only letrec.
 
 (import (scheme base)
         (scheme write))
 
 ;;; ============================================================================
 ;;; Shared Helpers
+;;; Small utilities used across many passes. These helpers are deliberately
+;;; simple so the interesting compiler logic below can read directly.
 ;;; ============================================================================
 
 (define (body->expr body-exprs)
@@ -69,7 +86,9 @@
 
 ;;; ============================================================================
 ;;; Pass 1: Uniquify
-;;; Renames all variables to unique names while respecting scope
+;;; Renames every binder so that each variable name is globally unique.
+;;; After this pass, later stages no longer need to reason about shadowing by
+;;; name; they can treat identifiers as stable handles for bindings.
 ;;; ============================================================================
 
 (define (uniquify expr)
@@ -179,8 +198,12 @@
 
 ;;; ============================================================================
 ;;; Pass 2: Letrec Desugaring
-;;; Rewrites lambda-only letrec groups into explicit initialization, while
-;;; preserving direct tail recursion as internal loop markers.
+;;; Rewrites lambda-only letrec groups into explicit allocation and
+;;; initialization. Recursive bindings become boxes containing closures.
+;;;
+;;; This pass also preserves direct tail recursion by rewriting eligible calls
+;;; to explicit self/group tail-call markers, which later stages can lower into
+;;; jumps instead of ordinary calls.
 ;;; ============================================================================
 
 (define (desugar-letrec expr)
@@ -608,6 +631,12 @@
 
 ;;; ============================================================================
 ;;; Pass 3: Closure Conversion
+;;; Turns lambdas into explicit closure values.
+;;;
+;;; After this pass, a function is represented as:
+;;;   1. code (a top-level procedure),
+;;;   2. an explicit environment payload for captured values, and
+;;;   3. closure-call / make-closure forms instead of source-level application.
 ;;; ============================================================================
 
 (define (free-vars expr bound)
@@ -1005,6 +1034,11 @@
 
 ;;; ============================================================================
 ;;; Pass 4: Convert to Three-Address Code (TAC)
+;;; Lowers expression-oriented code into a flat, explicit instruction stream.
+;;;
+;;; TAC makes evaluation order, temporary values, branches, and returns
+;;; concrete. This is the point where expression trees become something closer
+;;; to an imperative program.
 ;;; ============================================================================
 
 (define-record-type <procedure>
@@ -1657,6 +1691,11 @@
 
 ;;; ============================================================================
 ;;; Pass 5: Build Control Flow Graph (CFG)
+;;; Groups TAC instructions into basic blocks and records control-flow edges.
+;;;
+;;; The CFG is the boundary between the mostly source-shaped middle end and the
+;;; backend. Once code is in CFG form, later stages can reason in terms of
+;;; blocks, successors, liveness, and register allocation.
 ;;; ============================================================================
 
 (define (build-cfg tac-instrs)
@@ -1785,6 +1824,16 @@
 
 ;;; ============================================================================
 ;;; Backend: instruction selection and linear-scan allocation
+;;; The backend proceeds in three conceptual steps:
+;;;
+;;;   1. instruction selection:
+;;;      TAC operations become machine-like instructions with symbolic homes
+;;;      (virtual registers / abstract operands),
+;;;   2. analysis and allocation:
+;;;      liveness is computed and linear scan assigns registers or stack slots,
+;;;   3. finalization:
+;;;      calling-convention details, prologue/epilogue code, and helper calls
+;;;      are made explicit before assembly emission.
 ;;; ============================================================================
 
 (define aarch64-arg-registers '(x0 x1 x2 x3 x4 x5 x6 x7))
@@ -2455,6 +2504,10 @@
 
 ;;; ============================================================================
 ;;; AArch64 assembly emission
+;;; The emitter converts the allocated backend IR into textual Apple-style
+;;; AArch64 assembly. By this point, the interesting compiler work is already
+;;; done; emission is mostly a matter of printing each lowered instruction in
+;;; the right concrete form.
 ;;; ============================================================================
 
 (define (procedure-saved-bytes proc)
@@ -2828,6 +2881,12 @@
 
 ;;; ============================================================================
 ;;; Main Compiler Driver
+;;; These entry points stitch the passes together:
+;;;
+;;;   - compile-to-cfg: stop after the middle end
+;;;   - compile-to-backend: run through allocation/finalization
+;;;   - write-aarch64-program: emit assembly to a file
+;;;   - compile-program: educational debugging view of the intermediate stages
 ;;; ============================================================================
 
 (define (compile-to-cfg expr)
