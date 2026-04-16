@@ -984,6 +984,24 @@
   (params procedure-params)
   (instructions procedure-instructions))
 
+(define-record-type <machine-block>
+  (make-machine-block label instructions successors)
+  machine-block?
+  (label machine-block-label)
+  (instructions machine-block-instructions)
+  (successors machine-block-successors))
+
+(define-record-type <machine-procedure>
+  (make-machine-procedure name params param-locations blocks homes frame-slots used-registers)
+  machine-procedure?
+  (name machine-procedure-name)
+  (params machine-procedure-params)
+  (param-locations machine-procedure-param-locations)
+  (blocks machine-procedure-blocks)
+  (homes machine-procedure-homes)
+  (frame-slots machine-procedure-frame-slots)
+  (used-registers machine-procedure-used-registers))
+
 (define (expr->tac expr)
   ;; Convert an expression to TAC form.
   ;; Returns: (values instructions procedures)
@@ -1724,6 +1742,575 @@
      (find-successors blocks)))
 
 ;;; ============================================================================
+;;; Backend: instruction selection and linear-scan allocation
+;;; ============================================================================
+
+(define aarch64-arg-registers '(x0 x1 x2 x3 x4 x5 x6 x7))
+(define aarch64-return-register 'x0)
+(define aarch64-callee-saved '(x19 x20 x21 x22 x23 x24 x25 x26 x27 x28))
+
+(define (set-union xs ys)
+  (dedupe-symbols (append xs ys)))
+
+(define (set-difference xs ys)
+  (let loop ((rest xs) (result '()))
+    (cond
+      ((null? rest) (reverse result))
+      ((memq (car rest) ys)
+       (loop (cdr rest) result))
+      (else
+       (loop (cdr rest) (cons (car rest) result))))))
+
+(define (set-equal? xs ys)
+  (and (null? (set-difference xs ys))
+       (null? (set-difference ys xs))))
+
+(define (arg-location index)
+  (if (< index (length aarch64-arg-registers))
+      `(arg-register ,(list-ref aarch64-arg-registers index))
+      `(stack-arg ,(- index (length aarch64-arg-registers)))))
+
+(define (make-param-locations params)
+  (let loop ((rest params) (index 0) (result '()))
+    (if (null? rest)
+        (reverse result)
+        (loop (cdr rest)
+              (+ index 1)
+              (cons (list (car rest) (arg-location index)) result)))))
+
+(define (stack-align n)
+  (* 16 (quotient (+ n 15) 16)))
+
+(define (call-stack-arg-count instr)
+  (case (car instr)
+    ((call)
+     (max 0 (- (length (cdddr instr)) (length aarch64-arg-registers))))
+    ((tail-call)
+     (max 0 (- (length (cddr instr)) (length aarch64-arg-registers))))
+    (else 0)))
+
+(define (select-machine-instruction instr)
+  (cond
+    ((not (pair? instr))
+     (error "Invalid TAC instruction for instruction selection" instr))
+    ((eq? (car instr) 'label) '())
+    ((eq? (car instr) 'assign)
+     (let ((dst (cadr instr))
+           (rhs (caddr instr)))
+       (cond
+         ((or (symbol? rhs) (number? rhs) (boolean? rhs))
+          (list `(move ,dst ,rhs)))
+         ((and (pair? rhs) (eq? (car rhs) 'primop))
+          (list `(binop ,(cadr rhs) ,dst ,@(cddr rhs))))
+         ((and (pair? rhs) (eq? (car rhs) 'box))
+          (list `(alloc-box ,dst ,(cadr rhs))))
+         ((and (pair? rhs) (eq? (car rhs) 'unbox))
+          (list `(load-box ,dst ,(cadr rhs))))
+         ((and (pair? rhs) (eq? (car rhs) 'make-closure))
+          (list `(alloc-closure ,dst ,@(cdr rhs))))
+         ((and (pair? rhs) (eq? (car rhs) 'closure-call))
+          (list `(call ,dst ,@(cdr rhs))))
+         (else
+          (error "Unknown assignment rhs during instruction selection" rhs)))))
+    ((eq? (car instr) 'if)
+     (list `(branch-if ,(cadr instr) ,(caddr instr) ,(cadddr instr))))
+    ((eq? (car instr) 'goto)
+     (list `(jump ,(cadr instr))))
+    ((eq? (car instr) 'return)
+     (list `(ret ,(cadr instr))))
+    ((eq? (car instr) 'tail-call)
+     (list `(tail-call ,@(cdr instr))))
+    ((eq? (car instr) 'set-box!)
+     (list `(store-box ,(cadr instr) ,(caddr instr))))
+    (else
+     (error "Unknown TAC instruction in instruction selection" instr))))
+
+(define (select-machine-block block initial-instrs)
+  (make-machine-block
+   (basic-block-label block)
+   (append initial-instrs
+           (append-map select-machine-instruction
+                       (basic-block-instructions block)))
+   (basic-block-successors block)))
+
+(define (select-machine-procedure name params cfg)
+  (let ((param-locations (make-param-locations params)))
+    (let loop ((blocks cfg)
+               (first? #t)
+               (result '()))
+      (if (null? blocks)
+          (make-machine-procedure name
+                                  params
+                                  param-locations
+                                  (reverse result)
+                                  '()
+                                  0
+                                  '())
+          (let* ((initial-instrs
+                  (if first?
+                      (map (lambda (binding)
+                             `(move-in ,(car binding) ,(cadr binding)))
+                           param-locations)
+                      '()))
+                 (selected-block
+                  (select-machine-block (car blocks) initial-instrs)))
+            (loop (cdr blocks)
+                  #f
+                  (cons selected-block result)))))))
+
+(define (machine-instr-uses instr)
+  (case (car instr)
+    ((move-in) '())
+    ((move) (if (symbol? (caddr instr)) (list (caddr instr)) '()))
+    ((binop)
+     (append (if (symbol? (cadddr instr)) (list (cadddr instr)) '())
+             (if (symbol? (car (cddddr instr))) (list (car (cddddr instr))) '())))
+    ((alloc-box load-box)
+     (if (symbol? (caddr instr)) (list (caddr instr)) '()))
+    ((store-box)
+     (append (if (symbol? (cadr instr)) (list (cadr instr)) '())
+             (if (symbol? (caddr instr)) (list (caddr instr)) '())))
+    ((alloc-closure)
+     (let loop ((rest (cdddr instr)) (result '()))
+       (if (null? rest)
+           (reverse result)
+           (loop (cdr rest)
+                 (if (symbol? (car rest))
+                     (cons (car rest) result)
+                     result)))))
+    ((call)
+     (let ((closure (caddr instr))
+           (args (cdddr instr)))
+       (append (if (symbol? closure) (list closure) '())
+               (let loop ((rest args) (result '()))
+                 (if (null? rest)
+                     (reverse result)
+                     (loop (cdr rest)
+                           (if (symbol? (car rest))
+                               (cons (car rest) result)
+                               result)))))))
+    ((tail-call)
+     (let ((closure (cadr instr))
+           (args (cddr instr)))
+       (append (if (symbol? closure) (list closure) '())
+               (let loop ((rest args) (result '()))
+                 (if (null? rest)
+                     (reverse result)
+                     (loop (cdr rest)
+                           (if (symbol? (car rest))
+                               (cons (car rest) result)
+                               result)))))))
+    ((branch-if ret)
+     (if (symbol? (cadr instr)) (list (cadr instr)) '()))
+    ((jump) '())
+    (else (error "Unknown machine instruction in use analysis" instr))))
+
+(define (machine-instr-defs instr)
+  (case (car instr)
+    ((move-in move alloc-box load-box alloc-closure call)
+     (list (cadr instr)))
+    ((binop)
+     (list (caddr instr)))
+    ((store-box branch-if jump ret tail-call) '())
+    (else (error "Unknown machine instruction in def analysis" instr))))
+
+(define (machine-block-use block)
+  (let loop ((instrs (machine-block-instructions block))
+             (defs '())
+             (uses '()))
+    (if (null? instrs)
+        uses
+        (let* ((instr (car instrs))
+               (instr-uses (set-difference (machine-instr-uses instr) defs))
+               (instr-defs (machine-instr-defs instr)))
+          (loop (cdr instrs)
+                (set-union defs instr-defs)
+                (set-union uses instr-uses))))))
+
+(define (machine-block-def block)
+  (let loop ((instrs (machine-block-instructions block)) (defs '()))
+    (if (null? instrs)
+        defs
+        (loop (cdr instrs)
+              (set-union defs (machine-instr-defs (car instrs)))))))
+
+(define (compute-liveness blocks)
+  (let* ((count (length blocks))
+         (use-vec (list->vector (map machine-block-use blocks)))
+         (def-vec (list->vector (map machine-block-def blocks)))
+         (in-vec (make-vector count '()))
+         (out-vec (make-vector count '())))
+    (let loop ()
+      (let ((changed #f))
+        (do ((i (- count 1) (- i 1)))
+            ((< i 0))
+          (let* ((block (list-ref blocks i))
+                 (successors (machine-block-successors block))
+                 (new-out
+                  (let succ-loop ((rest successors) (result '()))
+                    (if (null? rest)
+                        result
+                        (succ-loop (cdr rest)
+                                   (set-union result
+                                              (vector-ref in-vec (car rest)))))))
+                 (new-in
+                  (set-union (vector-ref use-vec i)
+                             (set-difference new-out (vector-ref def-vec i)))))
+            (if (not (set-equal? new-out (vector-ref out-vec i)))
+                (begin
+                  (vector-set! out-vec i new-out)
+                  (set! changed #t)))
+            (if (not (set-equal? new-in (vector-ref in-vec i)))
+                (begin
+                  (vector-set! in-vec i new-in)
+                  (set! changed #t)))))
+        (if changed
+            (loop)
+            (values in-vec out-vec))))))
+
+(define (interval-start interval) (cadr interval))
+(define (interval-end interval) (caddr interval))
+
+(define (update-interval! table var point)
+  (let ((entry (assoc var table)))
+    (if entry
+        (let ((interval (cdr entry)))
+          (set-car! interval (min (car interval) point))
+          (set-cdr! interval (max (cdr interval) point)))
+        (set! table (cons (cons var (cons point point)) table))))
+  table)
+
+(define (collect-intervals blocks in-vec out-vec)
+  (let loop-blocks ((remaining blocks)
+                    (index 0)
+                    (point 0)
+                    (intervals '()))
+    (if (null? remaining)
+        (let convert ((rest intervals) (result '()))
+          (if (null? rest)
+              result
+              (let* ((entry (car rest))
+                     (range (cdr entry)))
+                (convert (cdr rest)
+                         (cons (list (car entry) (car range) (cdr range))
+                               result)))))
+        (let* ((block (car remaining))
+               (block-start point)
+               (intervals-with-live-in
+                (let live-in-loop ((vars (vector-ref in-vec index))
+                                   (current intervals))
+                  (if (null? vars)
+                      current
+                      (live-in-loop (cdr vars)
+                                    (update-interval! current (car vars) block-start)))))
+               (instrs (machine-block-instructions block)))
+          (let loop-instrs ((rest instrs)
+                            (next-point point)
+                            (current intervals-with-live-in))
+            (if (null? rest)
+                (let* ((block-end (if (= next-point block-start)
+                                      block-start
+                                      (- next-point 1)))
+                       (intervals-with-live-out
+                        (let live-out-loop ((vars (vector-ref out-vec index))
+                                            (updated current))
+                          (if (null? vars)
+                              updated
+                              (live-out-loop (cdr vars)
+                                             (update-interval! updated (car vars) block-end))))))
+                  (loop-blocks (cdr remaining)
+                               (+ index 1)
+                               next-point
+                               intervals-with-live-out))
+                (let* ((instr (car rest))
+                       (uses (machine-instr-uses instr))
+                       (defs (machine-instr-defs instr))
+                       (with-uses
+                        (let use-loop ((vars uses) (updated current))
+                          (if (null? vars)
+                              updated
+                              (use-loop (cdr vars)
+                                        (update-interval! updated (car vars) next-point)))))
+                       (with-defs
+                        (let def-loop ((vars defs) (updated with-uses))
+                          (if (null? vars)
+                              updated
+                              (def-loop (cdr vars)
+                                        (update-interval! updated (car vars) next-point))))))
+                  (loop-instrs (cdr rest)
+                               (+ next-point 1)
+                               with-defs))))))))
+
+(define (insert-by-start interval intervals)
+  (if (null? intervals)
+      (list interval)
+      (if (< (interval-start interval) (interval-start (car intervals)))
+          (cons interval intervals)
+          (cons (car intervals)
+                (insert-by-start interval (cdr intervals))))))
+
+(define (sort-intervals-by-start intervals)
+  (let loop ((rest intervals) (result '()))
+    (if (null? rest)
+        result
+        (loop (cdr rest)
+              (insert-by-start (car rest) result)))))
+
+(define (insert-active interval active)
+  (if (null? active)
+      (list interval)
+      (if (< (interval-end interval) (interval-end (car active)))
+          (cons interval active)
+          (cons (car active)
+                (insert-active interval (cdr active))))))
+
+(define (register-order register)
+  (let loop ((rest aarch64-callee-saved) (index 0))
+    (cond
+      ((null? rest) index)
+      ((eq? (car rest) register) index)
+      (else (loop (cdr rest) (+ index 1))))))
+
+(define (insert-register register registers)
+  (if (null? registers)
+      (list register)
+      (if (< (register-order register) (register-order (car registers)))
+          (cons register registers)
+          (cons (car registers)
+                (insert-register register (cdr registers))))))
+
+(define (linear-scan-allocate intervals)
+  (let loop ((remaining (sort-intervals-by-start intervals))
+             (active '())
+             (free-registers aarch64-callee-saved)
+             (homes '())
+             (next-slot 0))
+    (if (null? remaining)
+        (values homes next-slot)
+        (let* ((current (car remaining))
+               (start (interval-start current)))
+          (let expire ((rest active)
+                       (still-active '())
+                       (available free-registers))
+            (if (null? rest)
+                (if (null? available)
+                    (loop (cdr remaining)
+                          still-active
+                          available
+                          (cons (cons (car current) `(stack-slot ,next-slot)) homes)
+                          (+ next-slot 1))
+                    (let* ((register (car available))
+                           (new-active
+                            (insert-active
+                             (list (car current)
+                                   (interval-start current)
+                                   (interval-end current)
+                                   register)
+                             still-active)))
+                      (loop (cdr remaining)
+                            new-active
+                            (cdr available)
+                            (cons (cons (car current) `(register ,register)) homes)
+                            next-slot)))
+                (let* ((entry (car rest))
+                       (end (caddr entry))
+                       (register (cadddr entry)))
+                  (if (< end start)
+                      (expire (cdr rest)
+                              still-active
+                              (insert-register register available))
+                      (expire (cdr rest)
+                              (insert-active entry still-active)
+                              available)))))))))
+
+(define (lookup-home homes operand)
+  (if (symbol? operand)
+      (let ((binding (assoc operand homes)))
+        (if binding
+            (cdr binding)
+            operand))
+      operand))
+
+(define (rewrite-machine-instruction instr homes)
+  (case (car instr)
+    ((move-in)
+     `(move-in ,(lookup-home homes (cadr instr)) ,(caddr instr)))
+    ((move)
+     `(move ,(lookup-home homes (cadr instr))
+            ,(lookup-home homes (caddr instr))))
+    ((binop)
+     `(binop ,(cadr instr)
+             ,(lookup-home homes (caddr instr))
+             ,(lookup-home homes (cadddr instr))
+             ,(lookup-home homes (car (cddddr instr)))))
+    ((alloc-box)
+     `(alloc-box ,(lookup-home homes (cadr instr))
+                 ,(lookup-home homes (caddr instr))))
+    ((load-box)
+     `(load-box ,(lookup-home homes (cadr instr))
+                ,(lookup-home homes (caddr instr))))
+    ((store-box)
+     `(store-box ,(lookup-home homes (cadr instr))
+                 ,(lookup-home homes (caddr instr))))
+    ((alloc-closure)
+     `(alloc-closure ,(lookup-home homes (cadr instr))
+                     ,(caddr instr)
+                     ,@(map (lambda (operand) (lookup-home homes operand))
+                            (cdddr instr))))
+    ((call)
+     `(call ,(lookup-home homes (cadr instr))
+            ,(lookup-home homes (caddr instr))
+            ,@(map (lambda (operand) (lookup-home homes operand))
+                   (cdddr instr))))
+    ((tail-call)
+     `(tail-call ,(lookup-home homes (cadr instr))
+                 ,@(map (lambda (operand) (lookup-home homes operand))
+                        (cddr instr))))
+    ((branch-if)
+     `(branch-if ,(lookup-home homes (cadr instr))
+                 ,(caddr instr)
+                 ,(cadddr instr)))
+    ((jump) instr)
+    ((ret)
+     `(ret ,(lookup-home homes (cadr instr))))
+    (else
+     (error "Unknown machine instruction during allocation" instr))))
+
+(define (allocate-machine-procedure proc)
+  (let ((blocks (machine-procedure-blocks proc)))
+    (let-values (((in-vec out-vec) (compute-liveness blocks)))
+      (let-values (((homes frame-slots)
+                    (linear-scan-allocate
+                     (collect-intervals blocks in-vec out-vec))))
+        (let ((rewritten-blocks
+               (map (lambda (block)
+                      (make-machine-block
+                       (machine-block-label block)
+                       (map (lambda (instr)
+                              (rewrite-machine-instruction instr homes))
+                            (machine-block-instructions block))
+                       (machine-block-successors block)))
+                    blocks))
+              (used-registers
+               (dedupe-symbols
+                (let loop ((rest homes) (result '()))
+                  (if (null? rest)
+                      result
+                      (let ((home (cdar rest)))
+                        (loop (cdr rest)
+                              (if (and (pair? home) (eq? (car home) 'register))
+                                  (cons (cadr home) result)
+                                  result))))))))
+          (make-machine-procedure
+           (machine-procedure-name proc)
+           (machine-procedure-params proc)
+           (machine-procedure-param-locations proc)
+           rewritten-blocks
+           homes
+           frame-slots
+           used-registers))))))
+
+(define (max-outgoing-stack-args blocks)
+  (let block-loop ((remaining blocks) (best 0))
+    (if (null? remaining)
+        best
+        (let instr-loop ((instrs (machine-block-instructions (car remaining)))
+                         (block-best best))
+          (if (null? instrs)
+              (block-loop (cdr remaining) block-best)
+              (instr-loop (cdr instrs)
+                          (max block-best
+                               (call-stack-arg-count (car instrs)))))))))
+
+(define (stack-size-for proc)
+  (stack-align
+   (* 8 (+ (machine-procedure-frame-slots proc)
+           (length (machine-procedure-used-registers proc))
+           (max-outgoing-stack-args (machine-procedure-blocks proc))))))
+
+(define (lower-arg-moves operands)
+  (let loop ((rest operands) (index 0) (result '()))
+    (if (null? rest)
+        (reverse result)
+        (loop (cdr rest)
+              (+ index 1)
+              (cons `(move-out ,(arg-location index) ,(car rest))
+                    result)))))
+
+(define (finalize-machine-instruction instr stack-size saved-registers)
+  (case (car instr)
+    ((move-in)
+     (list `(move ,(cadr instr) ,(caddr instr))))
+    ((call)
+     (let ((dst (cadr instr))
+           (closure (caddr instr))
+           (args (cdddr instr)))
+       (append (lower-arg-moves args)
+               (list `(move-out ,(arg-location (length args)) ,closure)
+                     `(call-indirect ,(length args))
+                     `(move ,dst (arg-register ,aarch64-return-register))))))
+    ((tail-call)
+     (let ((closure (cadr instr))
+           (args (cddr instr)))
+       (append (lower-arg-moves args)
+               (list `(move-out ,(arg-location (length args)) ,closure)
+                     `(restore-callee-saved ,saved-registers)
+                     `(deallocate-frame ,stack-size)
+                     `(tail-call-indirect ,(length args))))))
+    ((ret)
+     (list `(move-out (arg-register ,aarch64-return-register) ,(cadr instr))
+           `(restore-callee-saved ,saved-registers)
+           `(deallocate-frame ,stack-size)
+           '(ret)))
+    (else
+     (list instr))))
+
+(define (finalize-machine-procedure proc)
+  (let* ((saved-registers (machine-procedure-used-registers proc))
+         (stack-size (stack-size-for proc))
+         (final-blocks
+          (let loop ((remaining (machine-procedure-blocks proc))
+                     (first? #t)
+                     (result '()))
+            (if (null? remaining)
+                (reverse result)
+                (let* ((block (car remaining))
+                       (prefix
+                        (if first?
+                            (list `(allocate-frame ,stack-size)
+                                  `(save-callee-saved ,saved-registers))
+                            '()))
+                       (final-instrs
+                        (append prefix
+                                (append-map
+                                 (lambda (instr)
+                                   (finalize-machine-instruction
+                                    instr
+                                    stack-size
+                                    saved-registers))
+                                 (machine-block-instructions block)))))
+                  (loop (cdr remaining)
+                        #f
+                        (cons (make-machine-block
+                               (machine-block-label block)
+                               final-instrs
+                               (machine-block-successors block))
+                              result)))))))
+    (make-machine-procedure
+     (machine-procedure-name proc)
+     (machine-procedure-params proc)
+     (machine-procedure-param-locations proc)
+     final-blocks
+     (machine-procedure-homes proc)
+     (machine-procedure-frame-slots proc)
+     saved-registers)))
+
+(define (cfg->allocated-machine-procedure name params cfg)
+  (finalize-machine-procedure
+   (allocate-machine-procedure
+    (select-machine-procedure name params cfg))))
+
+;;; ============================================================================
 ;;; Helper: Display results
 ;;; ============================================================================
 
@@ -1756,6 +2343,336 @@
   (display ":\n")
   (display-cfg cfg))
 
+(define (display-machine-procedure proc)
+  (display "Machine Procedure ")
+  (display (machine-procedure-name proc))
+  (display ":\n")
+  (display "    Param locations: ")
+  (write (machine-procedure-param-locations proc))
+  (newline)
+  (display "    Homes: ")
+  (write (machine-procedure-homes proc))
+  (newline)
+  (display "    Frame slots: ")
+  (write (machine-procedure-frame-slots proc))
+  (newline)
+  (display "    Used callee-saved: ")
+  (write (machine-procedure-used-registers proc))
+  (newline)
+  (for-each
+   (lambda (block)
+     (display "    Block")
+     (if (machine-block-label block)
+         (begin
+           (display " ")
+           (display (machine-block-label block)))
+         (display " entry"))
+     (display ":\n")
+     (for-each (lambda (instr)
+                 (display "        ")
+                 (write instr)
+                 (newline))
+               (machine-block-instructions block))
+     (display "        Successors: ")
+     (write (machine-block-successors block))
+     (newline))
+   (machine-procedure-blocks proc))
+  (newline))
+
+;;; ============================================================================
+;;; AArch64 assembly emission
+;;; ============================================================================
+
+(define (procedure-saved-bytes proc)
+  (* 8 (length (machine-procedure-used-registers proc))))
+
+(define (procedure-outgoing-base proc)
+  (+ (procedure-saved-bytes proc)
+     (* 8 (machine-procedure-frame-slots proc))))
+
+(define (incoming-stack-arg-offset index)
+  (+ 16 (* 8 index)))
+
+(define (stack-slot-offset proc index)
+  (+ (procedure-saved-bytes proc)
+     (* 8 index)))
+
+(define (saved-register-offset proc reg)
+  (let loop ((rest (machine-procedure-used-registers proc)) (offset 0))
+    (cond
+      ((null? rest) (error "Unknown saved register" reg))
+      ((eq? (car rest) reg) offset)
+      (else (loop (cdr rest) (+ offset 8))))))
+
+(define (asm-name sym)
+  (string-append "_" (symbol->string sym)))
+
+(define (emit-asm-line port text)
+  (display text port)
+  (newline port))
+
+(define (bool->int value)
+  (if value 1 0))
+
+(define (immediate->string value)
+  (cond
+    ((boolean? value) (number->string (bool->int value)))
+    ((number? value) (number->string value))
+    (else (error "Expected immediate value" value))))
+
+(define (register-operand? operand)
+  (and (pair? operand)
+       (memq (car operand) '(register arg-register))))
+
+(define (register-name operand)
+  (symbol->string (cadr operand)))
+
+(define (emit-load-operand port target operand proc)
+  (cond
+    ((or (number? operand) (boolean? operand))
+     (emit-asm-line port
+                    (string-append "    mov " target ", #"
+                                   (immediate->string operand))))
+    ((register-operand? operand)
+     (let ((src (register-name operand)))
+       (when (not (string=? target src))
+         (emit-asm-line port
+                        (string-append "    mov " target ", " src)))))
+    ((and (pair? operand) (eq? (car operand) 'stack-slot))
+     (emit-asm-line port
+                    (string-append "    ldr " target ", [sp, #"
+                                   (number->string
+                                    (stack-slot-offset proc (cadr operand)))
+                                   "]")))
+    ((and (pair? operand) (eq? (car operand) 'stack-arg))
+     (emit-asm-line port
+                    (string-append "    ldr " target ", [x29, #"
+                                   (number->string
+                                    (incoming-stack-arg-offset (cadr operand)))
+                                   "]")))
+    (else
+     (error "Unsupported source operand in assembly emission" operand))))
+
+(define (emit-store-operand port source operand proc)
+  (cond
+    ((register-operand? operand)
+     (let ((dst (register-name operand)))
+       (when (not (string=? source dst))
+         (emit-asm-line port
+                        (string-append "    mov " dst ", " source)))))
+    ((and (pair? operand) (eq? (car operand) 'stack-slot))
+     (emit-asm-line port
+                    (string-append "    str " source ", [sp, #"
+                                   (number->string
+                                    (stack-slot-offset proc (cadr operand)))
+                                   "]")))
+    ((and (pair? operand) (eq? (car operand) 'stack-arg))
+     (emit-asm-line port
+                    (string-append "    str " source ", [sp, #"
+                                   (number->string
+                                    (+ (procedure-outgoing-base proc)
+                                       (* 8 (cadr operand))))
+                                   "]")))
+    (else
+     (error "Unsupported destination operand in assembly emission" operand))))
+
+(define (emit-move port dst src proc)
+  (emit-load-operand port "x9" src proc)
+  (emit-store-operand port "x9" dst proc))
+
+(define (emit-procedure-address port reg proc-name)
+  (emit-asm-line port
+                 (string-append "    adrp " reg ", "
+                                (asm-name proc-name) "@PAGE"))
+  (emit-asm-line port
+                 (string-append "    add " reg ", " reg ", "
+                                (asm-name proc-name) "@PAGEOFF")))
+
+(define (emit-binop port op dst lhs rhs proc)
+  (emit-load-operand port "x9" lhs proc)
+  (emit-load-operand port "x10" rhs proc)
+  (cond
+    ((eq? op '+)
+     (emit-asm-line port "    add x11, x9, x10"))
+    ((eq? op '-)
+     (emit-asm-line port "    sub x11, x9, x10"))
+    ((eq? op '*)
+     (emit-asm-line port "    mul x11, x9, x10"))
+    ((eq? op '=)
+     (emit-asm-line port "    cmp x9, x10")
+     (emit-asm-line port "    cset x11, eq"))
+    ((eq? op '<)
+     (emit-asm-line port "    cmp x9, x10")
+     (emit-asm-line port "    cset x11, lt"))
+    ((eq? op '>)
+     (emit-asm-line port "    cmp x9, x10")
+     (emit-asm-line port "    cset x11, gt"))
+    (else
+     (error "Unsupported primop in assembly emission" op)))
+  (emit-store-operand port "x11" dst proc))
+
+(define (emit-alloc-closure port dst proc-name captures proc)
+  (let ((count (length captures)))
+    (when (> count 3)
+      (error "Too many closure captures for minimal runtime" count))
+    (emit-procedure-address port "x0" proc-name)
+    (let loop ((rest captures) (index 1))
+      (if (null? rest)
+          'done
+          (begin
+            (emit-load-operand port
+                               (string-append "x" (number->string index))
+                               (car rest)
+                               proc)
+            (loop (cdr rest) (+ index 1)))))
+    (emit-asm-line port
+                   (string-append "    bl _hop_alloc_closure_"
+                                  (number->string count)))
+    (emit-store-operand port "x0" dst proc)))
+
+(define (emit-call-helper port argc tail?)
+  (when (> argc 3)
+    (error "Too many call arguments for minimal runtime" argc))
+  (emit-asm-line port
+                 (string-append "    "
+                                (if tail? "b" "bl")
+                                " _hop_"
+                                (if tail? "tail_call_" "call_")
+                                (number->string argc))))
+
+(define (emit-machine-instruction port instr proc)
+  (case (car instr)
+    ((allocate-frame)
+     (emit-asm-line port "    stp x29, x30, [sp, #-16]!")
+     (emit-asm-line port "    mov x29, sp")
+     (when (> (cadr instr) 0)
+       (emit-asm-line port
+                      (string-append "    sub sp, sp, #"
+                                     (number->string (cadr instr))))))
+    ((save-callee-saved)
+     (for-each
+      (lambda (reg)
+        (emit-asm-line port
+                       (string-append "    str "
+                                      (symbol->string reg)
+                                      ", [sp, #"
+                                      (number->string
+                                       (saved-register-offset proc reg))
+                                      "]")))
+      (cadr instr)))
+    ((restore-callee-saved)
+     (for-each
+      (lambda (reg)
+        (emit-asm-line port
+                       (string-append "    ldr "
+                                      (symbol->string reg)
+                                      ", [sp, #"
+                                      (number->string
+                                       (saved-register-offset proc reg))
+                                      "]")))
+      (cadr instr)))
+    ((deallocate-frame)
+     (when (> (cadr instr) 0)
+       (emit-asm-line port
+                      (string-append "    add sp, sp, #"
+                                     (number->string (cadr instr)))))
+     (emit-asm-line port "    ldp x29, x30, [sp], #16"))
+    ((move move-out)
+     (emit-move port (cadr instr) (caddr instr) proc))
+    ((binop)
+     (emit-binop port
+                 (cadr instr)
+                 (caddr instr)
+                 (cadddr instr)
+                 (car (cddddr instr))
+                 proc))
+    ((alloc-box)
+     (emit-load-operand port "x0" (caddr instr) proc)
+     (emit-asm-line port "    bl _hop_alloc_box")
+     (emit-store-operand port "x0" (cadr instr) proc))
+    ((load-box)
+     (emit-load-operand port "x9" (caddr instr) proc)
+     (emit-asm-line port "    ldr x10, [x9]")
+     (emit-store-operand port "x10" (cadr instr) proc))
+    ((store-box)
+     (emit-load-operand port "x9" (cadr instr) proc)
+     (emit-load-operand port "x10" (caddr instr) proc)
+     (emit-asm-line port "    str x10, [x9]"))
+    ((alloc-closure)
+     (emit-alloc-closure port (cadr instr) (caddr instr) (cdddr instr) proc))
+    ((call-indirect)
+     (emit-call-helper port (cadr instr) #f))
+    ((tail-call-indirect)
+     (emit-call-helper port (cadr instr) #t))
+    ((branch-if)
+     (emit-load-operand port "x9" (cadr instr) proc)
+     (emit-asm-line port
+                    (string-append "    cbnz x9, L"
+                                   (symbol->string (caddr instr))))
+     (emit-asm-line port
+                    (string-append "    b L"
+                                   (symbol->string (cadddr instr)))))
+    ((jump)
+     (emit-asm-line port
+                    (string-append "    b L"
+                                   (symbol->string (cadr instr)))))
+    ((ret)
+     (emit-asm-line port "    ret"))
+    (else
+     (error "Unsupported machine instruction in assembly emission" instr))))
+
+(define (emit-machine-block port block proc first?)
+  (define (entry-setup-instruction? instr)
+    (and (pair? instr)
+         (or (memq (car instr) '(allocate-frame save-callee-saved))
+             (and (eq? (car instr) 'move)
+                  (pair? (caddr instr))
+                  (memq (car (caddr instr)) '(arg-register incoming-stack-arg))))))
+  (let* ((instrs (machine-block-instructions block))
+         (prologue
+          (if first?
+              (let loop ((rest instrs) (result '()))
+                (if (and (pair? rest)
+                         (entry-setup-instruction? (car rest)))
+                    (loop (cdr rest) (append result (list (car rest))))
+                    result))
+              '()))
+         (body
+          (if first?
+              (list-tail instrs (length prologue))
+              instrs)))
+    (for-each (lambda (instr)
+                (emit-machine-instruction port instr proc))
+              prologue)
+    (if (or (not first?) (machine-block-label block))
+        (emit-asm-line port
+                       (string-append "L"
+                                      (symbol->string (machine-block-label block))
+                                      ":")))
+    (for-each (lambda (instr)
+                (emit-machine-instruction port instr proc))
+              body)))
+
+(define (emit-machine-procedure port proc exported-name)
+  (emit-asm-line port (string-append ".globl " (asm-name exported-name)))
+  (emit-asm-line port (string-append ".p2align 2"))
+  (emit-asm-line port (string-append (asm-name exported-name) ":"))
+  (let loop ((blocks (machine-procedure-blocks proc)) (first? #t))
+    (if (null? blocks)
+        'done
+        (begin
+          (emit-machine-block port (car blocks) proc first?)
+          (loop (cdr blocks) #f))))
+  (newline port))
+
+(define (emit-aarch64-program port entry-proc procedures)
+  (emit-asm-line port ".text")
+  (emit-asm-line port "")
+  (emit-machine-procedure port entry-proc 'scheme_entry)
+  (for-each (lambda (proc)
+              (emit-machine-procedure port proc (machine-procedure-name proc)))
+            procedures))
+
 ;;; ============================================================================
 ;;; Simple hash table implementation 
 ;;; ============================================================================
@@ -1783,18 +2700,47 @@
               desugared
               closure-converted
               (build-cfg tac-instrs)
-              (map (lambda (procedure)
-                     (cons procedure
-                           (build-cfg (procedure-instructions procedure))))
-                   procedures)))))
+               (map (lambda (procedure)
+                      (cons procedure
+                            (build-cfg (procedure-instructions procedure))))
+                    procedures)))))
+
+(define (compile-to-backend expr)
+  (let-values (((uniquified desugared closure-converted entry-cfg procedures)
+                (compile-to-cfg expr)))
+    (let ((entry-machine
+           (cfg->allocated-machine-procedure 'scheme_entry '() entry-cfg))
+          (procedure-machines
+           (map (lambda (procedure+cfg)
+                  (cfg->allocated-machine-procedure
+                   (procedure-name (car procedure+cfg))
+                   (procedure-params (car procedure+cfg))
+                   (cdr procedure+cfg)))
+                procedures)))
+      (values uniquified
+              desugared
+              closure-converted
+              entry-cfg
+              procedures
+              entry-machine
+              procedure-machines))))
+
+(define (write-aarch64-program expr path)
+  (let-values (((uniquified desugared closure-converted entry-cfg procedures
+                            entry-machine procedure-machines)
+                (compile-to-backend expr)))
+    (call-with-output-file path
+      (lambda (port)
+        (emit-aarch64-program port entry-machine procedure-machines)))))
 
 (define (compile-program expr)
   (display "=== Source Program ===\n")
   (write expr) (newline)
   
   (display "\n=== After Uniquify ===\n")
-  (let-values (((uniquified desugared closure-converted entry-cfg procedures)
-                (compile-to-cfg expr)))
+  (let-values (((uniquified desugared closure-converted entry-cfg procedures
+                            entry-machine procedure-machines)
+                (compile-to-backend expr)))
     (write uniquified) (newline)
     
     (display "\n=== After letrec Desugaring ===\n")
@@ -1808,6 +2754,9 @@
     (display "Entry CFG built with ")
     (display (length entry-cfg))
     (display " basic blocks\n")
+    (display "\n=== Allocated Backend ===\n")
+    (display-machine-procedure entry-machine)
+    (for-each display-machine-procedure procedure-machines)
     
     (when (not (null? procedures))
       (display "\n=== Procedure CFGs ===\n")
@@ -1971,56 +2920,65 @@
        even?)))
 
 ;; Run tests
-(display "\nTest 1: Simple arithmetic\n")
-(compile-program test1)
+(define sample-tests
+  (list (cons "Test 1: Simple arithmetic" test1)
+        (cons "Test 2: Lambda application" test2)
+        (cons "Test 3: Box operations" test3)
+        (cons "Test 5: Nested lets" test5)
+        (cons "Test 6: Conditional with let" test6)
+        (cons "Test 7: Nested conditionals" test7)
+        (cons "Test 8: Loop-like pattern (for testing CFG)" test8)
+        (cons "Test 9: Closure capture with sequencing in lambda body" test9)
+        (cons "Test 10: Nested closures" test10)
+        (cons "Test 11: Direct sequencing in lambda body" test11)
+        (cons "Test 12: Simple values in if branches" test12)
+        (cons "Test 13: Self-recursive letrec" test13)
+        (cons "Test 14: Mutually recursive letrec" test14)
+        (cons "Test 15: Sequencing in letrec body" test15)
+        (cons "Test 16: Self-recursive letrec with accumulator" test16)
+        (cons "Test 17: Mutual letrec fallback with incompatible arities" test17)
+        (cons "Test 18: Capturing mutual letrec cluster" test18)
+        (cons "Test 19: Capturing mutual letrec escape fallback" test19)))
 
-(display "\n\nTest 2: Lambda application\n")
-(compile-program test2)
+(define named-tests
+  (list (cons 'test1 test1)
+        (cons 'test2 test2)
+        (cons 'test3 test3)
+        (cons 'test5 test5)
+        (cons 'test6 test6)
+        (cons 'test7 test7)
+        (cons 'test8 test8)
+        (cons 'test9 test9)
+        (cons 'test10 test10)
+        (cons 'test11 test11)
+        (cons 'test12 test12)
+        (cons 'test13 test13)
+        (cons 'test14 test14)
+        (cons 'test15 test15)
+        (cons 'test16 test16)
+        (cons 'test17 test17)
+        (cons 'test18 test18)
+        (cons 'test19 test19)))
 
-(display "\n\nTest 3: Box operations\n")
-(compile-program test3)
+(define (lookup-named-test name)
+  (let ((binding (assoc name named-tests)))
+    (if binding
+        (cdr binding)
+        (error "Unknown test name" name))))
 
-(display "\n\nTest 5: Nested lets\n")
-(compile-program test5)
+(define (write-named-aarch64-program name path)
+  (write-aarch64-program (lookup-named-test name) path))
 
-(display "\n\nTest 6: Conditional with let\n")
-(compile-program test6)
+(define (run-sample-tests)
+  (let loop ((rest sample-tests) (first? #t))
+    (if (null? rest)
+        'done
+        (begin
+          (display (if first? "\n" "\n\n"))
+          (display (car (car rest)))
+          (newline)
+          (compile-program (cdr (car rest)))
+          (loop (cdr rest) #f)))))
 
-(display "\n\nTest 7: Nested conditionals\n")
-(compile-program test7)
-
-(display "\n\nTest 8: Loop-like pattern (for testing CFG)\n")
-(compile-program test8)
-
-(display "\n\nTest 9: Closure capture with sequencing in lambda body\n")
-(compile-program test9)
-
-(display "\n\nTest 10: Nested closures\n")
-(compile-program test10)
-
-(display "\n\nTest 11: Direct sequencing in lambda body\n")
-(compile-program test11)
-
-(display "\n\nTest 12: Simple values in if branches\n")
-(compile-program test12)
-
-(display "\n\nTest 13: Self-recursive letrec\n")
-(compile-program test13)
-
-(display "\n\nTest 14: Mutually recursive letrec\n")
-(compile-program test14)
-
-(display "\n\nTest 15: Sequencing in letrec body\n")
-(compile-program test15)
-
-(display "\n\nTest 16: Self-recursive letrec with accumulator\n")
-(compile-program test16)
-
-(display "\n\nTest 17: Mutual letrec fallback with incompatible arities\n")
-(compile-program test17)
-
-(display "\n\nTest 18: Capturing mutual letrec cluster\n")
-(compile-program test18)
-
-(display "\n\nTest 19: Capturing mutual letrec escape fallback\n")
-(compile-program test19)
+(if (not (getenv "HOP_SCHEME_SKIP_SAMPLES"))
+    (run-sample-tests))
