@@ -5,6 +5,11 @@
 
 typedef int64_t hop_value;
 
+typedef struct {
+    uint64_t frame_slots;
+    uint64_t stack_size;
+} hop_gc_frame_desc;
+
 /*
  * Runtime value representation
  * ----------------------------
@@ -65,5 +70,24 @@ static inline hop_value hop_tag_pointer(void *ptr, int64_t tag) {
 static inline void *hop_untag_pointer(hop_value value) {
     return (void *)((uintptr_t)value & ~((uintptr_t)HOP_TAG_MASK));
 }
+
+extern void *hop_gc_top_frame;
+
+hop_value hop_alloc_box(hop_value value);
+hop_value hop_alloc_pair(hop_value car, hop_value cdr);
+hop_value hop_car(hop_value pair_value);
+hop_value hop_cdr(hop_value pair_value);
+hop_value hop_alloc_closure_0(void *code);
+hop_value hop_alloc_closure_1(void *code, hop_value env0);
+hop_value hop_alloc_closure_2(void *code, hop_value env0, hop_value env1);
+hop_value hop_alloc_closure_3(void *code, hop_value env0, hop_value env1, hop_value env2);
+hop_value hop_call_0(hop_value closure_value);
+hop_value hop_call_1(hop_value arg0, hop_value closure_value);
+hop_value hop_call_2(hop_value arg0, hop_value arg1, hop_value closure_value);
+hop_value hop_call_3(hop_value arg0, hop_value arg1, hop_value arg2, hop_value closure_value);
+hop_value hop_tail_call_0(hop_value closure_value);
+hop_value hop_tail_call_1(hop_value arg0, hop_value closure_value);
+hop_value hop_tail_call_2(hop_value arg0, hop_value arg1, hop_value closure_value);
+hop_value hop_tail_call_3(hop_value arg0, hop_value arg1, hop_value arg2, hop_value closure_value);
 
 #endif

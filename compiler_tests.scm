@@ -260,6 +260,36 @@
        (let ((f (app build 3)))
          (app f 4)))))
 
+(define test35
+  '(letrec ((build
+             (lambda (n acc)
+               (if (primop = n 0)
+                   acc
+                   (let ((junk (box n)))
+                     (app build
+                          (primop - n 1)
+                          (cons n acc))))))
+            (sum
+             (lambda (xs acc)
+               (if (null? xs)
+                   acc
+                   (app sum
+                        (cdr xs)
+                        (primop + acc (car xs)))))))
+     (app sum (app build 60 ()) 0)))
+
+(define test36
+  '(letrec ((make
+             (lambda (n)
+               (if (primop = n 0)
+                   (lambda (x) x)
+                   (let ((prev (app make (primop - n 1)))
+                         (junk (box n)))
+                     (lambda (x)
+                       (app prev (primop + x n))))))))
+     (let ((f (app make 50)))
+       (app f 0))))
+
 (define sample-tests
   (list (cons "Test 1: Simple arithmetic" test1)
         (cons "Test 2: Lambda application" test2)
@@ -293,7 +323,9 @@
         (cons "Test 31: Nested pair traversal" test31)
         (cons "Test 32: False selects else branch" test32)
         (cons "Test 33: Captured polymorphic closure fallback" test33)
-        (cons "Test 34: Self-tail letrec returns captured closure" test34)))
+        (cons "Test 34: Self-tail letrec returns captured closure" test34)
+        (cons "Test 35: Pair GC stress with transient boxes" test35)
+        (cons "Test 36: Closure GC stress with nested captures" test36)))
 
 (define named-tests
   ;; These are runnable end-to-end regression cases. test6 and test7 stay as
@@ -328,7 +360,9 @@
         (cons 'test31 test31)
         (cons 'test32 test32)
         (cons 'test33 test33)
-        (cons 'test34 test34)))
+        (cons 'test34 test34)
+        (cons 'test35 test35)
+        (cons 'test36 test36)))
 
 (define (lookup-named-test name)
   (let ((binding (assoc name named-tests)))

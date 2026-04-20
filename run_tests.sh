@@ -44,10 +44,15 @@ build_executable() {
 assert_output() {
   local test_name="$1"
   local expected="$2"
+  local heap_bytes="${3:-}"
   local exe_path
   exe_path="$(exe_path_for "$test_name")"
   build_executable "$test_name"
-  "$exe_path" "$expected" >/dev/null
+  if [[ -n "$heap_bytes" ]]; then
+    HOP_HEAP_BYTES="$heap_bytes" "$exe_path" "$expected" >/dev/null
+  else
+    "$exe_path" "$expected" >/dev/null
+  fi
   printf 'ok %s\n' "$test_name"
 }
 
@@ -109,11 +114,13 @@ runtime_cases=(
   "test32|2"
   "test33|7"
   "test34|6"
+  "test35|1830|2048"
+  "test36|1275|2048"
 )
 
 for case in "${runtime_cases[@]}"; do
-  IFS='|' read -r test_name expected <<<"$case"
-  assert_output "$test_name" "$expected"
+  IFS='|' read -r test_name expected heap_bytes <<<"$case"
+  assert_output "$test_name" "$expected" "${heap_bytes:-}"
 done
 
 assert_asm_contains "test26" 'b(l)? _cfa\.proc\.[0-9]+' 'direct closure call lowering'

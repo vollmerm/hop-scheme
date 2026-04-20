@@ -2437,7 +2437,8 @@
 
 (define aarch64-arg-registers '(x0 x1 x2 x3 x4 x5 x6 x7))
 (define aarch64-return-register 'x0)
-(define aarch64-callee-saved '(x19 x20 x21 x22 x23 x24 x25 x26 x27 x28))
+(define aarch64-callee-saved '())
+(define gc-frame-header-bytes 16)
 
 (define (set-union xs ys)
   (dedupe-symbols (append xs ys)))
@@ -2995,10 +2996,17 @@
                                (call-stack-arg-count (car instrs)))))))))
 
 (define (stack-size-for proc)
+  ;; GC adds a small hidden frame header in addition to the ordinary frame
+  ;; body. The header lives just above the saved x29/x30 pair and stores:
+  ;;   [x29, #-16] previous GC frame
+  ;;   [x29, # -8] pointer to this procedure's GC descriptor
+  ;; The rest of the frame is the usual saved-register / stack-slot /
+  ;; outgoing-arg area.
   (stack-align
-   (* 8 (+ (machine-procedure-frame-slots proc)
-           (length (machine-procedure-used-registers proc))
-           (max-outgoing-stack-args (machine-procedure-blocks proc))))))
+   (+ gc-frame-header-bytes
+      (* 8 (+ (machine-procedure-frame-slots proc)
+              (length (machine-procedure-used-registers proc))
+              (max-outgoing-stack-args (machine-procedure-blocks proc)))))))
 
 (define (lower-arg-moves operands)
   (let loop ((rest operands) (index 0) (result '()))
@@ -3017,13 +3025,18 @@
      (let ((dst (cadr instr))
            (closure (caddr instr))
             (args (cdddr instr)))
-        ;; Finalization is where pseudo-instructions become ABI-aware code:
-        ;; move arguments/results through the calling-convention locations and
-        ;; make frame teardown explicit around tail calls and returns.
-        (append (lower-arg-moves args)
-                 (list `(move-out ,(arg-location (length args)) ,closure)
-                       `(call-indirect ,(length args))
-                      `(move ,dst (arg-register ,aarch64-return-register))))))
+         ;; Finalization is where pseudo-instructions become ABI-aware code:
+         ;; move arguments/results through the calling-convention locations and
+         ;; make frame teardown explicit around tail calls and returns.
+         ;;
+         ;; GC note: ordinary calls keep the current frame live, so all roots
+         ;; must already be materialized in homes (stack slots in the current
+         ;; implementation) before control transfers to a helper that may
+         ;; allocate.
+         (append (lower-arg-moves args)
+                  (list `(move-out ,(arg-location (length args)) ,closure)
+                        `(call-indirect ,(length args))
+                       `(move ,dst (arg-register ,aarch64-return-register))))))
     ((call-known)
      (let ((dst (cadr instr))
            (proc-name (caddr instr))
@@ -3033,24 +3046,30 @@
                      `(move ,dst (arg-register ,aarch64-return-register))))))
     ((tail-call)
      (let ((closure (cadr instr))
-           (args (cddr instr)))
-       (append (lower-arg-moves args)
-               (list `(move-out ,(arg-location (length args)) ,closure)
-                      `(restore-callee-saved ,saved-registers)
-                      `(deallocate-frame ,stack-size)
-                      `(tail-call-indirect ,(length args))))))
+            (args (cddr instr)))
+        ;; Tail calls are different: once we pop the GC frame, this procedure
+        ;; stops contributing roots. That is why gc-pop-frame is sequenced
+        ;; before deallocating the frame and branching away.
+        (append (lower-arg-moves args)
+                (list `(move-out ,(arg-location (length args)) ,closure)
+                       '(gc-pop-frame)
+                       `(restore-callee-saved ,saved-registers)
+                       `(deallocate-frame ,stack-size)
+                       `(tail-call-indirect ,(length args))))))
     ((tail-call-known)
      (let ((proc-name (cadr instr))
-           (args (cddr instr)))
-       (append (lower-arg-moves args)
-               (list `(restore-callee-saved ,saved-registers)
-                     `(deallocate-frame ,stack-size)
-                     `(tail-call-label ,proc-name)))))
+            (args (cddr instr)))
+        (append (lower-arg-moves args)
+                (list '(gc-pop-frame)
+                      `(restore-callee-saved ,saved-registers)
+                      `(deallocate-frame ,stack-size)
+                      `(tail-call-label ,proc-name)))))
     ((ret)
      (list `(move-out (arg-register ,aarch64-return-register) ,(cadr instr))
-           `(restore-callee-saved ,saved-registers)
-           `(deallocate-frame ,stack-size)
-           '(ret)))
+            '(gc-pop-frame)
+            `(restore-callee-saved ,saved-registers)
+            `(deallocate-frame ,stack-size)
+            '(ret)))
     (else
      (list instr))))
 
@@ -3066,12 +3085,21 @@
                  (let* ((block (car remaining))
                         (prefix
                          (if first?
-                             ;; The first block receives the procedure prologue.
-                             ;; Epilogues are inserted instruction-by-instruction
-                             ;; when returns and tail calls are finalized.
-                             (list `(allocate-frame ,stack-size)
-                                   `(save-callee-saved ,saved-registers))
-                             '()))
+                              ;; The first block receives the procedure prologue.
+                              ;; Epilogues are inserted instruction-by-instruction
+                              ;; when returns and tail calls are finalized.
+                              ;;
+                              ;; GC note: init-frame-slots clears every root slot
+                              ;; before the frame becomes visible to the
+                              ;; collector. gc-push-frame publishes the frame
+                              ;; only after that, so the collector never sees
+                              ;; uninitialized garbage and mistake it for a live
+                              ;; Scheme pointer.
+                              (list `(allocate-frame ,stack-size)
+                                    `(save-callee-saved ,saved-registers)
+                                    `(init-frame-slots ,(machine-procedure-frame-slots proc))
+                                    `(gc-push-frame ,(machine-procedure-name proc)))
+                              '()))
                        (final-instrs
                         (append prefix
                                 (append-map
@@ -3248,6 +3276,8 @@
          (emit-asm-line port
                         (string-append "    mov " target ", " src)))))
     ((and (pair? operand) (eq? (car operand) 'stack-slot))
+     ;; Stack slots are the compiler's precise root homes. When the runtime
+     ;; walks frames during GC, these are exactly the locations it rewrites.
      (emit-asm-line port
                     (string-append "    ldr " target ", [sp, #"
                                    (number->string
@@ -3321,9 +3351,28 @@
                                 (number->string closure-tag))))
 
 (define (emit-runtime-unary-call port helper dst operand proc)
+  ;; The calling convention here reflects the GC invariant:
+  ;;   - load the argument from its home into x0
+  ;;   - call the runtime helper
+  ;;   - store the result back into a home
+  ;;
+  ;; The helper may allocate, but that is safe because every other live Scheme
+  ;; value is still sitting in an explicit stack slot rather than only in
+  ;; scratch registers.
   (emit-load-operand port "x0" operand proc)
   (emit-asm-line port (string-append "    bl " helper))
   (emit-store-operand port "x0" dst proc))
+
+(define (gc-desc-label proc-name)
+  (string-append "Lgcdesc." (symbol->string proc-name)))
+
+(define (emit-procedure-descriptor-address port reg proc-name)
+  (emit-asm-line port
+                 (string-append "    adrp " reg ", "
+                                (gc-desc-label proc-name) "@PAGE"))
+  (emit-asm-line port
+                 (string-append "    add " reg ", " reg ", "
+                                (gc-desc-label proc-name) "@PAGEOFF")))
 
 (define (emit-immediate-compare port operand immediate proc)
   (emit-load-operand port "x9" operand proc)
@@ -3414,8 +3463,38 @@
                                       ", [sp, #"
                                       (number->string
                                        (saved-register-offset proc reg))
-                                      "]")))
-      (cadr instr)))
+                                       "]")))
+       (cadr instr)))
+    ((init-frame-slots)
+     ;; Zeroing keeps newly-published frames precise even before the procedure
+     ;; has written all of its locals. xzr is not a tagged pointer value.
+     (let loop ((index 0))
+       (if (= index (cadr instr))
+           'done
+           (begin
+             (emit-asm-line port
+                            (string-append "    str xzr, [sp, #"
+                                           (number->string
+                                            (stack-slot-offset proc index))
+                                           "]"))
+             (loop (+ index 1))))))
+    ((gc-push-frame)
+     ;; Publish the current frame to the collector. After this point, any
+     ;; allocation helper can find this frame by following hop_gc_top_frame and
+     ;; then use the descriptor to locate its root slots precisely.
+     (emit-procedure-descriptor-address port "x9" (cadr instr))
+     (emit-procedure-address port "x10" 'hop_gc_top_frame)
+     (emit-asm-line port "    ldr x11, [x10]")
+     (emit-asm-line port "    str x11, [x29, #-16]")
+     (emit-asm-line port "    str x9, [x29, #-8]")
+     (emit-asm-line port "    mov x11, x29")
+     (emit-asm-line port "    str x11, [x10]"))
+    ((gc-pop-frame)
+     ;; Remove the frame from the collector's linked list before tail transfer
+     ;; or return tears the frame down.
+     (emit-procedure-address port "x9" 'hop_gc_top_frame)
+     (emit-asm-line port "    ldr x10, [x29, #-16]")
+     (emit-asm-line port "    str x10, [x9]"))
     ((restore-callee-saved)
      (for-each
       (lambda (reg)
@@ -3445,14 +3524,17 @@
     ((alloc-box)
       (emit-runtime-unary-call port "_hop_alloc_box" (cadr instr) (caddr instr) proc))
     ((alloc-pair)
+      ;; The pair helper may trigger GC. By the time we copy values into x0/x1,
+      ;; the source operands already live in stack slots, so the runtime can
+      ;; recover them precisely if it collects.
       (emit-load-operand port "x0" (caddr instr) proc)
       (emit-load-operand port "x1" (cadddr instr) proc)
       (emit-asm-line port "    bl _hop_alloc_pair")
       (emit-store-operand port "x0" (cadr instr) proc))
     ((load-box)
-      (emit-load-box-address port (caddr instr) proc)
-      (emit-asm-line port "    ldr x10, [x9]")
-      (emit-store-operand port "x10" (cadr instr) proc))
+       (emit-load-box-address port (caddr instr) proc)
+       (emit-asm-line port "    ldr x10, [x9, #8]")
+       (emit-store-operand port "x10" (cadr instr) proc))
     ((load-closure-env)
       (emit-load-closure-address port (caddr instr) proc)
       (emit-asm-line port
@@ -3477,9 +3559,9 @@
       (emit-immediate-compare port (caddr instr) null-immediate proc)
       (emit-bool-result port "eq" (cadr instr) proc))
     ((store-box)
-      (emit-load-box-address port (cadr instr) proc)
-      (emit-load-operand port "x10" (caddr instr) proc)
-      (emit-asm-line port "    str x10, [x9]"))
+       (emit-load-box-address port (cadr instr) proc)
+       (emit-load-operand port "x10" (caddr instr) proc)
+       (emit-asm-line port "    str x10, [x9, #8]"))
     ((alloc-closure)
      (emit-alloc-closure port (cadr instr) (caddr instr) (cdddr instr) proc))
     ((call-indirect)
@@ -3510,10 +3592,10 @@
 (define (emit-machine-block port block proc first?)
   (define (entry-setup-instruction? instr)
     (and (pair? instr)
-         (or (memq (car instr) '(allocate-frame save-callee-saved))
-             (and (eq? (car instr) 'move)
-                  (pair? (caddr instr))
-                  (memq (car (caddr instr)) '(arg-register incoming-stack-arg))))))
+         (or (memq (car instr) '(allocate-frame save-callee-saved init-frame-slots gc-push-frame))
+              (and (eq? (car instr) 'move)
+                   (pair? (caddr instr))
+                   (memq (car (caddr instr)) '(arg-register incoming-stack-arg))))))
   (let* ((instrs (machine-block-instructions block))
          (prologue
           (if first?
@@ -3551,12 +3633,34 @@
           (loop (cdr blocks) #f))))
   (newline port))
 
+(define (emit-procedure-descriptor port proc)
+  ;; A descriptor is the runtime's compact summary of a frame layout.
+  ;; For this first collector we only need:
+  ;;   - how many stack slots may hold Scheme values
+  ;;   - how many bytes to step from x29 down to slot 0
+  ;; That is enough for a precise stack walk because the current backend keeps
+  ;; live values in those slots at allocation safepoints.
+  (emit-asm-line port (string-append ".p2align 3"))
+  (emit-asm-line port (string-append (gc-desc-label (machine-procedure-name proc)) ":"))
+  (emit-asm-line port
+                 (string-append "    .quad "
+                                (number->string (machine-procedure-frame-slots proc))))
+  (emit-asm-line port
+                 (string-append "    .quad "
+                                (number->string (stack-size-for proc)))))
+
 (define (emit-aarch64-program port entry-proc procedures)
   (emit-asm-line port ".text")
   (emit-asm-line port "")
   (emit-machine-procedure port entry-proc 'scheme_entry)
   (for-each (lambda (proc)
               (emit-machine-procedure port proc (machine-procedure-name proc)))
+            procedures)
+  (emit-asm-line port ".data")
+  (emit-asm-line port "")
+  (emit-procedure-descriptor port entry-proc)
+  (for-each (lambda (proc)
+              (emit-procedure-descriptor port proc))
             procedures))
 
 ;;; ============================================================================
