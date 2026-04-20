@@ -207,14 +207,20 @@
 ;;; ============================================================================
 
 (define (desugar-letrec expr)
+  ;; Mutual tail-call lowering only works when every member can share one
+  ;; calling convention. This arity check is part of that contract.
   (define (all-same-arity? bindings)
     (or (null? bindings)
         (let ((arity (length (cadr (cadar bindings)))))
           (all (lambda (binding)
                  (= (length (cadr (cadr binding))) arity))
-               bindings))))
+                bindings))))
 
   (define (tail-recursion-safe? expr group-names tail?)
+    ;; We only rewrite recursive calls into explicit tail-call markers when the
+    ;; recursive binding is used in positions that later passes can preserve as
+    ;; jumps. This predicate rejects shapes that would require reifying a
+    ;; closure or value from the recursive variable mid-expression.
     (cond
       ((symbol? expr)
        (not (memq expr group-names)))
@@ -514,10 +520,12 @@
   (define (rewrite expr env current-group tail?)
     (cond
       ((symbol? expr)
+       ;; After desugaring, recursive bindings are represented as boxes that
+       ;; hold closures. Reading such a variable therefore becomes an unbox.
        (let ((binding (assoc expr env)))
-         (if binding
-             `(unbox ,(cadr binding))
-             expr)))
+          (if binding
+              `(unbox ,(cadr binding))
+              expr)))
       
       ((literal-expr? expr) expr)
       
@@ -550,21 +558,24 @@
            (let* ((bindings (cadr expr))
                   (names (map car bindings))
                   (group-eligible?
-                   (and (eligible-mutual-tail-group? bindings)
-                        (group-entry-safe? (body->expr (cddr expr)) names))))
-             (if (not (all (lambda (binding)
-                             (and (single-binding? binding)
-                                  (lambda-expr? (cadr binding))))
-                          bindings))
-                (error "letrec requires lambda bindings" expr)
-                (let* ((base-env (remove-shadowed-bindings env names))
-                       (rec-env (append (map (lambda (name) (list name name)) names)
-                                        base-env))
-                       (box-bindings
-                        (map (lambda (name) (list name '(box #f))) names))
-                       (init-exprs
-                        (map (lambda (binding)
-                               `(set-box! ,(car binding)
+                    (and (eligible-mutual-tail-group? bindings)
+                         (group-entry-safe? (body->expr (cddr expr)) names))))
+              (if (not (all (lambda (binding)
+                              (and (single-binding? binding)
+                                   (lambda-expr? (cadr binding))))
+                           bindings))
+                 (error "letrec requires lambda bindings" expr)
+                 (let* ((base-env (remove-shadowed-bindings env names))
+                        (rec-env (append (map (lambda (name) (list name name)) names)
+                                         base-env))
+                        ;; Each letrec name gets a box first so every lambda in
+                        ;; the group can refer to the whole recursive knot while
+                        ;; the closures are still being constructed.
+                        (box-bindings
+                         (map (lambda (name) (list name '(box #f))) names))
+                        (init-exprs
+                         (map (lambda (binding)
+                                `(set-box! ,(car binding)
                                           ,(rewrite-lambda (cadr binding)
                                                            rec-env
                                                            (if group-eligible?
@@ -582,10 +593,14 @@
           ((app)
            (let ((rator (cadr expr))
                  (args (cddr expr)))
-            (if (and tail?
-                     current-group
-                     (symbol? rator)
-                     (memq rator current-group))
+             ;; The source language still says "app", but by this point we have
+             ;; enough information to distinguish ordinary calls from
+             ;; self/group tail recursion. Later passes can then lower the
+             ;; explicit markers to jumps.
+             (if (and tail?
+                      current-group
+                      (symbol? rator)
+                      (memq rator current-group))
                 (if (> (length current-group) 1)
                     `(group-tail-call ,rator
                                       ,@(map (lambda (e) (rewrite e env current-group #f)) args))
@@ -634,7 +649,7 @@
 ;;; Turns lambdas into explicit closure values.
 ;;;
 ;;; After this pass, a function is represented as:
-;;;   1. code (a top-level procedure),
+;;;   1. code plus an explicit environment interface,
 ;;;   2. an explicit environment payload for captured values, and
 ;;;   3. closure-call / make-closure forms instead of source-level application.
 ;;; ============================================================================
@@ -697,6 +712,11 @@
   (dedupe-symbols (collect expr bound)))
 
 (define (closure-convert expr)
+  ;; This pass makes environments first-class. Every variable reference is
+  ;; reinterpreted as either:
+  ;;   - (local x): available directly as a procedure/local binding, or
+  ;;   - (closure env.k): represented by one of the synthetic environment
+  ;;     parameters introduced for captured values.
   (define (any predicate lst)
     (cond
       ((null? lst) #f)
@@ -870,13 +890,17 @@
     (let ((prefix (extract-group-prefix exprs env)))
       (and prefix
             (let* ((members (car prefix))
-                  (remaining (cdr prefix))
-                  (member-names (map cadr members))
-                  (shared-captures
-                   (dedupe-symbols
-                    (append-map
-                     (lambda (member)
-                       (free-vars (cadddr member)
+                   (remaining (cdr prefix))
+                   (member-names (map cadr members))
+                    ;; All closures in a mutually tail-recursive cluster share
+                    ;; one environment payload. That keeps inter-member tail
+                    ;; calls cheap and gives later lowering passes a clear path
+                    ;; to jump among entry labels without rebuilding closures.
+                    (shared-captures
+                    (dedupe-symbols
+                     (append-map
+                      (lambda (member)
+                        (free-vars (cadddr member)
                                   (append (caddr member) member-names)))
                      members)))
                   (capture-params
@@ -919,8 +943,9 @@
           (map (lambda (e) (convert e env self-tail-prefix)) exprs))))
 
   (define (convert expr env self-tail-prefix)
-    ;; env: association list mapping variable names to their representation
-    ;; Either (local var) or (closure env-var) for captured variables.
+    ;; env maps source names to their runtime representation. Reading a source
+    ;; variable after closure conversion is no longer uniform: locals stay as
+    ;; locals, while captured variables become explicit closure payload reads.
     
     (cond
       ((symbol? expr)
@@ -957,27 +982,27 @@
               `(let ((,var ,val-converted)) ,body-converted)))
            
             ((lambda)
-            (let* ((params (cadr expr))
-                   (body (body->expr (cddr expr)))
-                   (fvs (free-vars body params))
-
-                   (env-vars (make-env-vars "env." (length fvs)))
-
-                  ;; Build new environment for lambda body
-                   (param-bindings (map (lambda (p) (list p `(local ,p))) params))
-                   (env-bindings (map (lambda (fv env-var)
-                                        (list fv `(closure ,env-var)))
-                                     fvs env-vars))
+             (let* ((params (cadr expr))
+                    (body (body->expr (cddr expr)))
+                    (fvs (free-vars body params))
+                    ;; These synthetic parameters stand for the closure payload
+                    ;; that will be prepended to the user-visible parameters.
+                    (env-vars (make-env-vars "env." (length fvs)))
+                    (param-bindings (map (lambda (p) (list p `(local ,p))) params))
+                    (env-bindings (map (lambda (fv env-var)
+                                         (list fv `(closure ,env-var)))
+                                      fvs env-vars))
                   (new-env (append param-bindings env-bindings env))
                   (self-tail-env (map (lambda (env-var) `(local ,env-var)) env-vars))
                   
                   (body-converted (convert body new-env self-tail-env)))
-             
-             ;; Create closure structure
-             `(make-closure 
-              (lambda ,(append env-vars params) ,body-converted)
-              ,@(map (lambda (fv) 
-                       (let ((binding (assoc fv env)))
+              ;; The output lambda now expects its environment explicitly, and
+              ;; make-closure packages the current values of the free variables
+              ;; beside that code pointer.
+              `(make-closure 
+               (lambda ,(append env-vars params) ,body-converted)
+               ,@(map (lambda (fv) 
+                        (let ((binding (assoc fv env)))
                          (if binding
                              (cadr binding)
                              fv)))  ; Global/primitive
@@ -1066,6 +1091,9 @@
     (string->symbol (string-append "cfa.proc." (number->string proc-counter))))
 
   (define (normalize-simple expr)
+    ;; 0CFA is easier to teach and implement over names than over arbitrary
+    ;; nested expressions. This helper hoists a complex subexpression into a
+    ;; temporary let-binding whenever needed.
     (let ((normalized (normalize expr)))
       (if (cfa-simple-expr? normalized)
           (values '() normalized)
@@ -1107,25 +1135,31 @@
             `(let ((,var ,val)) ,@body-exprs)))
          ((lambda)
           `(lambda ,(cadr expr) ,@(normalize-sequence (cddr expr))))
-         ((make-closure)
-          (let* ((lambda-expr (cadr expr))
-                 (captures (cddr expr)))
-            (let-values (((capture-bindings simple-captures)
-                          (normalize-simple-list captures)))
-              (let ((proc-name (fresh-cfa-proc)))
-                (wrap-let-bindings
-                 capture-bindings
-                 `(make-closure ,proc-name
-                                ,(normalize lambda-expr)
-                                ,@simple-captures))))))
-         ((closure-call)
-          (let-values (((op-bindings simple-op)
-                        (normalize-simple (cadr expr)))
-                       ((arg-bindings simple-args)
-                        (normalize-simple-list (cddr expr))))
-            (wrap-let-bindings
-             (append op-bindings arg-bindings)
-             `(closure-call ,simple-op ,@simple-args))))
+          ((make-closure)
+           (let* ((lambda-expr (cadr expr))
+                  (captures (cddr expr)))
+             (let-values (((capture-bindings simple-captures)
+                           (normalize-simple-list captures)))
+               ;; Every closure allocation gets a stable synthetic procedure
+               ;; name so the analysis can talk about "which procedure flows
+               ;; here?" without comparing lambda syntax trees.
+               (let ((proc-name (fresh-cfa-proc)))
+                 (wrap-let-bindings
+                  capture-bindings
+                  `(make-closure ,proc-name
+                                 ,(normalize lambda-expr)
+                                 ,@simple-captures))))))
+          ((closure-call)
+           (let-values (((op-bindings simple-op)
+                         (normalize-simple (cadr expr)))
+                        ((arg-bindings simple-args)
+                         (normalize-simple-list (cddr expr))))
+             ;; Calls are normalized to "simple operator, simple arguments" so
+             ;; the analysis logic can focus on flow propagation instead of
+             ;; recursively re-lowering nested source expressions.
+             (wrap-let-bindings
+              (append op-bindings arg-bindings)
+              `(closure-call ,simple-op ,@simple-args))))
          ((self-tail-call)
           (let-values (((arg-bindings simple-args)
                         (normalize-simple-list (cdr expr))))
@@ -1164,6 +1198,11 @@
   (normalize expr))
 
 (define (run-0cfa expr)
+  ;; The analysis tracks four related facts:
+  ;;   - procedures: metadata for every closure-allocated procedure,
+  ;;   - var-flow: which procedures may flow to each variable-like name,
+  ;;   - box-flow: which procedures may be stored in each box,
+  ;;   - proc-results: which procedures may be returned by each procedure.
   (define procedures (make-hash-table))
   (define var-flow (make-hash-table))
   (define box-flow (make-hash-table))
@@ -1199,6 +1238,8 @@
     (repr-name expr))
 
   (define (collect-procedures expr)
+    ;; First pass over the normalized tree: assign stable metadata to each
+    ;; make-closure site so the dataflow phase can refer to procedures by name.
     (cond
       ((or (symbol? expr) (literal-expr? expr)) 'done)
       ((pair? expr)
@@ -1279,9 +1320,9 @@
                  (value-set (analyze-expr (cadr binding) current-proc)))
             (add-flow! var-flow var value-set)
             (analyze-expr (body->expr (cddr expr)) current-proc)))
-         ((make-closure)
-          (let* ((proc-name (cadr expr))
-                 (meta (hash-ref procedures proc-name))
+          ((make-closure)
+           (let* ((proc-name (cadr expr))
+                  (meta (hash-ref procedures proc-name))
                  (capture-count (car meta))
                  (params (cadr meta))
                  (captures (cdddr expr))
@@ -1292,23 +1333,28 @@
                         (loop (cdr rest)
                               (- remaining 1)
                               (cons (car rest) result))))))
-            (let loop ((env-rest env-params) (capture-rest captures))
-              (if (or (null? env-rest) (null? capture-rest))
-                  'done
-                  (begin
+             ;; Closing over a value means the abstract values flowing to that
+             ;; capture now also flow to the synthetic environment parameter.
+             (let loop ((env-rest env-params) (capture-rest captures))
+               (if (or (null? env-rest) (null? capture-rest))
+                   'done
+                   (begin
                     (add-flow! var-flow
                                (car env-rest)
                                (analyze-expr (car capture-rest) current-proc))
                     (loop (cdr env-rest) (cdr capture-rest)))))
             (list proc-name)))
-         ((closure-call)
-          (let* ((proc-set (analyze-expr (cadr expr) current-proc))
-                 (arg-sets (map (lambda (arg)
-                                  (analyze-expr arg current-proc))
-                                (cddr expr))))
-            (for-each
-             (lambda (proc-name)
-               (let* ((meta (hash-ref procedures proc-name))
+          ((closure-call)
+           (let* ((proc-set (analyze-expr (cadr expr) current-proc))
+                  (arg-sets (map (lambda (arg)
+                                   (analyze-expr arg current-proc))
+                                 (cddr expr))))
+             ;; For every possible callee, push each argument's abstract values
+             ;; into that callee's formal parameters, then union together the
+             ;; abstract results that procedure may return.
+             (for-each
+              (lambda (proc-name)
+                (let* ((meta (hash-ref procedures proc-name))
                       (capture-count (car meta))
                       (params (cadr meta))
                       (actual-params (list-tail params capture-count)))
@@ -1460,15 +1506,18 @@
             `(make-closure ,(cadr expr)
                            ,(rewrite (caddr expr))
                            ,@(map rewrite (cdddr expr))))
-           ((closure-call)
-            (let* ((rator (rewrite (cadr expr)))
-                   (args (map rewrite (cddr expr)))
-                   (targets (closure-set rator)))
-              (if (and (= (length targets) 1)
-                       (hash-ref procedures (car targets)))
-                  (let* ((proc-name (car targets))
-                         (meta (hash-ref procedures proc-name))
-                         (capture-count (car meta)))
+            ((closure-call)
+             (let* ((rator (rewrite (cadr expr)))
+                    (args (map rewrite (cddr expr)))
+                    (targets (closure-set rator)))
+               ;; If 0CFA proves there is exactly one possible callee, keep the
+               ;; closure value for its environment but replace the generic
+               ;; indirect call with a direct known-call form.
+               (if (and (= (length targets) 1)
+                        (hash-ref procedures (car targets)))
+                   (let* ((proc-name (car targets))
+                          (meta (hash-ref procedures proc-name))
+                          (capture-count (car meta)))
                     `(known-call ,proc-name ,capture-count ,rator ,@args))
                   `(closure-call ,rator ,@args))))
            ((known-call)
@@ -1538,8 +1587,10 @@
   (used-registers machine-procedure-used-registers))
 
 (define (expr->tac expr)
-  ;; Convert an expression to TAC form.
-  ;; Returns: (values instructions procedures)
+  ;; Convert expression-shaped IR into a linear, statement-shaped program.
+  ;; The result splits into:
+  ;;   - TAC instructions for the current body, and
+  ;;   - lifted procedures created from nested lambdas/closures.
   
   (define temp-counter 0)
   (define (fresh-temp)
@@ -1586,6 +1637,9 @@
               (append closure-procedures arg-procedures))))
 
   (define (convert-known-call proc-name capture-count closure-expr args dest tail?)
+    ;; known-call still starts from a closure value because that closure carries
+    ;; captured variables. TAC makes those hidden environment arguments explicit
+    ;; by loading each payload slot before emitting the direct call.
     (let-values (((closure-instrs closure-var closure-procedures)
                   (convert-value closure-expr #f))
                  ((arg-instrs arg-vars arg-procedures)
@@ -1793,10 +1847,13 @@
                      (list (cadr member) label))
                    members
                    member-labels))
-             (capture-param-names (map car capture-specs))
-             (capture-value-exprs (map cadr capture-specs)))
+              (capture-param-names (map car capture-specs))
+              (capture-value-exprs (map cadr capture-specs)))
         (let-values (((capture-instrs capture-vars capture-procedures)
                       (convert-list capture-value-exprs)))
+          ;; A tail-recursive cluster becomes one procedure with an entry tag.
+          ;; Entering the cluster chooses a member label; jumping between
+          ;; members becomes a plain goto after rewriting the shared parameters.
           (let ((init-instrs
                  (let loop ((rest members) (index 0) (instrs capture-instrs))
                    (if (null? rest)
@@ -1890,11 +1947,13 @@
                            (append instrs new-instrs)
                            (append procedures new-procedures)))))))))
          
-         ((if)
-          (let* ((then-label (fresh-temp))
-                 (else-label (fresh-temp)))
-            (let-values (((test-instrs test-var test-procedures)
-                          (convert-value (cadr expr) #f))
+          ((if)
+           (let* ((then-label (fresh-temp))
+                  (else-label (fresh-temp)))
+             ;; Tail-position conditionals can branch directly to two tail
+             ;; fragments because both branches end in a return or tail-call.
+             (let-values (((test-instrs test-var test-procedures)
+                           (convert-value (cadr expr) #f))
                          ((then-instrs then-procedures)
                           (convert-tail (caddr expr)
                                         current-params
@@ -1936,17 +1995,20 @@
                               body-instrs)
                       (append val-procedures body-procedures)))))
          
-         ((self-tail-call)
-          (if (not current-entry-label)
-              (error "self-tail-call outside of procedure" expr)
-              (let ((args (cdr expr)))
-                (when (not (= (length args) (length current-params)))
-                  (error "Arity mismatch in self-tail-call" expr))
-                (let-values (((arg-instrs arg-vars arg-procedures)
-                              (convert-list args)))
-                  (values (append arg-instrs
-                                  (map (lambda (param arg)
-                                         `(assign ,param ,arg))
+          ((self-tail-call)
+           (if (not current-entry-label)
+               (error "self-tail-call outside of procedure" expr)
+               (let ((args (cdr expr)))
+                 (when (not (= (length args) (length current-params)))
+                   (error "Arity mismatch in self-tail-call" expr))
+                 (let-values (((arg-instrs arg-vars arg-procedures)
+                               (convert-list args)))
+                   ;; Rebind the current parameters and jump back to the
+                   ;; procedure entry label. At TAC level, a self tail call is
+                   ;; already just control flow, not a call instruction.
+                   (values (append arg-instrs
+                                   (map (lambda (param arg)
+                                          `(assign ,param ,arg))
                                        current-params
                                        arg-vars)
                                   (list `(goto ,current-entry-label)))
@@ -2077,13 +2139,15 @@
           ((unbox car cdr pair? null?)
            (convert-unary-value-op (car expr) (cadr expr)))
          
-         ((if)
-          (let* ((then-label (fresh-temp))
-                 (else-label (fresh-temp))
-                 (join-label (fresh-temp))
-                 (result-var (or dest (fresh-temp))))
-            (let-values (((test-instrs test-var test-procedures)
-                          (convert-value (cadr expr) #f))
+          ((if)
+           (let* ((then-label (fresh-temp))
+                  (else-label (fresh-temp))
+                  (join-label (fresh-temp))
+                  (result-var (or dest (fresh-temp))))
+             ;; Value-position conditionals need an explicit join so both
+             ;; branches assign into the same destination before control merges.
+             (let-values (((test-instrs test-var test-procedures)
+                           (convert-value (cadr expr) #f))
                          ((then-instrs then-result then-procedures)
                           (convert-value (caddr expr) result-var))
                          ((else-instrs else-result else-procedures)
@@ -2117,11 +2181,11 @@
                           body-result
                           (append val-procedures body-procedures)))))))
          
-         ((make-closure)
-           (let* ((named-closure?
-                   (and (symbol? (cadr expr))
-                        (pair? (caddr expr))
-                        (eq? (car (caddr expr)) 'lambda)))
+          ((make-closure)
+            (let* ((named-closure?
+                    (and (symbol? (cadr expr))
+                         (pair? (caddr expr))
+                         (eq? (car (caddr expr)) 'lambda)))
                   (proc-name (if named-closure?
                                  (cadr expr)
                                  (fresh-proc)))
@@ -2131,12 +2195,15 @@
                   (free-vars (if named-closure?
                                  (cdddr expr)
                                  (cddr expr)))
-                  (proc-params (cadr lambda-expr))
-                  (proc-body (body->expr (cddr lambda-expr))))
-             (let ((entry-label (fresh-temp)))
-               (let-values (((body-instrs body-procedures)
-                             (convert-tail proc-body
-                                          proc-params
+                   (proc-params (cadr lambda-expr))
+                   (proc-body (body->expr (cddr lambda-expr))))
+              (let ((entry-label (fresh-temp)))
+                ;; TAC lifts each lambda body into its own procedure and turns
+                ;; the source-level lambda expression into data: a make-closure
+                ;; instruction that points at the lifted procedure plus captures.
+                (let-values (((body-instrs body-procedures)
+                              (convert-tail proc-body
+                                           proc-params
                                           entry-label
                                           #f
                                           #f))
@@ -2229,8 +2296,8 @@
 ;;; ============================================================================
 
 (define (build-cfg tac-instrs)
-  ;; Build proper control flow graph from TAC instructions
-  ;; Returns list of basic blocks in order
+  ;; Convert linear TAC into basic blocks. Each block has one entry and exits
+  ;; only through its final terminator or by falling through to the next block.
   
   (define (terminator? instr)
     (and (pair? instr)
@@ -2245,7 +2312,8 @@
                (terminator? (list-ref instrs (- index 1)))))))
   
   (define (split-into-blocks instrs)
-    ;; Split instructions into basic blocks at leaders
+    ;; Leaders mark block boundaries: the first instruction, every label, and
+    ;; every instruction that follows a terminator.
     (let* ((len (length instrs))
            (leaders (make-vector len #f)))
       
@@ -2295,7 +2363,8 @@
                  current-label))))))
   
   (define (find-successors blocks)
-    ;; Determine successors for each basic block
+    ;; Once blocks are formed, successor edges come only from the final
+    ;; instruction of each block.
     (let ((label->block (make-hash-table)))
       
       ;; Build mapping from label to block index
@@ -2489,12 +2558,15 @@
                                   '()
                                   0
                                   '())
-          (let* ((initial-instrs
-                  (if first?
-                      (map (lambda (binding)
-                             `(move-in ,(car binding) ,(cadr binding)))
-                           param-locations)
-                      '()))
+           (let* ((initial-instrs
+                   (if first?
+                       ;; Parameters arrive according to the calling convention.
+                       ;; The backend IR makes that explicit with move-in pseudo
+                       ;; instructions before ordinary instruction selection.
+                       (map (lambda (binding)
+                              `(move-in ,(car binding) ,(cadr binding)))
+                            param-locations)
+                       '()))
                  (selected-block
                   (select-machine-block (car blocks) initial-instrs)))
             (loop (cdr blocks)
@@ -2605,6 +2677,9 @@
          (out-vec (make-vector count '())))
     (let loop ()
       (let ((changed #f))
+        ;; Standard backwards dataflow:
+        ;;   out[B] = union of in[S] for successors S
+        ;;   in[B]  = use[B] union (out[B] - def[B])
         (do ((i (- count 1) (- i 1)))
             ((< i 0))
           (let* ((block (list-ref blocks i))
@@ -2644,6 +2719,8 @@
   table)
 
 (define (collect-intervals blocks in-vec out-vec)
+  ;; Collapse liveness information into live intervals. Linear scan only needs
+  ;; to know the first and last program point where each variable is live.
   (let loop-blocks ((remaining blocks)
                     (index 0)
                     (point 0)
@@ -2752,14 +2829,17 @@
         (values homes next-slot)
         (let* ((current (car remaining))
                (start (interval-start current)))
-          (let expire ((rest active)
-                       (still-active '())
-                       (available free-registers))
-            (if (null? rest)
-                (if (null? available)
-                    (loop (cdr remaining)
-                          still-active
-                          available
+           (let expire ((rest active)
+                        (still-active '())
+                        (available free-registers))
+             (if (null? rest)
+                 (if (null? available)
+                     ;; This minimal allocator spills instead of splitting
+                     ;; intervals: if no register is free, the value gets a
+                     ;; stack slot for its whole live range.
+                     (loop (cdr remaining)
+                           still-active
+                           available
                           (cons (cons (car current) `(stack-slot ,next-slot)) homes)
                           (+ next-slot 1))
                     (let* ((register (car available))
@@ -2936,10 +3016,13 @@
     ((call)
      (let ((dst (cadr instr))
            (closure (caddr instr))
-           (args (cdddr instr)))
-       (append (lower-arg-moves args)
-                (list `(move-out ,(arg-location (length args)) ,closure)
-                      `(call-indirect ,(length args))
+            (args (cdddr instr)))
+        ;; Finalization is where pseudo-instructions become ABI-aware code:
+        ;; move arguments/results through the calling-convention locations and
+        ;; make frame teardown explicit around tail calls and returns.
+        (append (lower-arg-moves args)
+                 (list `(move-out ,(arg-location (length args)) ,closure)
+                       `(call-indirect ,(length args))
                       `(move ,dst (arg-register ,aarch64-return-register))))))
     ((call-known)
      (let ((dst (cadr instr))
@@ -2975,17 +3058,20 @@
   (let* ((saved-registers (machine-procedure-used-registers proc))
          (stack-size (stack-size-for proc))
          (final-blocks
-          (let loop ((remaining (machine-procedure-blocks proc))
+           (let loop ((remaining (machine-procedure-blocks proc))
                      (first? #t)
                      (result '()))
             (if (null? remaining)
                 (reverse result)
-                (let* ((block (car remaining))
-                       (prefix
-                        (if first?
-                            (list `(allocate-frame ,stack-size)
-                                  `(save-callee-saved ,saved-registers))
-                            '()))
+                 (let* ((block (car remaining))
+                        (prefix
+                         (if first?
+                             ;; The first block receives the procedure prologue.
+                             ;; Epilogues are inserted instruction-by-instruction
+                             ;; when returns and tail calls are finalized.
+                             (list `(allocate-frame ,stack-size)
+                                   `(save-callee-saved ,saved-registers))
+                             '()))
                        (final-instrs
                         (append prefix
                                 (append-map
@@ -3012,9 +3098,11 @@
      saved-registers)))
 
 (define (cfg->allocated-machine-procedure name params cfg)
+  ;; This helper is the whole backend pipeline for one procedure-sized CFG:
+  ;; instruction selection -> liveness/allocation -> ABI finalization.
   (finalize-machine-procedure
    (allocate-machine-procedure
-    (select-machine-procedure name params cfg))))
+     (select-machine-procedure name params cfg))))
 
 ;;; ============================================================================
 ;;; Helper: Display results
@@ -3516,8 +3604,8 @@
 
 (define (compile-to-backend expr)
   (let-values (((uniquified desugared closure-converted cfa-normalized
-                            cfa-rewritten entry-cfg procedures)
-                (compile-to-cfg expr)))
+                             cfa-rewritten entry-cfg procedures)
+                 (compile-to-cfg expr)))
     (let ((entry-machine
            (cfg->allocated-machine-procedure 'scheme_entry '() entry-cfg))
           (procedure-machines
@@ -3539,14 +3627,17 @@
 
 (define (write-aarch64-program expr path)
   (let-values (((uniquified desugared closure-converted cfa-normalized
-                            cfa-rewritten entry-cfg procedures
-                             entry-machine procedure-machines)
-                (compile-to-backend expr)))
+                             cfa-rewritten entry-cfg procedures
+                              entry-machine procedure-machines)
+                 (compile-to-backend expr)))
     (call-with-output-file path
       (lambda (port)
         (emit-aarch64-program port entry-machine procedure-machines)))))
 
 (define (compile-program expr)
+  ;; compile-program is intentionally pedagogical: it prints the major
+  ;; representations in pipeline order so a reader can watch one source program
+  ;; become lower-level at each pass boundary.
   (display "=== Source Program ===\n")
   (write expr) (newline)
   

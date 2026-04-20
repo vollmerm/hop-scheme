@@ -5,6 +5,32 @@
 
 typedef int64_t hop_value;
 
+/*
+ * Runtime value representation
+ * ----------------------------
+ *
+ * Every Scheme value is carried in a 64-bit hop_value. The runtime uses the
+ * low three bits as a tag:
+ *
+ *   xxx...xxx000  fixnum immediate
+ *   ptr......001  pair pointer
+ *   ptr......010  box pointer
+ *   ptr......011  closure pointer
+ *
+ * Fixnums are stored by shifting the signed integer left by
+ * HOP_FIXNUM_SHIFT. Heap objects are allocated at aligned addresses, so their
+ * low tag bits are available; hop_tag_pointer installs the object tag and
+ * hop_untag_pointer removes it before dereferencing.
+ *
+ * Some values are represented as tagged immediates rather than pointers:
+ *
+ *   HOP_NULL   = ()
+ *   HOP_FALSE  = #f
+ *   HOP_TRUE   = #t
+ *
+ * Conditionals treat only HOP_FALSE as false. HOP_NULL and HOP_TRUE are both
+ * truthy, and all tagged pointers and fixnums are truthy as well.
+ */
 #define HOP_FIXNUM_SHIFT 3
 #define HOP_TAG_MASK 7
 
