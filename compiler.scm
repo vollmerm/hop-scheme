@@ -1033,6 +1033,474 @@
   (convert expr '()))
 
 ;;; ============================================================================
+;;; Pass 3.5: Normalize for 0CFA and rewrite monomorphic closure calls
+;;; The normalization here is intentionally lightweight: it gives every
+;;; make-closure a stable procedure name and ensures closure-call operators and
+;;; arguments are explicit simple names. That keeps the analysis small while
+;;; preserving the source-shaped structure of the program.
+;;; ============================================================================
+
+(define (cfa-simple-expr? expr)
+  (or (symbol? expr)
+      (literal-expr? expr)
+      (and (pair? expr) (memq (car expr) '(local closure)))))
+
+(define (wrap-let-bindings bindings body)
+  (let loop ((rest (reverse bindings)) (result body))
+    (if (null? rest)
+        result
+        `(let (,(car rest)) ,(loop (cdr rest) result)))))
+
+(define (normalize-for-cfa expr)
+  (define temp-counter 0)
+  (define proc-counter 0)
+
+  (define (fresh-cfa-temp)
+    (set! temp-counter (+ temp-counter 1))
+    (string->symbol (string-append "cfa.tmp." (number->string temp-counter))))
+
+  (define (fresh-cfa-proc)
+    (set! proc-counter (+ proc-counter 1))
+    (string->symbol (string-append "cfa.proc." (number->string proc-counter))))
+
+  (define (normalize-simple expr)
+    (let ((normalized (normalize expr)))
+      (if (cfa-simple-expr? normalized)
+          (values '() normalized)
+          (let ((tmp (fresh-cfa-temp)))
+            (values (list (list tmp normalized)) tmp)))))
+
+  (define (normalize-simple-list exprs)
+    (let loop ((rest exprs) (bindings '()) (result '()))
+      (if (null? rest)
+          (values bindings (reverse result))
+          (let-values (((new-bindings simple-expr)
+                        (normalize-simple (car rest))))
+            (loop (cdr rest)
+                  (append bindings new-bindings)
+                  (cons simple-expr result))))))
+
+  (define (normalize-sequence exprs)
+    (map normalize exprs))
+
+  (define (normalize expr)
+    (cond
+      ((or (symbol? expr) (literal-expr? expr)) expr)
+      ((pair? expr)
+       (case (car expr)
+         ((begin)
+          `(begin ,@(normalize-sequence (cdr expr))))
+         ((primop)
+          `(primop ,(cadr expr)
+                   ,@(normalize-sequence (cddr expr))))
+         ((if)
+          `(if ,(normalize (cadr expr))
+               ,(normalize (caddr expr))
+               ,(normalize (cadddr expr))))
+         ((let)
+          (let* ((binding (caadr expr))
+                 (var (car binding))
+                 (val (normalize (cadr binding)))
+                 (body-exprs (normalize-sequence (cddr expr))))
+            `(let ((,var ,val)) ,@body-exprs)))
+         ((lambda)
+          `(lambda ,(cadr expr) ,@(normalize-sequence (cddr expr))))
+         ((make-closure)
+          (let* ((lambda-expr (cadr expr))
+                 (captures (cddr expr)))
+            (let-values (((capture-bindings simple-captures)
+                          (normalize-simple-list captures)))
+              (let ((proc-name (fresh-cfa-proc)))
+                (wrap-let-bindings
+                 capture-bindings
+                 `(make-closure ,proc-name
+                                ,(normalize lambda-expr)
+                                ,@simple-captures))))))
+         ((closure-call)
+          (let-values (((op-bindings simple-op)
+                        (normalize-simple (cadr expr)))
+                       ((arg-bindings simple-args)
+                        (normalize-simple-list (cddr expr))))
+            (wrap-let-bindings
+             (append op-bindings arg-bindings)
+             `(closure-call ,simple-op ,@simple-args))))
+         ((self-tail-call)
+          (let-values (((arg-bindings simple-args)
+                        (normalize-simple-list (cdr expr))))
+            (wrap-let-bindings arg-bindings `(self-tail-call ,@simple-args))))
+         ((group-tail-call)
+          (let-values (((arg-bindings simple-args)
+                        (normalize-simple-list (cddr expr))))
+            (wrap-let-bindings
+             arg-bindings
+             `(group-tail-call ,(cadr expr) ,@simple-args))))
+         ((group-closures)
+          `(group-closures
+            ,(map (lambda (member)
+                    (list (car member)
+                          (cadr member)
+                          (caddr member)
+                          (normalize (cadddr member))))
+                  (cadr expr))
+            ,(map (lambda (capture-spec)
+                    (list (car capture-spec)
+                          (normalize (cadr capture-spec))))
+                  (caddr expr))))
+         ((cons set-box!)
+          `(,(car expr)
+            ,(normalize (cadr expr))
+            ,(normalize (caddr expr))))
+         ((box unbox car cdr pair? null?)
+          `(,(car expr) ,(normalize (cadr expr))))
+         ((local closure)
+          expr)
+         (else
+          (error "Unknown expression in CFA normalization" (car expr)))))
+      (else
+       (error "Invalid expression in CFA normalization" expr))))
+
+  (normalize expr))
+
+(define (run-0cfa expr)
+  (define procedures (make-hash-table))
+  (define var-flow (make-hash-table))
+  (define box-flow (make-hash-table))
+  (define proc-results (make-hash-table))
+  (define changed #f)
+
+  (define (table-keys table)
+    (map car (cdr table)))
+
+  (define (flow-ref table key)
+    (let ((value (hash-ref table key)))
+      (if value value '())))
+
+  (define (add-flow! table key values)
+    (if (or (not key) (null? values))
+        #f
+        (let* ((current (flow-ref table key))
+               (updated (dedupe-symbols (append current values))))
+          (if (set-equal? current updated)
+              #f
+              (begin
+                (hash-set! table key updated)
+                (set! changed #t)
+                #t)))))
+
+  (define (repr-name expr)
+    (cond
+      ((symbol? expr) expr)
+      ((and (pair? expr) (memq (car expr) '(local closure))) (cadr expr))
+      (else #f)))
+
+  (define (box-key expr)
+    (repr-name expr))
+
+  (define (collect-procedures expr)
+    (cond
+      ((or (symbol? expr) (literal-expr? expr)) 'done)
+      ((pair? expr)
+       (case (car expr)
+         ((begin)
+          (for-each collect-procedures (cdr expr)))
+         ((primop cons set-box!)
+          (for-each collect-procedures (cdr expr)))
+         ((if)
+          (collect-procedures (cadr expr))
+          (collect-procedures (caddr expr))
+          (collect-procedures (cadddr expr)))
+         ((let)
+          (collect-procedures (cadr (caadr expr)))
+          (for-each collect-procedures (cddr expr)))
+         ((lambda)
+          (for-each collect-procedures (cddr expr)))
+         ((make-closure)
+          (let ((proc-name (cadr expr))
+                (lambda-expr (caddr expr))
+                (captures (cdddr expr)))
+            (hash-set! procedures
+                       proc-name
+                       (list (length captures)
+                             (cadr lambda-expr)
+                             (body->expr (cddr lambda-expr))))
+            (collect-procedures (body->expr (cddr lambda-expr)))
+            (for-each collect-procedures captures)))
+         ((closure-call known-call self-tail-call)
+          (for-each collect-procedures (cdr expr)))
+         ((group-tail-call)
+          (for-each collect-procedures (cddr expr)))
+         ((group-closures)
+          (for-each (lambda (member)
+                      (collect-procedures (cadddr member)))
+                    (cadr expr))
+          (for-each (lambda (capture-spec)
+                      (collect-procedures (cadr capture-spec)))
+                    (caddr expr)))
+         ((box unbox car cdr pair? null?)
+          (collect-procedures (cadr expr)))
+         ((local closure) 'done)
+         (else
+          (error "Unknown expression while collecting CFA procedures" (car expr)))))
+      (else
+       (error "Invalid expression while collecting CFA procedures" expr))))
+
+  (collect-procedures expr)
+
+  (define (analyze-expr expr current-proc)
+    (cond
+      ((literal-expr? expr) '())
+      ((symbol? expr) (flow-ref var-flow expr))
+      ((pair? expr)
+       (case (car expr)
+         ((local closure)
+          (flow-ref var-flow (cadr expr)))
+         ((begin)
+          (let loop ((rest (cdr expr)) (last '()))
+            (if (null? rest)
+                last
+                (loop (cdr rest)
+                      (analyze-expr (car rest) current-proc)))))
+         ((primop cons car cdr pair? null?)
+          (begin
+            (for-each (lambda (subexpr)
+                        (analyze-expr subexpr current-proc))
+                      (cdr expr))
+            '()))
+         ((if)
+          (begin
+            (analyze-expr (cadr expr) current-proc)
+            (set-union (analyze-expr (caddr expr) current-proc)
+                       (analyze-expr (cadddr expr) current-proc))))
+         ((let)
+          (let* ((binding (caadr expr))
+                 (var (car binding))
+                 (value-set (analyze-expr (cadr binding) current-proc)))
+            (add-flow! var-flow var value-set)
+            (analyze-expr (body->expr (cddr expr)) current-proc)))
+         ((make-closure)
+          (let* ((proc-name (cadr expr))
+                 (meta (hash-ref procedures proc-name))
+                 (capture-count (car meta))
+                 (params (cadr meta))
+                 (captures (cdddr expr))
+                 (env-params
+                  (let loop ((rest params) (remaining capture-count) (result '()))
+                    (if (= remaining 0)
+                        (reverse result)
+                        (loop (cdr rest)
+                              (- remaining 1)
+                              (cons (car rest) result))))))
+            (let loop ((env-rest env-params) (capture-rest captures))
+              (if (or (null? env-rest) (null? capture-rest))
+                  'done
+                  (begin
+                    (add-flow! var-flow
+                               (car env-rest)
+                               (analyze-expr (car capture-rest) current-proc))
+                    (loop (cdr env-rest) (cdr capture-rest)))))
+            (list proc-name)))
+         ((closure-call)
+          (let* ((proc-set (analyze-expr (cadr expr) current-proc))
+                 (arg-sets (map (lambda (arg)
+                                  (analyze-expr arg current-proc))
+                                (cddr expr))))
+            (for-each
+             (lambda (proc-name)
+               (let* ((meta (hash-ref procedures proc-name))
+                      (capture-count (car meta))
+                      (params (cadr meta))
+                      (actual-params (list-tail params capture-count)))
+                 (let loop ((param-rest actual-params) (arg-rest arg-sets))
+                   (if (or (null? param-rest) (null? arg-rest))
+                       'done
+                       (begin
+                         (add-flow! var-flow (car param-rest) (car arg-rest))
+                         (loop (cdr param-rest) (cdr arg-rest)))))))
+             proc-set)
+            (let loop ((rest proc-set) (result '()))
+              (if (null? rest)
+                  result
+                  (loop (cdr rest)
+                        (set-union result
+                                   (flow-ref proc-results (car rest))))))))
+         ((self-tail-call)
+          (let ((meta (and current-proc (hash-ref procedures current-proc))))
+            (if (not meta)
+                '()
+                (let* ((capture-count (car meta))
+                       (params (cadr meta))
+                       (actual-params (list-tail params capture-count))
+                       (arg-sets (map (lambda (arg)
+                                        (analyze-expr arg current-proc))
+                                      (cdr expr))))
+                  (let loop ((param-rest actual-params) (arg-rest arg-sets))
+                    (if (or (null? param-rest) (null? arg-rest))
+                        'done
+                        (begin
+                          (add-flow! var-flow (car param-rest) (car arg-rest))
+                          (loop (cdr param-rest) (cdr arg-rest)))))
+                  (flow-ref proc-results current-proc)))))
+         ((group-tail-call)
+          (begin
+            (for-each (lambda (arg)
+                        (analyze-expr arg current-proc))
+                      (cddr expr))
+            '()))
+         ((group-closures)
+          (begin
+            (for-each (lambda (capture-spec)
+                        (analyze-expr (cadr capture-spec) current-proc))
+                      (caddr expr))
+            '()))
+         ((box)
+          (begin
+            (analyze-expr (cadr expr) current-proc)
+            '()))
+         ((unbox)
+          (let ((key (box-key (cadr expr))))
+            (analyze-expr (cadr expr) current-proc)
+            (if key
+                (flow-ref box-flow key)
+                '())))
+         ((set-box!)
+          (let ((value-set (analyze-expr (caddr expr) current-proc))
+                (key (box-key (cadr expr))))
+            (analyze-expr (cadr expr) current-proc)
+            (add-flow! box-flow key value-set)
+            value-set))
+         (else
+          (error "Unknown expression in 0CFA" (car expr)))))
+      (else
+       (error "Invalid expression in 0CFA" expr))))
+
+  (let loop ()
+    (set! changed #f)
+
+    ;; Re-run the program body and all procedure bodies until the abstract
+    ;; environments and result sets stop growing.
+    (analyze-expr expr #f)
+    (for-each
+     (lambda (proc-name)
+       (let* ((meta (hash-ref procedures proc-name))
+              (body (caddr meta))
+              (result-set (analyze-expr body proc-name)))
+         (add-flow! proc-results proc-name result-set)))
+     (table-keys procedures))
+    (if changed
+        (loop)
+        (list procedures var-flow box-flow proc-results))))
+
+(define (rewrite-known-calls expr analysis)
+  (let ((procedures (car analysis))
+        (var-flow (cadr analysis))
+        (box-flow (caddr analysis)))
+    (define (flow-ref table key)
+      (let ((value (hash-ref table key)))
+        (if value value '())))
+
+    (define (repr-name expr)
+      (cond
+        ((symbol? expr) expr)
+        ((and (pair? expr) (memq (car expr) '(local closure))) (cadr expr))
+        (else #f)))
+
+    (define (box-key expr)
+      (repr-name expr))
+
+    (define (closure-set expr)
+      (cond
+        ((symbol? expr) (flow-ref var-flow expr))
+        ((literal-expr? expr) '())
+        ((pair? expr)
+         (case (car expr)
+           ((local closure)
+            (flow-ref var-flow (cadr expr)))
+           ((unbox)
+            (let ((key (box-key (cadr expr))))
+              (if key
+                  (flow-ref box-flow key)
+                  '())))
+           ((make-closure)
+            (list (cadr expr)))
+           ((let)
+            (closure-set (body->expr (cddr expr))))
+           ((begin)
+            (if (null? (cdr expr))
+                '()
+                (closure-set (car (reverse (cdr expr))))))
+           ((if)
+            (set-union (closure-set (caddr expr))
+                       (closure-set (cadddr expr))))
+           (else '())))
+        (else '())))
+
+    (define (rewrite expr)
+      (cond
+        ((or (symbol? expr) (literal-expr? expr)) expr)
+        ((pair? expr)
+         (case (car expr)
+           ((begin)
+            `(begin ,@(map rewrite (cdr expr))))
+           ((primop)
+            `(primop ,(cadr expr) ,@(map rewrite (cddr expr))))
+           ((if)
+            `(if ,(rewrite (cadr expr))
+                 ,(rewrite (caddr expr))
+                 ,(rewrite (cadddr expr))))
+           ((let)
+            `(let (,(list (car (caadr expr))
+                          (rewrite (cadr (caadr expr)))))
+               ,@(map rewrite (cddr expr))))
+           ((lambda)
+            `(lambda ,(cadr expr) ,@(map rewrite (cddr expr))))
+           ((make-closure)
+            `(make-closure ,(cadr expr)
+                           ,(rewrite (caddr expr))
+                           ,@(map rewrite (cdddr expr))))
+           ((closure-call)
+            (let* ((rator (rewrite (cadr expr)))
+                   (args (map rewrite (cddr expr)))
+                   (targets (closure-set rator)))
+              (if (and (= (length targets) 1)
+                       (hash-ref procedures (car targets)))
+                  (let* ((proc-name (car targets))
+                         (meta (hash-ref procedures proc-name))
+                         (capture-count (car meta)))
+                    `(known-call ,proc-name ,capture-count ,rator ,@args))
+                  `(closure-call ,rator ,@args))))
+           ((known-call)
+            `(known-call ,(cadr expr)
+                         ,(caddr expr)
+                         ,(rewrite (cadddr expr))
+                         ,@(map rewrite (cddddr expr))))
+           ((self-tail-call)
+            `(self-tail-call ,@(map rewrite (cdr expr))))
+           ((group-tail-call)
+            `(group-tail-call ,(cadr expr) ,@(map rewrite (cddr expr))))
+           ((group-closures)
+            `(group-closures
+              ,(map (lambda (member)
+                      (list (car member)
+                            (cadr member)
+                            (caddr member)
+                            (rewrite (cadddr member))))
+                    (cadr expr))
+              ,(map (lambda (capture-spec)
+                      (list (car capture-spec)
+                            (rewrite (cadr capture-spec))))
+                    (caddr expr))))
+           ((cons set-box!)
+            `(,(car expr) ,(rewrite (cadr expr)) ,(rewrite (caddr expr))))
+           ((box unbox car cdr pair? null? local closure)
+            `(,(car expr) ,(rewrite (cadr expr))))
+           (else
+            (error "Unknown expression in known-call rewrite" (car expr)))))
+        (else
+         (error "Invalid expression in known-call rewrite" expr))))
+
+    (rewrite expr)))
+
+;;; ============================================================================
 ;;; Pass 4: Convert to Three-Address Code (TAC)
 ;;; Lowers expression-oriented code into a flat, explicit instruction stream.
 ;;;
@@ -1114,6 +1582,35 @@
               arg-vars
               (append closure-procedures arg-procedures))))
 
+  (define (convert-known-call proc-name capture-count closure-expr args dest tail?)
+    (let-values (((closure-instrs closure-var closure-procedures)
+                  (convert-value closure-expr #f))
+                 ((arg-instrs arg-vars arg-procedures)
+                  (convert-list args)))
+      (let loop ((index 0) (env-instrs '()) (env-vars '()))
+        (if (= index capture-count)
+            (let ((all-args (append (reverse env-vars) arg-vars)))
+              (if tail?
+                  (values (append closure-instrs
+                                  arg-instrs
+                                  env-instrs
+                                  (list `(direct-tail-call ,proc-name ,@all-args)))
+                          (append closure-procedures arg-procedures))
+                  (let ((result-var (or dest (fresh-temp))))
+                    (values (append closure-instrs
+                                    arg-instrs
+                                    env-instrs
+                                    (list `(assign ,result-var
+                                                   (direct-call ,proc-name ,@all-args))))
+                            result-var
+                            (append closure-procedures arg-procedures)))))
+            (let ((env-var (fresh-temp)))
+              (loop (+ index 1)
+                    (append env-instrs
+                            (list `(assign ,env-var
+                                           (closure-env-ref ,closure-var ,index))))
+                    (cons env-var env-vars)))))))
+
   (define (local-name expr)
     (and (pair? expr)
          (eq? (car expr) 'local)
@@ -1127,11 +1624,15 @@
          (let ((name (local-name (cadr expr)))
                (value (caddr expr)))
            (and name
-                (pair? value)
-                (eq? (car value) 'make-closure)
-                (pair? (cdr value))
-                (null? (cddr value))
-                 (let ((lambda-expr (cadr value)))
+                 (pair? value)
+                 (eq? (car value) 'make-closure)
+                 (let* ((named-closure?
+                         (and (symbol? (cadr value))
+                              (pair? (caddr value))
+                              (eq? (car (caddr value)) 'lambda)))
+                        (lambda-expr (if named-closure?
+                                         (caddr value)
+                                         (cadr value))))
                    (and (pair? lambda-expr)
                         (eq? (car lambda-expr) 'lambda)
                         (list name
@@ -1171,7 +1672,7 @@
                 (all (lambda (e) (cluster-body-compatible? e names))
                      (cddr expr))))
           ((self-tail-call) #f)
-          ((app closure-call set-box! cons)
+          ((app closure-call known-call set-box! cons)
            (all (lambda (e) (cluster-body-compatible? e names)) (cdr expr)))
           ((box unbox car cdr pair? null?)
            (cluster-body-compatible? (cadr expr) names))
@@ -1187,7 +1688,7 @@
           ((group-tail-call)
            (cons (cadr expr)
                  (append-map collect-group-tail-targets (cddr expr))))
-          ((begin app closure-call set-box! cons)
+          ((begin app closure-call known-call set-box! cons)
            (append-map collect-group-tail-targets (cdr expr)))
          ((primop)
           (append-map collect-group-tail-targets (cddr expr)))
@@ -1468,18 +1969,26 @@
                                   (list `(goto ,(cadr entry))))
                           arg-procedures)))))
          
-         ((closure-call)
-          (let ((closure-expr (cadr expr))
-                (args (cddr expr)))
-            (let-values (((call-instrs closure-var arg-vars procedures)
-                          (convert-call closure-expr args)))
-              (values (append call-instrs
-                              (list `(tail-call ,closure-var ,@arg-vars)))
-                      procedures))))
-         
-         (else
-          (let-values (((instrs result-var procedures)
-                        (convert-value expr #f)))
+          ((closure-call)
+           (let ((closure-expr (cadr expr))
+                 (args (cddr expr)))
+             (let-values (((call-instrs closure-var arg-vars procedures)
+                           (convert-call closure-expr args)))
+               (values (append call-instrs
+                               (list `(tail-call ,closure-var ,@arg-vars)))
+                       procedures))))
+
+          ((known-call)
+           (convert-known-call (cadr expr)
+                               (caddr expr)
+                               (cadddr expr)
+                               (cddddr expr)
+                               #f
+                               #t))
+          
+          (else
+           (let-values (((instrs result-var procedures)
+                         (convert-value expr #f)))
             (values (append instrs (list `(return ,result-var)))
                     procedures)))))
       
@@ -1606,14 +2115,24 @@
                           (append val-procedures body-procedures)))))))
          
          ((make-closure)
-          (let* ((lambda-expr (cadr expr))
-                 (free-vars (cddr expr))
-                 (proc-name (fresh-proc))
-                 (proc-params (cadr lambda-expr))
-                 (proc-body (body->expr (cddr lambda-expr))))
-            (let ((entry-label (fresh-temp)))
-              (let-values (((body-instrs body-procedures)
-                            (convert-tail proc-body
+           (let* ((named-closure?
+                   (and (symbol? (cadr expr))
+                        (pair? (caddr expr))
+                        (eq? (car (caddr expr)) 'lambda)))
+                  (proc-name (if named-closure?
+                                 (cadr expr)
+                                 (fresh-proc)))
+                  (lambda-expr (if named-closure?
+                                   (caddr expr)
+                                   (cadr expr)))
+                  (free-vars (if named-closure?
+                                 (cdddr expr)
+                                 (cddr expr)))
+                  (proc-params (cadr lambda-expr))
+                  (proc-body (body->expr (cddr lambda-expr))))
+             (let ((entry-label (fresh-temp)))
+               (let-values (((body-instrs body-procedures)
+                             (convert-tail proc-body
                                           proc-params
                                           entry-label
                                           #f
@@ -1631,12 +2150,20 @@
                                                                ,@fv-vars))))
                           result-var
                           (append body-procedures
-                                  fv-procedures
-                                  (list procedure))))))))
-         
-         ((closure-call)
-          (let* ((closure-expr (cadr expr))
-                 (args (cddr expr)))
+                                   fv-procedures
+                                   (list procedure))))))))
+
+          ((known-call)
+           (convert-known-call (cadr expr)
+                               (caddr expr)
+                               (cadddr expr)
+                               (cddddr expr)
+                               dest
+                               #f))
+          
+          ((closure-call)
+           (let* ((closure-expr (cadr expr))
+                  (args (cddr expr)))
             (let-values (((call-instrs closure-var arg-vars procedures)
                           (convert-call closure-expr args)))
               (let ((result-var (or dest (fresh-temp))))
@@ -1876,7 +2403,11 @@
   (case (car instr)
     ((call)
      (max 0 (- (length (cdddr instr)) (length aarch64-arg-registers))))
+    ((call-known)
+     (max 0 (- (length (cdddr instr)) (length aarch64-arg-registers))))
     ((tail-call)
+     (max 0 (- (length (cddr instr)) (length aarch64-arg-registers))))
+    ((tail-call-known)
      (max 0 (- (length (cddr instr)) (length aarch64-arg-registers))))
     (else 0)))
 
@@ -1901,10 +2432,14 @@
        (list `(is-pair ,dst ,(cadr rhs))))
       ((and (pair? rhs) (eq? (car rhs) 'null?))
        (list `(is-null ,dst ,(cadr rhs))))
+      ((and (pair? rhs) (eq? (car rhs) 'closure-env-ref))
+       (list `(load-closure-env ,dst ,(cadr rhs) ,(caddr rhs))))
       ((and (pair? rhs) (eq? (car rhs) 'make-closure))
        (list `(alloc-closure ,dst ,@(cdr rhs))))
       ((and (pair? rhs) (eq? (car rhs) 'closure-call))
        (list `(call ,dst ,@(cdr rhs))))
+      ((and (pair? rhs) (eq? (car rhs) 'direct-call))
+       (list `(call-known ,dst ,@(cdr rhs))))
       (else
        (error "Unknown assignment rhs during instruction selection" rhs))))
   (cond
@@ -1923,6 +2458,8 @@
      (list `(ret ,(cadr instr))))
     ((eq? (car instr) 'tail-call)
      (list `(tail-call ,@(cdr instr))))
+    ((eq? (car instr) 'direct-tail-call)
+     (list `(tail-call-known ,@(cdr instr))))
     ((eq? (car instr) 'set-box!)
      (list `(store-box ,(cadr instr) ,(caddr instr))))
     (else
@@ -1968,8 +2505,8 @@
     ((binop)
      (append (if (symbol? (cadddr instr)) (list (cadddr instr)) '())
              (if (symbol? (car (cddddr instr))) (list (car (cddddr instr))) '())))
-    ((alloc-box load-box load-car load-cdr is-pair is-null)
-      (if (symbol? (caddr instr)) (list (caddr instr)) '()))
+    ((alloc-box load-box load-car load-cdr is-pair is-null load-closure-env)
+       (if (symbol? (caddr instr)) (list (caddr instr)) '()))
     ((alloc-pair)
      (append (if (symbol? (caddr instr)) (list (caddr instr)) '())
              (if (symbol? (cadddr instr)) (list (cadddr instr)) '())))
@@ -1986,26 +2523,42 @@
                      result)))))
     ((call)
      (let ((closure (caddr instr))
-           (args (cdddr instr)))
-       (append (if (symbol? closure) (list closure) '())
-               (let loop ((rest args) (result '()))
+            (args (cdddr instr)))
+        (append (if (symbol? closure) (list closure) '())
+                (let loop ((rest args) (result '()))
                  (if (null? rest)
                      (reverse result)
                      (loop (cdr rest)
                            (if (symbol? (car rest))
-                               (cons (car rest) result)
-                               result)))))))
+                                (cons (car rest) result)
+                                result)))))))
+    ((call-known)
+     (let loop ((rest (cdddr instr)) (result '()))
+       (if (null? rest)
+           (reverse result)
+           (loop (cdr rest)
+                 (if (symbol? (car rest))
+                     (cons (car rest) result)
+                     result)))))
     ((tail-call)
      (let ((closure (cadr instr))
-           (args (cddr instr)))
-       (append (if (symbol? closure) (list closure) '())
+            (args (cddr instr)))
+        (append (if (symbol? closure) (list closure) '())
                (let loop ((rest args) (result '()))
                  (if (null? rest)
                      (reverse result)
                      (loop (cdr rest)
                            (if (symbol? (car rest))
-                               (cons (car rest) result)
-                               result)))))))
+                                (cons (car rest) result)
+                                result)))))))
+    ((tail-call-known)
+     (let loop ((rest (cddr instr)) (result '()))
+       (if (null? rest)
+           (reverse result)
+           (loop (cdr rest)
+                 (if (symbol? (car rest))
+                     (cons (car rest) result)
+                     result)))))
     ((branch-if ret)
      (if (symbol? (cadr instr)) (list (cadr instr)) '()))
     ((jump) '())
@@ -2014,11 +2567,11 @@
 (define (machine-instr-defs instr)
   (case (car instr)
     ((move-in move alloc-pair alloc-box load-box load-car load-cdr
-              is-pair is-null alloc-closure call)
+              is-pair is-null load-closure-env alloc-closure call call-known)
       (list (cadr instr)))
     ((binop)
-     (list (caddr instr)))
-    ((store-box branch-if jump ret tail-call) '())
+      (list (caddr instr)))
+    ((store-box branch-if jump ret tail-call tail-call-known) '())
     (else (error "Unknown machine instruction in def analysis" instr))))
 
 (define (machine-block-use block)
@@ -2260,6 +2813,10 @@
     ((load-box)
      `(load-box ,(lookup-home homes (cadr instr))
                 ,(lookup-home homes (caddr instr))))
+    ((load-closure-env)
+     `(load-closure-env ,(lookup-home homes (cadr instr))
+                        ,(lookup-home homes (caddr instr))
+                        ,(cadddr instr)))
     ((load-car)
      `(load-car ,(lookup-home homes (cadr instr))
                 ,(lookup-home homes (caddr instr))))
@@ -2285,10 +2842,19 @@
             ,(lookup-home homes (caddr instr))
             ,@(map (lambda (operand) (lookup-home homes operand))
                    (cdddr instr))))
+    ((call-known)
+     `(call-known ,(lookup-home homes (cadr instr))
+                  ,(caddr instr)
+                  ,@(map (lambda (operand) (lookup-home homes operand))
+                         (cdddr instr))))
     ((tail-call)
      `(tail-call ,(lookup-home homes (cadr instr))
                  ,@(map (lambda (operand) (lookup-home homes operand))
                         (cddr instr))))
+    ((tail-call-known)
+     `(tail-call-known ,(cadr instr)
+                       ,@(map (lambda (operand) (lookup-home homes operand))
+                              (cddr instr))))
     ((branch-if)
      `(branch-if ,(lookup-home homes (cadr instr))
                  ,(caddr instr)
@@ -2369,17 +2935,31 @@
            (closure (caddr instr))
            (args (cdddr instr)))
        (append (lower-arg-moves args)
-               (list `(move-out ,(arg-location (length args)) ,closure)
-                     `(call-indirect ,(length args))
+                (list `(move-out ,(arg-location (length args)) ,closure)
+                      `(call-indirect ,(length args))
+                      `(move ,dst (arg-register ,aarch64-return-register))))))
+    ((call-known)
+     (let ((dst (cadr instr))
+           (proc-name (caddr instr))
+           (args (cdddr instr)))
+       (append (lower-arg-moves args)
+               (list `(call-label ,proc-name)
                      `(move ,dst (arg-register ,aarch64-return-register))))))
     ((tail-call)
      (let ((closure (cadr instr))
            (args (cddr instr)))
        (append (lower-arg-moves args)
                (list `(move-out ,(arg-location (length args)) ,closure)
-                     `(restore-callee-saved ,saved-registers)
+                      `(restore-callee-saved ,saved-registers)
+                      `(deallocate-frame ,stack-size)
+                      `(tail-call-indirect ,(length args))))))
+    ((tail-call-known)
+     (let ((proc-name (cadr instr))
+           (args (cddr instr)))
+       (append (lower-arg-moves args)
+               (list `(restore-callee-saved ,saved-registers)
                      `(deallocate-frame ,stack-size)
-                     `(tail-call-indirect ,(length args))))))
+                     `(tail-call-label ,proc-name)))))
     ((ret)
      (list `(move-out (arg-register ,aarch64-return-register) ,(cadr instr))
            `(restore-callee-saved ,saved-registers)
@@ -2643,6 +3223,12 @@
                  (string-append "    sub x9, x9, #"
                                 (number->string box-tag))))
 
+(define (emit-load-closure-address port operand proc)
+  (emit-load-operand port "x9" operand proc)
+  (emit-asm-line port
+                 (string-append "    sub x9, x9, #"
+                                (number->string closure-tag))))
+
 (define (emit-runtime-unary-call port helper dst operand proc)
   (emit-load-operand port "x0" operand proc)
   (emit-asm-line port (string-append "    bl " helper))
@@ -2713,6 +3299,12 @@
                                 (if tail? "tail_call_" "call_")
                                 (number->string argc))))
 
+(define (emit-call-label port proc-name tail?)
+  (emit-asm-line port
+                 (string-append "    "
+                                (if tail? "b " "bl ")
+                                (asm-name proc-name))))
+
 (define (emit-machine-instruction port instr proc)
   (case (car instr)
     ((allocate-frame)
@@ -2770,6 +3362,13 @@
       (emit-load-box-address port (caddr instr) proc)
       (emit-asm-line port "    ldr x10, [x9]")
       (emit-store-operand port "x10" (cadr instr) proc))
+    ((load-closure-env)
+      (emit-load-closure-address port (caddr instr) proc)
+      (emit-asm-line port
+                     (string-append "    ldr x10, [x9, #"
+                                    (number->string (+ 16 (* 8 (cadddr instr))))
+                                    "]"))
+      (emit-store-operand port "x10" (cadr instr) proc))
     ((load-car)
       (emit-runtime-unary-call port "_hop_car" (cadr instr) (caddr instr) proc))
     ((load-cdr)
@@ -2794,8 +3393,12 @@
      (emit-alloc-closure port (cadr instr) (caddr instr) (cdddr instr) proc))
     ((call-indirect)
      (emit-call-helper port (cadr instr) #f))
+    ((call-label)
+      (emit-call-label port (cadr instr) #f))
     ((tail-call-indirect)
      (emit-call-helper port (cadr instr) #t))
+    ((tail-call-label)
+      (emit-call-label port (cadr instr) #t))
     ((branch-if)
       (emit-immediate-compare port (cadr instr) false-immediate proc)
       (emit-asm-line port
@@ -2892,19 +3495,25 @@
 (define (compile-to-cfg expr)
   (let* ((uniquified (uniquify expr))
          (desugared (desugar-letrec uniquified))
-         (closure-converted (closure-convert desugared)))
-    (let-values (((tac-instrs procedures) (expr->tac closure-converted)))
+         (closure-converted (closure-convert desugared))
+         (cfa-normalized (normalize-for-cfa closure-converted))
+         (cfa-analysis (run-0cfa cfa-normalized))
+         (cfa-rewritten (rewrite-known-calls cfa-normalized cfa-analysis)))
+    (let-values (((tac-instrs procedures) (expr->tac cfa-rewritten)))
       (values uniquified
               desugared
               closure-converted
+              cfa-normalized
+              cfa-rewritten
               (build-cfg tac-instrs)
-               (map (lambda (procedure)
-                      (cons procedure
-                            (build-cfg (procedure-instructions procedure))))
-                    procedures)))))
+                (map (lambda (procedure)
+                       (cons procedure
+                             (build-cfg (procedure-instructions procedure))))
+                     procedures)))))
 
 (define (compile-to-backend expr)
-  (let-values (((uniquified desugared closure-converted entry-cfg procedures)
+  (let-values (((uniquified desugared closure-converted cfa-normalized
+                            cfa-rewritten entry-cfg procedures)
                 (compile-to-cfg expr)))
     (let ((entry-machine
            (cfg->allocated-machine-procedure 'scheme_entry '() entry-cfg))
@@ -2918,14 +3527,17 @@
       (values uniquified
               desugared
               closure-converted
+              cfa-normalized
+              cfa-rewritten
               entry-cfg
               procedures
               entry-machine
               procedure-machines))))
 
 (define (write-aarch64-program expr path)
-  (let-values (((uniquified desugared closure-converted entry-cfg procedures
-                            entry-machine procedure-machines)
+  (let-values (((uniquified desugared closure-converted cfa-normalized
+                            cfa-rewritten entry-cfg procedures
+                             entry-machine procedure-machines)
                 (compile-to-backend expr)))
     (call-with-output-file path
       (lambda (port)
@@ -2936,8 +3548,9 @@
   (write expr) (newline)
   
   (display "\n=== After Uniquify ===\n")
-  (let-values (((uniquified desugared closure-converted entry-cfg procedures
-                            entry-machine procedure-machines)
+  (let-values (((uniquified desugared closure-converted cfa-normalized
+                            cfa-rewritten entry-cfg procedures
+                             entry-machine procedure-machines)
                 (compile-to-backend expr)))
     (write uniquified) (newline)
     
@@ -2946,6 +3559,12 @@
     
     (display "\n=== After Closure Conversion ===\n")
     (write closure-converted) (newline)
+
+    (display "\n=== After CFA Normalization ===\n")
+    (write cfa-normalized) (newline)
+
+    (display "\n=== After 0CFA Call Rewriting ===\n")
+    (write cfa-rewritten) (newline)
     
     (display "\n=== Entry CFG ===\n")
     (display-cfg entry-cfg)
@@ -3146,6 +3765,23 @@
           (cons 1 (cons 2 (cons 3 ())))
           0)))
 
+(define test26
+  '(let ((make-adder
+          (lambda (x)
+            (lambda (y)
+              (primop + x y)))))
+     (let ((f (app make-adder 5)))
+       (app f 1))))
+
+(define test27
+  '(let ((choose
+          (lambda (flag)
+            (if flag
+                (lambda (x) (primop + x 1))
+                (lambda (x) (primop + x 2))))))
+     (let ((f (app choose #t)))
+       (app f 5))))
+
 ;; Run tests
 (define sample-tests
   (list (cons "Test 1: Simple arithmetic" test1)
@@ -3171,7 +3807,9 @@
         (cons "Test 22: pair? recognizes pairs" test22)
         (cons "Test 23: null? recognizes the empty list" test23)
         (cons "Test 24: only #f is false" test24)
-        (cons "Test 25: Recursive sum over a list" test25)))
+        (cons "Test 25: Recursive sum over a list" test25)
+        (cons "Test 26: Monomorphic closure call for 0CFA" test26)
+        (cons "Test 27: Polymorphic closure call fallback" test27)))
 
 (define named-tests
   (list (cons 'test1 test1)
@@ -3197,7 +3835,9 @@
         (cons 'test22 test22)
         (cons 'test23 test23)
         (cons 'test24 test24)
-        (cons 'test25 test25)))
+        (cons 'test25 test25)
+        (cons 'test26 test26)
+        (cons 'test27 test27)))
 
 (define (lookup-named-test name)
   (let ((binding (assoc name named-tests)))

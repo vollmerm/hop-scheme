@@ -36,5 +36,17 @@ build_and_run test22 "#t"
 build_and_run test23 "#t"
 build_and_run test24 1
 build_and_run test25 6
+build_and_run test26 6
+build_and_run test27 6
+
+generate test26 "$TMPDIR/test26.s"
+grep -Eq 'b(l)? _cfa\.proc\.[0-9]+' "$TMPDIR/test26.s"
+if grep -Eq '_hop_(tail_)?call_[0-9]+' "$TMPDIR/test26.s"; then
+  echo "expected direct call lowering for test26" >&2
+  exit 1
+fi
+
+generate test27 "$TMPDIR/test27.s"
+grep -Eq '_hop_(tail_)?call_[0-9]+' "$TMPDIR/test27.s"
 
 echo "codegen checks passed"
