@@ -866,10 +866,10 @@
                       (finish members rest)))
                 (finish members rest))))))
 
-  (define (convert-group-prefix exprs env)
+  (define (convert-group-prefix exprs env self-tail-prefix)
     (let ((prefix (extract-group-prefix exprs env)))
       (and prefix
-           (let* ((members (car prefix))
+            (let* ((members (car prefix))
                   (remaining (cdr prefix))
                   (member-names (map cadr members))
                   (shared-captures
@@ -897,28 +897,28 @@
                                   (map (lambda (param)
                                          (list param `(local ,param)))
                                        params))
-                                 (body-env (append param-bindings group-env)))
-                            (list box-var
-                                  member-name
-                                  params
-                                  (convert body body-env))))
-                        members))
-                  (capture-values
-                   (map (lambda (fv capture-param)
-                          (list capture-param (lookup-repr fv env)))
-                        shared-captures
-                        capture-params)))
-             (cons (cons `(group-closures ,converted-members ,capture-values)
-                         (map (lambda (e) (convert e env)) remaining))
-                   #t)))))
+                             (body-env (append param-bindings group-env)))
+                             (list box-var
+                                   member-name
+                                   params
+                                   (convert body body-env '()))))
+                         members))
+                   (capture-values
+                    (map (lambda (fv capture-param)
+                           (list capture-param (lookup-repr fv env)))
+                         shared-captures
+                         capture-params)))
+              (cons (cons `(group-closures ,converted-members ,capture-values)
+                          (map (lambda (e) (convert e env self-tail-prefix)) remaining))
+                    #t)))))
 
-  (define (convert-sequence exprs env)
-    (let ((group-result (convert-group-prefix exprs env)))
+  (define (convert-sequence exprs env self-tail-prefix)
+    (let ((group-result (convert-group-prefix exprs env self-tail-prefix)))
       (if group-result
           (car group-result)
-          (map (lambda (e) (convert e env)) exprs))))
+          (map (lambda (e) (convert e env self-tail-prefix)) exprs))))
 
-  (define (convert expr env)
+  (define (convert expr env self-tail-prefix)
     ;; env: association list mapping variable names to their representation
     ;; Either (local var) or (closure env-var) for captured variables.
     
@@ -932,31 +932,31 @@
       ((literal-expr? expr)
        expr)
       
-      ((pair? expr)
-       (case (car expr)
-         ((begin)
-          `(begin ,@(convert-sequence (cdr expr) env)))
-         
-          ((primop)
-           `(primop ,(cadr expr) 
-                    ,@(map (lambda (e) (convert e env)) (cddr expr))))
-         
-         ((if)
-          `(if ,(convert (cadr expr) env)
-               ,(convert (caddr expr) env)
-               ,(convert (cadddr expr) env)))
-         
-          ((let)
-           (let* ((binding (caadr expr))
-                  (var (car binding))
-                  (val (cadr binding))
-                  (body (body->expr (cddr expr)))
-                  (val-converted (convert val env))
-                  (new-env (cons (list var `(local ,var)) env))
-                  (body-converted (convert body new-env)))
-             `(let ((,var ,val-converted)) ,body-converted)))
+       ((pair? expr)
+        (case (car expr)
+          ((begin)
+           `(begin ,@(convert-sequence (cdr expr) env self-tail-prefix)))
           
-           ((lambda)
+           ((primop)
+            `(primop ,(cadr expr) 
+                     ,@(map (lambda (e) (convert e env self-tail-prefix)) (cddr expr))))
+          
+          ((if)
+           `(if ,(convert (cadr expr) env self-tail-prefix)
+                ,(convert (caddr expr) env self-tail-prefix)
+                ,(convert (cadddr expr) env self-tail-prefix)))
+          
+           ((let)
+            (let* ((binding (caadr expr))
+                   (var (car binding))
+                   (val (cadr binding))
+                   (body (body->expr (cddr expr)))
+                   (val-converted (convert val env self-tail-prefix))
+                   (new-env (cons (list var `(local ,var)) env))
+                   (body-converted (convert body new-env self-tail-prefix)))
+              `(let ((,var ,val-converted)) ,body-converted)))
+           
+            ((lambda)
             (let* ((params (cadr expr))
                    (body (body->expr (cddr expr)))
                    (fvs (free-vars body params))
@@ -964,16 +964,17 @@
                    (env-vars (make-env-vars "env." (length fvs)))
 
                   ;; Build new environment for lambda body
-                  (param-bindings (map (lambda (p) (list p `(local ,p))) params))
-                  (env-bindings (map (lambda (fv env-var)
-                                       (list fv `(closure ,env-var)))
-                                    fvs env-vars))
-                 (new-env (append param-bindings env-bindings env))
-                 
-                 (body-converted (convert body new-env)))
-            
-            ;; Create closure structure
-            `(make-closure 
+                   (param-bindings (map (lambda (p) (list p `(local ,p))) params))
+                   (env-bindings (map (lambda (fv env-var)
+                                        (list fv `(closure ,env-var)))
+                                     fvs env-vars))
+                  (new-env (append param-bindings env-bindings env))
+                  (self-tail-env (map (lambda (env-var) `(local ,env-var)) env-vars))
+                  
+                  (body-converted (convert body new-env self-tail-env)))
+             
+             ;; Create closure structure
+             `(make-closure 
               (lambda ,(append env-vars params) ,body-converted)
               ,@(map (lambda (fv) 
                        (let ((binding (assoc fv env)))
@@ -982,55 +983,56 @@
                              fv)))  ; Global/primitive
                      fvs))))
          
-          ((app)
-           (let ((rator (cadr expr))
-                 (rands (cddr expr)))
-             `(closure-call ,(convert rator env)
-                            ,@(map (lambda (e) (convert e env)) rands))))
+           ((app)
+            (let ((rator (cadr expr))
+                  (rands (cddr expr)))
+              `(closure-call ,(convert rator env self-tail-prefix)
+                             ,@(map (lambda (e) (convert e env self-tail-prefix)) rands))))
 
-           ((cons)
-            `(cons ,(convert (cadr expr) env)
-                   ,(convert (caddr expr) env)))
+            ((cons)
+             `(cons ,(convert (cadr expr) env self-tail-prefix)
+                    ,(convert (caddr expr) env self-tail-prefix)))
 
-            ((self-tail-call)
-             `(self-tail-call
-              ,@(map (lambda (e) (convert e env)) (cdr expr))))
+             ((self-tail-call)
+              `(self-tail-call
+               ,@self-tail-prefix
+               ,@(map (lambda (e) (convert e env self-tail-prefix)) (cdr expr))))
 
-         ((group-tail-call)
-          `(group-tail-call
-            ,(cadr expr)
-            ,@(map (lambda (e) (convert e env)) (cddr expr))))
+          ((group-tail-call)
+           `(group-tail-call
+             ,(cadr expr)
+             ,@(map (lambda (e) (convert e env self-tail-prefix)) (cddr expr))))
 
           ((group-closures)
            expr)
            
-            ((box)
-             `(box ,(convert (cadr expr) env)))
+             ((box)
+              `(box ,(convert (cadr expr) env self-tail-prefix)))
+           
+           ((unbox)
+            `(unbox ,(convert (cadr expr) env self-tail-prefix)))
+
+           ((car)
+            `(car ,(convert (cadr expr) env self-tail-prefix)))
+
+           ((cdr)
+            `(cdr ,(convert (cadr expr) env self-tail-prefix)))
+
+           ((pair?)
+            `(pair? ,(convert (cadr expr) env self-tail-prefix)))
+
+           ((null?)
+            `(null? ,(convert (cadr expr) env self-tail-prefix)))
+           
+           ((set-box!)
+            `(set-box! ,(convert (cadr expr) env self-tail-prefix)
+                      ,(convert (caddr expr) env self-tail-prefix)))
           
-          ((unbox)
-           `(unbox ,(convert (cadr expr) env)))
-
-          ((car)
-           `(car ,(convert (cadr expr) env)))
-
-          ((cdr)
-           `(cdr ,(convert (cadr expr) env)))
-
-          ((pair?)
-           `(pair? ,(convert (cadr expr) env)))
-
-          ((null?)
-           `(null? ,(convert (cadr expr) env)))
-          
-          ((set-box!)
-           `(set-box! ,(convert (cadr expr) env)
-                     ,(convert (caddr expr) env)))
-         
-         (else (error "Unknown expression in closure-convert" (car expr)))))
+          (else (error "Unknown expression in closure-convert" (car expr)))))
       
       (else (error "Invalid expression in closure-convert" expr))))
   
-  (convert expr '()))
+  (convert expr '() '()))
 
 ;;; ============================================================================
 ;;; Pass 3.5: Normalize for 0CFA and rewrite monomorphic closure calls
@@ -1323,23 +1325,24 @@
                   (loop (cdr rest)
                         (set-union result
                                    (flow-ref proc-results (car rest))))))))
-         ((self-tail-call)
-          (let ((meta (and current-proc (hash-ref procedures current-proc))))
-            (if (not meta)
-                '()
-                (let* ((capture-count (car meta))
-                       (params (cadr meta))
-                       (actual-params (list-tail params capture-count))
-                       (arg-sets (map (lambda (arg)
-                                        (analyze-expr arg current-proc))
-                                      (cdr expr))))
-                  (let loop ((param-rest actual-params) (arg-rest arg-sets))
-                    (if (or (null? param-rest) (null? arg-rest))
-                        'done
-                        (begin
-                          (add-flow! var-flow (car param-rest) (car arg-rest))
-                          (loop (cdr param-rest) (cdr arg-rest)))))
-                  (flow-ref proc-results current-proc)))))
+          ((self-tail-call)
+           (let ((meta (and current-proc (hash-ref procedures current-proc))))
+             (if (not meta)
+                 '()
+                 (let* ((capture-count (car meta))
+                        (params (cadr meta))
+                        (actual-params (list-tail params capture-count))
+                        (actual-arg-sets
+                         (map (lambda (arg)
+                                (analyze-expr arg current-proc))
+                              (list-tail (cdr expr) capture-count))))
+                   (let loop ((param-rest actual-params) (arg-rest actual-arg-sets))
+                     (if (or (null? param-rest) (null? arg-rest))
+                         'done
+                         (begin
+                           (add-flow! var-flow (car param-rest) (car arg-rest))
+                           (loop (cdr param-rest) (cdr arg-rest)))))
+                   (flow-ref proc-results current-proc)))))
          ((group-tail-call)
           (begin
             (for-each (lambda (arg)
@@ -3583,281 +3586,5 @@
     
     (display "\n=== Compilation Complete ===\n")))
 
-;;; ============================================================================
-;;; Test Programs
-;;; ============================================================================
-
-(define test1
-  '(let ((x 5))
-     (primop + x 1)))
-
-(define test2
-  '(let ((f (lambda (x) (primop + x 1))))
-     (app f 5)))
-
-(define test3
-  '(let ((b (box 0)))
-     (set-box! b (primop + (unbox b) 1))
-     (unbox b)))
-
-(define test4
-  '(if (primop > x 0)
-       (primop + x 1)
-       (primop - x 1)))
-
-(define test5
-  '(let ((x 5))
-     (let ((y 10))
-       (primop + x y))))
-
-(define test6
-  '(if (primop > x 0)
-       (let ((y (primop + x 1)))
-         (primop * y 2))
-       (primop - x 1)))
-
-(define test7
-  '(if (primop > x 0)
-       (primop + x 1)
-       (if (primop < x -5)
-           (primop - x 2)
-           (primop * x 3))))
-
-(define test8
-  '(let ((x 0))
-     (if (primop < x 10)
-          (let ((y (primop + x 1)))
-            (primop * y 2))
-          (primop - x 5))))
-
-(define test9
-  '(let ((x 5))
-     (let ((f (lambda (y)
-                (let ((b (box x)))
-                  (set-box! b (primop + (unbox b) y))
-                  (unbox b)))))
-       (app f 3))))
-
-(define test10
-  '(let ((x 5))
-     (let ((mk (lambda (y)
-                 (lambda (z)
-                   (primop + x (primop + y z))))))
-       (let ((f (app mk 7)))
-         (app f 3)))))
-
-(define test11
-  '(let ((x 2))
-     (let ((f (lambda (y)
-                (primop + y 1)
-                (primop + x y))))
-       (app f 4))))
-
-(define test12
-  '(let ((x (if #t 1 2)))
-     (primop + x 10)))
-
-(define test13
-  '(letrec ((countdown
-             (lambda (n)
-               (if (primop = n 0)
-                   0
-                   (app countdown (primop - n 1))))))
-     (app countdown 3)))
-
-(define test14
-  '(letrec ((even?
-             (lambda (n)
-               (if (primop = n 0)
-                   #t
-                   (app odd? (primop - n 1)))))
-            (odd?
-             (lambda (n)
-               (if (primop = n 0)
-                   #f
-                   (app even? (primop - n 1))))))
-     (app even? 4)))
-
-(define test15
-  '(letrec ((id
-             (lambda (x)
-               x)))
-     (app id 1)
-     (app id 2)))
-
-(define test16
-  '(letrec ((sum-down
-             (lambda (n acc)
-               (if (primop = n 0)
-                   acc
-                   (app sum-down
-                        (primop - n 1)
-                        (primop + acc n))))))
-     (app sum-down 3 0)))
-
-(define test17
-  '(letrec ((walk
-             (lambda (n)
-               (if (primop = n 0)
-                   0
-                   (app jump (primop - n 1) 1))))
-            (jump
-             (lambda (n extra)
-               (if (primop = n 0)
-                   extra
-                   (app walk (primop - n 1))))))
-     (app walk 3)))
-
-(define test18
-  '(let ((step 1))
-     (letrec ((even?
-               (lambda (n)
-                 (if (primop = n 0)
-                     #t
-                     (app odd? (primop - n step)))))
-              (odd?
-               (lambda (n)
-                 (if (primop = n 0)
-                     #f
-                     (app even? (primop - n step))))))
-       (app even? 4))))
-
-(define test19
-  '(let ((step 1))
-     (letrec ((even?
-               (lambda (n)
-                 (if (primop = n 0)
-                     #t
-                     (app odd? (primop - n step)))))
-              (odd?
-                (lambda (n)
-                  (if (primop = n 0)
-                      #f
-                      (app even? (primop - n step))))))
-        even?)))
-
-(define test20
-  '(car (cons 7 ())))
-
-(define test21
-  '(cdr (cons 7 ())))
-
-(define test22
-  '(pair? (cons 1 ())))
-
-(define test23
-  '(null? ()))
-
-(define test24
-  '(if ()
-       1
-       2))
-
-(define test25
-  '(letrec ((sum-list
-             (lambda (xs acc)
-               (if (null? xs)
-                   acc
-                   (app sum-list
-                        (cdr xs)
-                        (primop + acc (car xs)))))))
-     (app sum-list
-          (cons 1 (cons 2 (cons 3 ())))
-          0)))
-
-(define test26
-  '(let ((make-adder
-          (lambda (x)
-            (lambda (y)
-              (primop + x y)))))
-     (let ((f (app make-adder 5)))
-       (app f 1))))
-
-(define test27
-  '(let ((choose
-          (lambda (flag)
-            (if flag
-                (lambda (x) (primop + x 1))
-                (lambda (x) (primop + x 2))))))
-     (let ((f (app choose #t)))
-       (app f 5))))
-
-;; Run tests
-(define sample-tests
-  (list (cons "Test 1: Simple arithmetic" test1)
-        (cons "Test 2: Lambda application" test2)
-        (cons "Test 3: Box operations" test3)
-        (cons "Test 5: Nested lets" test5)
-        (cons "Test 6: Conditional with let" test6)
-        (cons "Test 7: Nested conditionals" test7)
-        (cons "Test 8: Loop-like pattern (for testing CFG)" test8)
-        (cons "Test 9: Closure capture with sequencing in lambda body" test9)
-        (cons "Test 10: Nested closures" test10)
-        (cons "Test 11: Direct sequencing in lambda body" test11)
-        (cons "Test 12: Simple values in if branches" test12)
-        (cons "Test 13: Self-recursive letrec" test13)
-        (cons "Test 14: Mutually recursive letrec" test14)
-        (cons "Test 15: Sequencing in letrec body" test15)
-        (cons "Test 16: Self-recursive letrec with accumulator" test16)
-        (cons "Test 17: Mutual letrec fallback with incompatible arities" test17)
-        (cons "Test 18: Capturing mutual letrec cluster" test18)
-        (cons "Test 19: Capturing mutual letrec escape fallback" test19)
-        (cons "Test 20: car of a cons cell" test20)
-        (cons "Test 21: cdr returns null" test21)
-        (cons "Test 22: pair? recognizes pairs" test22)
-        (cons "Test 23: null? recognizes the empty list" test23)
-        (cons "Test 24: only #f is false" test24)
-        (cons "Test 25: Recursive sum over a list" test25)
-        (cons "Test 26: Monomorphic closure call for 0CFA" test26)
-        (cons "Test 27: Polymorphic closure call fallback" test27)))
-
-(define named-tests
-  (list (cons 'test1 test1)
-        (cons 'test2 test2)
-        (cons 'test3 test3)
-        (cons 'test5 test5)
-        (cons 'test6 test6)
-        (cons 'test7 test7)
-        (cons 'test8 test8)
-        (cons 'test9 test9)
-        (cons 'test10 test10)
-        (cons 'test11 test11)
-        (cons 'test12 test12)
-        (cons 'test13 test13)
-        (cons 'test14 test14)
-        (cons 'test15 test15)
-        (cons 'test16 test16)
-        (cons 'test17 test17)
-        (cons 'test18 test18)
-        (cons 'test19 test19)
-        (cons 'test20 test20)
-        (cons 'test21 test21)
-        (cons 'test22 test22)
-        (cons 'test23 test23)
-        (cons 'test24 test24)
-        (cons 'test25 test25)
-        (cons 'test26 test26)
-        (cons 'test27 test27)))
-
-(define (lookup-named-test name)
-  (let ((binding (assoc name named-tests)))
-    (if binding
-        (cdr binding)
-        (error "Unknown test name" name))))
-
-(define (write-named-aarch64-program name path)
-  (write-aarch64-program (lookup-named-test name) path))
-
-(define (run-sample-tests)
-  (let loop ((rest sample-tests) (first? #t))
-    (if (null? rest)
-        'done
-        (begin
-          (display (if first? "\n" "\n\n"))
-          (display (car (car rest)))
-          (newline)
-          (compile-program (cdr (car rest)))
-          (loop (cdr rest) #f)))))
-
-(if (not (getenv "HOP_SCHEME_SKIP_SAMPLES"))
-    (run-sample-tests))
+;;; Test fixtures and demo helpers live in separate test-owned files so loading
+;;; the compiler does not implicitly run or define the regression suite.
