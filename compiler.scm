@@ -4,6 +4,7 @@
 ;;; each stage has a single, teachable job:
 ;;;
 ;;;   source program
+;;;     -> program lowering
 ;;;     -> uniquify
 ;;;     -> letrec desugaring
 ;;;     -> closure conversion
@@ -14,10 +15,11 @@
 ;;;     -> AArch64 assembly
 ;;;
 ;;; The source language supported here is intentionally small: arithmetic,
-;;; booleans, null, pairs, conditionals, boxes, lambdas, applications, and
-;;; lambda-only letrec.
+;;; booleans, null, pairs, conditionals, boxes, lambdas, applications,
+;;; lambda-only letrec, and top-level variable define in multi-form programs.
 
 (import (scheme base)
+        (scheme read)
         (scheme write))
 
 ;;; ============================================================================
@@ -83,6 +85,146 @@
       (body->expr body-exprs)
       `(let (,(car bindings))
          ,(nest-let-bindings (cdr bindings) body-exprs))))
+
+;;; ============================================================================
+;;; Pass 0: Program Lowering
+;;; Accept either a single expression or an explicit `(program ...)` wrapper,
+;;; flatten top-level `begin`, assign compiler-known global slots, and rewrite
+;;; top-level define into explicit global initialization.
+;;; ============================================================================
+
+(define (program-source? source)
+  (and (pair? source) (eq? (car source) 'program)))
+
+(define (source->forms source)
+  (if (program-source? source)
+      (cdr source)
+      (list source)))
+
+(define (top-level-define-form? form)
+  (and (pair? form)
+       (eq? (car form) 'define)
+       (pair? (cdr form))
+       (symbol? (cadr form))
+       (pair? (cddr form))
+       (null? (cdddr form))))
+
+(define (flatten-top-level-forms forms)
+  (define (flatten-form form)
+    (if (and (pair? form) (eq? (car form) 'begin))
+        (flatten-top-level-forms (cdr form))
+        (list form)))
+  (append-map flatten-form forms))
+
+(define (collect-top-level-global-env forms)
+  (let loop ((rest forms) (next-slot 0) (env '()))
+    (if (null? rest)
+        env
+        (let ((form (car rest)))
+          (if (top-level-define-form? form)
+              (let ((name (cadr form)))
+                (if (assoc name env)
+                    (loop (cdr rest) next-slot env)
+                    (loop (cdr rest)
+                          (+ next-slot 1)
+                          (cons (list name next-slot) env))))
+              (loop (cdr rest) next-slot env))))))
+
+(define (global-slot name global-env)
+  (let ((binding (assoc name global-env)))
+    (if binding
+        (cadr binding)
+        (error "Unknown global binding" name))))
+
+(define (resolve-globals expr local-env global-env)
+  (cond
+    ((symbol? expr)
+     (if (memq expr local-env)
+         expr
+         (let ((binding (assoc expr global-env)))
+           (if binding
+               `(global ,(cadr binding))
+               expr))))
+    ((literal-expr? expr) expr)
+    ((pair? expr)
+     (case (car expr)
+       ((begin)
+        `(begin ,@(map (lambda (e) (resolve-globals e local-env global-env))
+                       (cdr expr))))
+       ((primop)
+        `(primop ,(cadr expr)
+                 ,@(map (lambda (e) (resolve-globals e local-env global-env))
+                        (cddr expr))))
+       ((if)
+        `(if ,(resolve-globals (cadr expr) local-env global-env)
+             ,(resolve-globals (caddr expr) local-env global-env)
+             ,(resolve-globals (cadddr expr) local-env global-env)))
+       ((let)
+        (let* ((binding (caadr expr))
+               (var (car binding))
+               (val-expr (cadr binding))
+               (body-exprs (cddr expr)))
+          `(let ((,var ,(resolve-globals val-expr local-env global-env)))
+             ,@(map (lambda (body-expr)
+                      (resolve-globals body-expr
+                                       (cons var local-env)
+                                       global-env))
+                    body-exprs))))
+       ((lambda)
+        (let ((params (cadr expr)))
+          `(lambda ,params
+             ,@(map (lambda (body-expr)
+                      (resolve-globals body-expr
+                                       (append params local-env)
+                                       global-env))
+                    (cddr expr)))))
+       ((letrec)
+        (let* ((bindings (cadr expr))
+               (names (map car bindings))
+               (rec-env (append names local-env)))
+          `(letrec
+             ,(map (lambda (binding)
+                     (list (car binding)
+                           (resolve-globals (cadr binding) rec-env global-env)))
+                   bindings)
+             ,@(map (lambda (body-expr)
+                      (resolve-globals body-expr rec-env global-env))
+                    (cddr expr)))))
+       ((app)
+        `(app ,(resolve-globals (cadr expr) local-env global-env)
+              ,@(map (lambda (e) (resolve-globals e local-env global-env))
+                     (cddr expr))))
+       ((cons)
+        `(cons ,(resolve-globals (cadr expr) local-env global-env)
+               ,(resolve-globals (caddr expr) local-env global-env)))
+       ((box unbox car cdr pair? null?)
+        `(,(car expr) ,(resolve-globals (cadr expr) local-env global-env)))
+       ((set-box!)
+        `(set-box! ,(resolve-globals (cadr expr) local-env global-env)
+                   ,(resolve-globals (caddr expr) local-env global-env)))
+       ((define)
+        (error "Internal define is not supported" expr))
+       (else
+        (error "Unknown expression during global resolution" (car expr)))))
+    (else
+     (error "Invalid expression during global resolution" expr))))
+
+(define (lower-source-program source)
+  (let* ((forms (flatten-top-level-forms (source->forms source)))
+         (global-env (collect-top-level-global-env forms)))
+    (if (null? forms)
+        (error "Program requires at least one top-level form")
+        (values
+         (body->expr
+          (map (lambda (form)
+                 (if (top-level-define-form? form)
+                     ;; Top-level define is not a local binder after this point;
+                     ;; it is an ordered write into a compiler-assigned slot.
+                     `(set-global! ,(global-slot (cadr form) global-env)
+                                    ,(resolve-globals (caddr form) '() global-env))
+                     (resolve-globals form '() global-env)))
+               forms))
+         (length global-env)))))
 
 ;;; ============================================================================
 ;;; Pass 1: Uniquify
@@ -189,8 +331,15 @@
           ((set-box!)
            `(set-box! ,(uniquify-expr (cadr expr) env) 
                       ,(uniquify-expr (caddr expr) env)))
-         
-         (else (error "Unknown expression type" (car expr)))))
+          
+          ((global)
+           expr)
+
+          ((set-global!)
+           `(set-global! ,(cadr expr)
+                         ,(uniquify-expr (caddr expr) env)))
+          
+          (else (error "Unknown expression type" (car expr)))))
       
       (else (error "Invalid expression" expr))))
   
@@ -285,10 +434,16 @@
            (and (tail-recursion-safe? (cadr expr) group-names #f)
                 (tail-recursion-safe? (caddr expr) group-names #f)))
 
-          ((box unbox car cdr pair? null?)
-           (tail-recursion-safe? (cadr expr) group-names #f))
-          
-          (else #f)))
+           ((box unbox car cdr pair? null?)
+            (tail-recursion-safe? (cadr expr) group-names #f))
+
+           ((global)
+            #t)
+
+           ((set-global!)
+            (tail-recursion-safe? (caddr expr) group-names #f))
+           
+           (else #f)))
       
       (else #f)))
 
@@ -345,10 +500,16 @@
             (append (collect (cadr expr) bound)
                     (collect (caddr expr) bound)))
 
-           ((box unbox car cdr pair? null?)
-            (collect (cadr expr) bound))
-            
-            (else '())))
+            ((box unbox car cdr pair? null?)
+             (collect (cadr expr) bound))
+
+            ((global)
+             '())
+
+            ((set-global!)
+             (collect (caddr expr) bound))
+             
+             (else '())))
         
         (else '())))
     
@@ -415,10 +576,16 @@
            (append (tail-call-targets (cadr expr) group-names #f)
                    (tail-call-targets (caddr expr) group-names #f)))
 
-          ((box unbox car cdr pair? null?)
-           (tail-call-targets (cadr expr) group-names #f))
-          
-          (else '())))
+           ((box unbox car cdr pair? null?)
+            (tail-call-targets (cadr expr) group-names #f))
+
+           ((global)
+            '())
+
+           ((set-global!)
+            (tail-call-targets (caddr expr) group-names #f))
+           
+           (else '())))
       
       (else '())))
 
@@ -496,9 +663,13 @@
                (group-entry-safe? (caddr expr) group-names)))
          ((box)
           (group-entry-safe? (cadr expr) group-names))
-         ((unbox car cdr pair? null?)
-          (group-entry-safe? (cadr expr) group-names))
-         (else #f)))
+          ((unbox car cdr pair? null?)
+           (group-entry-safe? (cadr expr) group-names))
+          ((global)
+           #t)
+          ((set-global!)
+           (group-entry-safe? (caddr expr) group-names))
+          (else #f)))
       (else #f)))
 
   (define (rewrite-sequence exprs env current-group tail?)
@@ -631,14 +802,21 @@
           ((null?)
            `(null? ,(rewrite (cadr expr) env current-group #f)))
           
-          ((set-box!)
-           (let ((target (cadr expr)))
-            (when (and (symbol? target) (assoc target env))
-              (error "Cannot mutate letrec function binding" target))
-            `(set-box! ,(rewrite target env current-group #f)
-                       ,(rewrite (caddr expr) env current-group #f))))
-         
-         (else (error "Unknown expression type in letrec desugaring" (car expr)))))
+           ((set-box!)
+            (let ((target (cadr expr)))
+             (when (and (symbol? target) (assoc target env))
+               (error "Cannot mutate letrec function binding" target))
+             `(set-box! ,(rewrite target env current-group #f)
+                        ,(rewrite (caddr expr) env current-group #f))))
+
+           ((global)
+            expr)
+
+           ((set-global!)
+            `(set-global! ,(cadr expr)
+                          ,(rewrite (caddr expr) env current-group #f)))
+          
+          (else (error "Unknown expression type in letrec desugaring" (car expr)))))
       
       (else (error "Invalid expression in letrec desugaring" expr))))
   
@@ -701,9 +879,15 @@
            ((box unbox car cdr pair? null?)
             (collect (cadr expr) bound))
 
-          ((cons set-box!)
-           (append (collect (cadr expr) bound)
-                   (collect (caddr expr) bound)))
+           ((global)
+            '())
+
+           ((set-global!)
+            (collect (caddr expr) bound))
+
+           ((cons set-box!)
+            (append (collect (cadr expr) bound)
+                    (collect (caddr expr) bound)))
           
           (else (error "Unknown expression in free-vars" (car expr)))))
       
@@ -767,7 +951,11 @@
          ((lambda)
           (collect-group-tail-targets (body->expr (cddr expr))))
          ((box unbox car cdr pair? null?)
-          (collect-group-tail-targets (cadr expr)))
+           (collect-group-tail-targets (cadr expr)))
+         ((global)
+          '())
+         ((set-global!)
+          (collect-group-tail-targets (caddr expr)))
          (else '())))
       (else '())))
 
@@ -788,9 +976,13 @@
               (any (lambda (e) (mentions-box-var? e box-vars)) (cddr expr))))
          ((lambda)
           (mentions-box-var? (body->expr (cddr expr)) box-vars))
-         ((box unbox car cdr pair? null?)
-           (mentions-box-var? (cadr expr) box-vars))
-         (else #f)))
+          ((box unbox car cdr pair? null?)
+            (mentions-box-var? (cadr expr) box-vars))
+          ((global)
+           #f)
+          ((set-global!)
+           (mentions-box-var? (caddr expr) box-vars))
+          (else #f)))
       (else #f)))
 
   (define (safe-group-body? expr box-vars)
@@ -832,11 +1024,15 @@
              (if (and (symbol? target) (memq target box-vars))
                  #f
                  (safe-group-body? target box-vars))))
-         ((set-box!)
-          (and (not (and (symbol? (cadr expr)) (memq (cadr expr) box-vars)))
-               (safe-group-body? (cadr expr) box-vars)
-               (safe-group-body? (caddr expr) box-vars)))
-         (else #f)))
+          ((set-box!)
+           (and (not (and (symbol? (cadr expr)) (memq (cadr expr) box-vars)))
+                (safe-group-body? (cadr expr) box-vars)
+                (safe-group-body? (caddr expr) box-vars)))
+          ((global)
+           #t)
+          ((set-global!)
+           (safe-group-body? (caddr expr) box-vars))
+          (else #f)))
       (else #f)))
 
   (define (extract-group-prefix exprs env)
@@ -956,105 +1152,90 @@
       
       ((literal-expr? expr)
        expr)
-      
-       ((pair? expr)
-        (case (car expr)
-          ((begin)
-           `(begin ,@(convert-sequence (cdr expr) env self-tail-prefix)))
-          
-           ((primop)
-            `(primop ,(cadr expr) 
-                     ,@(map (lambda (e) (convert e env self-tail-prefix)) (cddr expr))))
-          
-          ((if)
-           `(if ,(convert (cadr expr) env self-tail-prefix)
-                ,(convert (caddr expr) env self-tail-prefix)
-                ,(convert (cadddr expr) env self-tail-prefix)))
-          
-           ((let)
-            (let* ((binding (caadr expr))
-                   (var (car binding))
-                   (val (cadr binding))
-                   (body (body->expr (cddr expr)))
-                   (val-converted (convert val env self-tail-prefix))
-                   (new-env (cons (list var `(local ,var)) env))
-                   (body-converted (convert body new-env self-tail-prefix)))
-              `(let ((,var ,val-converted)) ,body-converted)))
-           
-            ((lambda)
-             (let* ((params (cadr expr))
-                    (body (body->expr (cddr expr)))
-                    (fvs (free-vars body params))
-                    ;; These synthetic parameters stand for the closure payload
-                    ;; that will be prepended to the user-visible parameters.
-                    (env-vars (make-env-vars "env." (length fvs)))
-                    (param-bindings (map (lambda (p) (list p `(local ,p))) params))
-                    (env-bindings (map (lambda (fv env-var)
-                                         (list fv `(closure ,env-var)))
-                                      fvs env-vars))
-                  (new-env (append param-bindings env-bindings env))
-                  (self-tail-env (map (lambda (env-var) `(local ,env-var)) env-vars))
-                  
-                  (body-converted (convert body new-env self-tail-env)))
-              ;; The output lambda now expects its environment explicitly, and
-              ;; make-closure packages the current values of the free variables
-              ;; beside that code pointer.
-              `(make-closure 
-               (lambda ,(append env-vars params) ,body-converted)
-               ,@(map (lambda (fv) 
-                        (let ((binding (assoc fv env)))
+      ((pair? expr)
+       (case (car expr)
+         ((begin)
+          `(begin ,@(convert-sequence (cdr expr) env self-tail-prefix)))
+         ((primop)
+          `(primop ,(cadr expr)
+                   ,@(map (lambda (e) (convert e env self-tail-prefix)) (cddr expr))))
+         ((if)
+          `(if ,(convert (cadr expr) env self-tail-prefix)
+               ,(convert (caddr expr) env self-tail-prefix)
+               ,(convert (cadddr expr) env self-tail-prefix)))
+         ((let)
+          (let* ((binding (caadr expr))
+                 (var (car binding))
+                 (val (cadr binding))
+                 (body (body->expr (cddr expr)))
+                 (val-converted (convert val env self-tail-prefix))
+                 (new-env (cons (list var `(local ,var)) env))
+                 (body-converted (convert body new-env self-tail-prefix)))
+            `(let ((,var ,val-converted)) ,body-converted)))
+         ((lambda)
+          (let* ((params (cadr expr))
+                 (body (body->expr (cddr expr)))
+                 (fvs (free-vars body params))
+                 ;; These synthetic parameters stand for the closure payload
+                 ;; that will be prepended to the user-visible parameters.
+                 (env-vars (make-env-vars "env." (length fvs)))
+                 (param-bindings (map (lambda (p) (list p `(local ,p))) params))
+                 (env-bindings (map (lambda (fv env-var)
+                                      (list fv `(closure ,env-var)))
+                                    fvs env-vars))
+                 (new-env (append param-bindings env-bindings env))
+                 (self-tail-env (map (lambda (env-var) `(local ,env-var)) env-vars))
+                 (body-converted (convert body new-env self-tail-env)))
+            ;; The output lambda now expects its environment explicitly, and
+            ;; make-closure packages the current values of the free variables
+            ;; beside that code pointer.
+            `(make-closure
+              (lambda ,(append env-vars params) ,body-converted)
+              ,@(map (lambda (fv)
+                       (let ((binding (assoc fv env)))
                          (if binding
                              (cadr binding)
                              fv)))  ; Global/primitive
                      fvs))))
-         
-           ((app)
-            (let ((rator (cadr expr))
-                  (rands (cddr expr)))
-              `(closure-call ,(convert rator env self-tail-prefix)
-                             ,@(map (lambda (e) (convert e env self-tail-prefix)) rands))))
-
-            ((cons)
-             `(cons ,(convert (cadr expr) env self-tail-prefix)
-                    ,(convert (caddr expr) env self-tail-prefix)))
-
-             ((self-tail-call)
-              `(self-tail-call
-               ,@self-tail-prefix
-               ,@(map (lambda (e) (convert e env self-tail-prefix)) (cdr expr))))
-
-          ((group-tail-call)
-           `(group-tail-call
-             ,(cadr expr)
-             ,@(map (lambda (e) (convert e env self-tail-prefix)) (cddr expr))))
-
-          ((group-closures)
-           expr)
-           
-             ((box)
-              `(box ,(convert (cadr expr) env self-tail-prefix)))
-           
-           ((unbox)
-            `(unbox ,(convert (cadr expr) env self-tail-prefix)))
-
-           ((car)
-            `(car ,(convert (cadr expr) env self-tail-prefix)))
-
-           ((cdr)
-            `(cdr ,(convert (cadr expr) env self-tail-prefix)))
-
-           ((pair?)
-            `(pair? ,(convert (cadr expr) env self-tail-prefix)))
-
-           ((null?)
-            `(null? ,(convert (cadr expr) env self-tail-prefix)))
-           
-           ((set-box!)
-            `(set-box! ,(convert (cadr expr) env self-tail-prefix)
-                      ,(convert (caddr expr) env self-tail-prefix)))
-          
-          (else (error "Unknown expression in closure-convert" (car expr)))))
-      
+         ((app)
+          (let ((rator (cadr expr))
+                (rands (cddr expr)))
+            `(closure-call ,(convert rator env self-tail-prefix)
+                           ,@(map (lambda (e) (convert e env self-tail-prefix)) rands))))
+         ((cons)
+          `(cons ,(convert (cadr expr) env self-tail-prefix)
+                 ,(convert (caddr expr) env self-tail-prefix)))
+         ((self-tail-call)
+          `(self-tail-call
+            ,@self-tail-prefix
+            ,@(map (lambda (e) (convert e env self-tail-prefix)) (cdr expr))))
+         ((group-tail-call)
+          `(group-tail-call
+            ,(cadr expr)
+            ,@(map (lambda (e) (convert e env self-tail-prefix)) (cddr expr))))
+         ((group-closures global)
+          expr)
+         ((box)
+          `(box ,(convert (cadr expr) env self-tail-prefix)))
+         ((unbox)
+          `(unbox ,(convert (cadr expr) env self-tail-prefix)))
+         ((car)
+          `(car ,(convert (cadr expr) env self-tail-prefix)))
+         ((cdr)
+          `(cdr ,(convert (cadr expr) env self-tail-prefix)))
+         ((pair?)
+          `(pair? ,(convert (cadr expr) env self-tail-prefix)))
+         ((null?)
+          `(null? ,(convert (cadr expr) env self-tail-prefix)))
+         ((set-box!)
+          `(set-box! ,(convert (cadr expr) env self-tail-prefix)
+                     ,(convert (caddr expr) env self-tail-prefix)))
+         ((set-global!)
+          `(set-global! ,(cadr expr)
+                        ,(convert (caddr expr) env self-tail-prefix)))
+         (else
+          (error "Unknown expression in closure-convert" (car expr)))))
+       
       (else (error "Invalid expression in closure-convert" expr))))
   
   (convert expr '() '()))
@@ -1070,7 +1251,7 @@
 (define (cfa-simple-expr? expr)
   (or (symbol? expr)
       (literal-expr? expr)
-      (and (pair? expr) (memq (car expr) '(local closure)))))
+      (and (pair? expr) (memq (car expr) '(local closure global)))))
 
 (define (wrap-let-bindings bindings body)
   (let loop ((rest (reverse bindings)) (result body))
@@ -1183,13 +1364,15 @@
                           (normalize (cadr capture-spec))))
                   (caddr expr))))
          ((cons set-box!)
-          `(,(car expr)
-            ,(normalize (cadr expr))
-            ,(normalize (caddr expr))))
-         ((box unbox car cdr pair? null?)
-          `(,(car expr) ,(normalize (cadr expr))))
-         ((local closure)
-          expr)
+           `(,(car expr)
+             ,(normalize (cadr expr))
+             ,(normalize (caddr expr))))
+          ((box unbox car cdr pair? null?)
+           `(,(car expr) ,(normalize (cadr expr))))
+          ((set-global!)
+           `(set-global! ,(cadr expr) ,(normalize (caddr expr))))
+         ((local closure global)
+           expr)
          (else
           (error "Unknown expression in CFA normalization" (car expr)))))
       (else
@@ -1198,14 +1381,16 @@
   (normalize expr))
 
 (define (run-0cfa expr)
-  ;; The analysis tracks four related facts:
+  ;; The analysis tracks five related facts:
   ;;   - procedures: metadata for every closure-allocated procedure,
   ;;   - var-flow: which procedures may flow to each variable-like name,
   ;;   - box-flow: which procedures may be stored in each box,
+  ;;   - global-flow: which procedures may be stored in each global slot,
   ;;   - proc-results: which procedures may be returned by each procedure.
   (define procedures (make-hash-table))
   (define var-flow (make-hash-table))
   (define box-flow (make-hash-table))
+  (define global-flow (make-hash-table))
   (define proc-results (make-hash-table))
   (define changed #f)
 
@@ -1273,17 +1458,19 @@
          ((group-tail-call)
           (for-each collect-procedures (cddr expr)))
          ((group-closures)
-          (for-each (lambda (member)
-                      (collect-procedures (cadddr member)))
-                    (cadr expr))
-          (for-each (lambda (capture-spec)
-                      (collect-procedures (cadr capture-spec)))
-                    (caddr expr)))
-         ((box unbox car cdr pair? null?)
-          (collect-procedures (cadr expr)))
-         ((local closure) 'done)
-         (else
-          (error "Unknown expression while collecting CFA procedures" (car expr)))))
+           (for-each (lambda (member)
+                       (collect-procedures (cadddr member)))
+                     (cadr expr))
+           (for-each (lambda (capture-spec)
+                       (collect-procedures (cadr capture-spec)))
+                     (caddr expr)))
+          ((box unbox car cdr pair? null?)
+           (collect-procedures (cadr expr)))
+          ((set-global!)
+           (collect-procedures (caddr expr)))
+          ((local closure global) 'done)
+          (else
+           (error "Unknown expression while collecting CFA procedures" (car expr)))))
       (else
        (error "Invalid expression while collecting CFA procedures" expr))))
 
@@ -1294,12 +1481,14 @@
       ((literal-expr? expr) '())
       ((symbol? expr) (flow-ref var-flow expr))
       ((pair? expr)
-       (case (car expr)
-         ((local closure)
-          (flow-ref var-flow (cadr expr)))
-         ((begin)
-          (let loop ((rest (cdr expr)) (last '()))
-            (if (null? rest)
+        (case (car expr)
+          ((local closure)
+           (flow-ref var-flow (cadr expr)))
+          ((global)
+           (flow-ref global-flow (cadr expr)))
+          ((begin)
+           (let loop ((rest (cdr expr)) (last '()))
+             (if (null? rest)
                 last
                 (loop (cdr rest)
                       (analyze-expr (car rest) current-proc)))))
@@ -1411,14 +1600,18 @@
             (if key
                 (flow-ref box-flow key)
                 '())))
-         ((set-box!)
-          (let ((value-set (analyze-expr (caddr expr) current-proc))
-                (key (box-key (cadr expr))))
-            (analyze-expr (cadr expr) current-proc)
-            (add-flow! box-flow key value-set)
-            value-set))
-         (else
-          (error "Unknown expression in 0CFA" (car expr)))))
+          ((set-box!)
+           (let ((value-set (analyze-expr (caddr expr) current-proc))
+                 (key (box-key (cadr expr))))
+             (analyze-expr (cadr expr) current-proc)
+             (add-flow! box-flow key value-set)
+             value-set))
+          ((set-global!)
+           (let ((value-set (analyze-expr (caddr expr) current-proc)))
+             (add-flow! global-flow (cadr expr) value-set)
+             value-set))
+          (else
+           (error "Unknown expression in 0CFA" (car expr)))))
       (else
        (error "Invalid expression in 0CFA" expr))))
 
@@ -1435,14 +1628,15 @@
               (result-set (analyze-expr body proc-name)))
          (add-flow! proc-results proc-name result-set)))
      (table-keys procedures))
-    (if changed
-        (loop)
-        (list procedures var-flow box-flow proc-results))))
+     (if changed
+         (loop)
+         (list procedures var-flow box-flow global-flow proc-results))))
 
 (define (rewrite-known-calls expr analysis)
   (let ((procedures (car analysis))
-        (var-flow (cadr analysis))
-        (box-flow (caddr analysis)))
+         (var-flow (cadr analysis))
+         (box-flow (caddr analysis))
+         (global-flow (cadddr analysis)))
     (define (flow-ref table key)
       (let ((value (hash-ref table key)))
         (if value value '())))
@@ -1464,15 +1658,17 @@
          (case (car expr)
            ((local closure)
             (flow-ref var-flow (cadr expr)))
-           ((unbox)
-            (let ((key (box-key (cadr expr))))
-              (if key
+            ((global)
+             (flow-ref global-flow (cadr expr)))
+            ((unbox)
+             (let ((key (box-key (cadr expr))))
+               (if key
                   (flow-ref box-flow key)
                   '())))
            ((make-closure)
             (list (cadr expr)))
-           ((let)
-            (closure-set (body->expr (cddr expr))))
+            ((let)
+             (closure-set (body->expr (cddr expr))))
            ((begin)
             (if (null? (cdr expr))
                 '()
@@ -1543,10 +1739,12 @@
                     (caddr expr))))
            ((cons set-box!)
             `(,(car expr) ,(rewrite (cadr expr)) ,(rewrite (caddr expr))))
-           ((box unbox car cdr pair? null? local closure)
-            `(,(car expr) ,(rewrite (cadr expr))))
-           (else
-            (error "Unknown expression in known-call rewrite" (car expr)))))
+           ((set-global!)
+            `(set-global! ,(cadr expr) ,(rewrite (caddr expr))))
+            ((box unbox car cdr pair? null? local closure global)
+             `(,(car expr) ,(rewrite (cadr expr))))
+            (else
+             (error "Unknown expression in known-call rewrite" (car expr)))))
         (else
          (error "Invalid expression in known-call rewrite" expr))))
 
@@ -1732,8 +1930,10 @@
           ((app closure-call known-call set-box! cons)
            (all (lambda (e) (cluster-body-compatible? e names)) (cdr expr)))
           ((box unbox car cdr pair? null?)
-           (cluster-body-compatible? (cadr expr) names))
-          ((local closure) #t)
+            (cluster-body-compatible? (cadr expr) names))
+          ((global local closure) #t)
+          ((set-global!)
+           (cluster-body-compatible? (caddr expr) names))
           (else #f)))
       (else #f)))
 
@@ -1757,10 +1957,14 @@
           (append (collect-group-tail-targets (cadr (caadr expr)))
                   (append-map collect-group-tail-targets (cddr expr))))
          ((lambda)
-          (collect-group-tail-targets (body->expr (cddr expr))))
-          ((box unbox car cdr pair? null?)
-           (collect-group-tail-targets (cadr expr)))
-          (else '())))
+           (collect-group-tail-targets (body->expr (cddr expr))))
+           ((box unbox car cdr pair? null?)
+            (collect-group-tail-targets (cadr expr)))
+           ((global)
+            '())
+           ((set-global!)
+            (collect-group-tail-targets (caddr expr)))
+           (else '())))
       (else '())))
 
   (define (all-same-member-arity? members)
@@ -1919,10 +2123,10 @@
       ((simple? expr)
        (values (list `(return ,(simple-value expr))) '()))
       
-      ((pair? expr)
-       (case (car expr)
-         ((begin)
-          (let ((body-exprs (cdr expr)))
+       ((pair? expr)
+        (case (car expr)
+          ((begin)
+           (let ((body-exprs (cdr expr)))
             (let-values (((cluster-instrs cluster-procedures remaining-exprs)
                           (convert-cluster-prefix body-exprs)))
               (let loop ((rest remaining-exprs)
@@ -2094,8 +2298,13 @@
              (values '() value '()))))
       
       ((pair? expr)
-       (case (car expr)
-         ((begin)
+        (case (car expr)
+          ((global)
+           (let ((result-var (or dest (fresh-temp))))
+             (values (list `(assign ,result-var ,expr))
+                     result-var
+                     '())))
+          ((begin)
           (let ((body-exprs (cdr expr)))
             (let-values (((cluster-instrs cluster-procedures remaining-exprs)
                           (convert-cluster-prefix body-exprs)))
@@ -2247,23 +2456,35 @@
          ((group-tail-call)
           (error "group-tail-call is only valid in tail position" expr))
          
-         ((set-box!)
-          (let-values (((box-instrs box-var box-procedures)
-                        (convert-value (cadr expr) #f))
-                       ((val-instrs val-var val-procedures)
-                        (convert-value (caddr expr) #f)))
-            (let ((result-var (or dest val-var)))
+          ((set-box!)
+           (let-values (((box-instrs box-var box-procedures)
+                         (convert-value (cadr expr) #f))
+                        ((val-instrs val-var val-procedures)
+                         (convert-value (caddr expr) #f)))
+             (let ((result-var (or dest val-var)))
               (values (append box-instrs
                               val-instrs
                               (list `(set-box! ,box-var ,val-var))
                               (if (eq? result-var val-var)
                                   '()
                                   (list `(assign ,result-var ,val-var))))
-                      result-var
-                      (append box-procedures val-procedures)))))
-         
-         ((local closure)
-          (values '() (cadr expr) '()))
+                       result-var
+                       (append box-procedures val-procedures)))))
+
+          ((set-global!)
+           (let-values (((val-instrs val-var val-procedures)
+                         (convert-value (caddr expr) #f)))
+             (let ((result-var (or dest val-var)))
+               (values (append val-instrs
+                               (list `(set-global! ,(cadr expr) ,val-var))
+                               (if (eq? result-var val-var)
+                                   '()
+                                   (list `(assign ,result-var ,val-var))))
+                       result-var
+                       val-procedures))))
+          
+          ((local closure)
+           (values '() (cadr expr) '()))
          
          (else
           (error "Unknown expression in expr->tac" (car expr)))))
@@ -2505,6 +2726,8 @@
        (list `(is-pair ,dst ,(cadr rhs))))
       ((and (pair? rhs) (eq? (car rhs) 'null?))
        (list `(is-null ,dst ,(cadr rhs))))
+      ((and (pair? rhs) (eq? (car rhs) 'global))
+       (list `(load-global ,dst ,(cadr rhs))))
       ((and (pair? rhs) (eq? (car rhs) 'closure-env-ref))
        (list `(load-closure-env ,dst ,(cadr rhs) ,(caddr rhs))))
       ((and (pair? rhs) (eq? (car rhs) 'make-closure))
@@ -2535,6 +2758,8 @@
      (list `(tail-call-known ,@(cdr instr))))
     ((eq? (car instr) 'set-box!)
      (list `(store-box ,(cadr instr) ,(caddr instr))))
+    ((eq? (car instr) 'set-global!)
+     (list `(store-global ,(cadr instr) ,(caddr instr))))
     (else
      (error "Unknown TAC instruction in instruction selection" instr))))
 
@@ -2582,13 +2807,16 @@
      (append (if (symbol? (cadddr instr)) (list (cadddr instr)) '())
              (if (symbol? (car (cddddr instr))) (list (car (cddddr instr))) '())))
     ((alloc-box load-box load-car load-cdr is-pair is-null load-closure-env)
-       (if (symbol? (caddr instr)) (list (caddr instr)) '()))
+        (if (symbol? (caddr instr)) (list (caddr instr)) '()))
+    ((load-global) '())
     ((alloc-pair)
      (append (if (symbol? (caddr instr)) (list (caddr instr)) '())
              (if (symbol? (cadddr instr)) (list (cadddr instr)) '())))
     ((store-box)
       (append (if (symbol? (cadr instr)) (list (cadr instr)) '())
               (if (symbol? (caddr instr)) (list (caddr instr)) '())))
+    ((store-global)
+      (if (symbol? (caddr instr)) (list (caddr instr)) '()))
     ((alloc-closure)
      (let loop ((rest (cdddr instr)) (result '()))
        (if (null? rest)
@@ -2643,11 +2871,11 @@
 (define (machine-instr-defs instr)
   (case (car instr)
     ((move-in move alloc-pair alloc-box load-box load-car load-cdr
-              is-pair is-null load-closure-env alloc-closure call call-known)
+              is-pair is-null load-closure-env load-global alloc-closure call call-known)
       (list (cadr instr)))
     ((binop)
       (list (caddr instr)))
-    ((store-box branch-if jump ret tail-call tail-call-known) '())
+    ((store-box store-global branch-if jump ret tail-call tail-call-known) '())
     (else (error "Unknown machine instruction in def analysis" instr))))
 
 (define (machine-block-use block)
@@ -2898,9 +3126,12 @@
      `(load-box ,(lookup-home homes (cadr instr))
                 ,(lookup-home homes (caddr instr))))
     ((load-closure-env)
-     `(load-closure-env ,(lookup-home homes (cadr instr))
-                        ,(lookup-home homes (caddr instr))
-                        ,(cadddr instr)))
+      `(load-closure-env ,(lookup-home homes (cadr instr))
+                         ,(lookup-home homes (caddr instr))
+                         ,(cadddr instr)))
+    ((load-global)
+      `(load-global ,(lookup-home homes (cadr instr))
+                    ,(caddr instr)))
     ((load-car)
      `(load-car ,(lookup-home homes (cadr instr))
                 ,(lookup-home homes (caddr instr))))
@@ -2914,8 +3145,11 @@
      `(is-null ,(lookup-home homes (cadr instr))
                ,(lookup-home homes (caddr instr))))
     ((store-box)
-     `(store-box ,(lookup-home homes (cadr instr))
+      `(store-box ,(lookup-home homes (cadr instr))
                   ,(lookup-home homes (caddr instr))))
+    ((store-global)
+      `(store-global ,(cadr instr)
+                     ,(lookup-home homes (caddr instr))))
     ((alloc-closure)
      `(alloc-closure ,(lookup-home homes (cadr instr))
                      ,(caddr instr)
@@ -3245,6 +3479,7 @@
 (define null-immediate 20)
 (define false-immediate 36)
 (define true-immediate 52)
+(define uninitialized-immediate 68)
 
 (define (encode-immediate value)
   (cond
@@ -3362,6 +3597,20 @@
   (emit-load-operand port "x0" operand proc)
   (emit-asm-line port (string-append "    bl " helper))
   (emit-store-operand port "x0" dst proc))
+
+(define (emit-runtime-global-read port dst slot proc)
+  (emit-asm-line port
+                 (string-append "    mov x0, #"
+                                (number->string slot)))
+  (emit-asm-line port "    bl _hop_global_ref")
+  (emit-store-operand port "x0" dst proc))
+
+(define (emit-runtime-global-write port slot operand proc)
+  (emit-asm-line port
+                 (string-append "    mov x0, #"
+                                (number->string slot)))
+  (emit-load-operand port "x1" operand proc)
+  (emit-asm-line port "    bl _hop_global_set"))
 
 (define (gc-desc-label proc-name)
   (string-append "Lgcdesc." (symbol->string proc-name)))
@@ -3542,6 +3791,8 @@
                                     (number->string (+ 16 (* 8 (cadddr instr))))
                                     "]"))
       (emit-store-operand port "x10" (cadr instr) proc))
+    ((load-global)
+      (emit-runtime-global-read port (cadr instr) (caddr instr) proc))
     ((load-car)
       (emit-runtime-unary-call port "_hop_car" (cadr instr) (caddr instr) proc))
     ((load-cdr)
@@ -3559,9 +3810,11 @@
       (emit-immediate-compare port (caddr instr) null-immediate proc)
       (emit-bool-result port "eq" (cadr instr) proc))
     ((store-box)
-       (emit-load-box-address port (cadr instr) proc)
-       (emit-load-operand port "x10" (caddr instr) proc)
-       (emit-asm-line port "    str x10, [x9, #8]"))
+        (emit-load-box-address port (cadr instr) proc)
+        (emit-load-operand port "x10" (caddr instr) proc)
+        (emit-asm-line port "    str x10, [x9, #8]"))
+    ((store-global)
+      (emit-runtime-global-write port (cadr instr) (caddr instr) proc))
     ((alloc-closure)
      (emit-alloc-closure port (cadr instr) (caddr instr) (cdddr instr) proc))
     ((call-indirect)
@@ -3649,7 +3902,26 @@
                  (string-append "    .quad "
                                 (number->string (stack-size-for proc)))))
 
-(define (emit-aarch64-program port entry-proc procedures)
+(define (emit-global-slots port global-count)
+  (emit-asm-line port (string-append ".globl " (asm-name 'hop_global_slot_count)))
+  (emit-asm-line port ".p2align 3")
+  (emit-asm-line port (string-append (asm-name 'hop_global_slot_count) ":"))
+  (emit-asm-line port
+                 (string-append "    .quad "
+                                (number->string global-count)))
+  (emit-asm-line port (string-append ".globl " (asm-name 'hop_global_slots)))
+  (emit-asm-line port ".p2align 3")
+  (emit-asm-line port (string-append (asm-name 'hop_global_slots) ":"))
+  (let loop ((index 0))
+    (if (= index global-count)
+        'done
+        (begin
+          (emit-asm-line port
+                         (string-append "    .quad "
+                                        (number->string uninitialized-immediate)))
+          (loop (+ index 1))))))
+
+(define (emit-aarch64-program port entry-proc procedures global-count)
   (emit-asm-line port ".text")
   (emit-asm-line port "")
   (emit-machine-procedure port entry-proc 'scheme_entry)
@@ -3661,7 +3933,8 @@
   (emit-procedure-descriptor port entry-proc)
   (for-each (lambda (proc)
               (emit-procedure-descriptor port proc))
-            procedures))
+            procedures)
+  (emit-global-slots port global-count))
 
 ;;; ============================================================================
 ;;; Simple hash table implementation 
@@ -3684,30 +3957,37 @@
 ;;;   - compile-to-cfg: stop after the middle end
 ;;;   - compile-to-backend: run through allocation/finalization
 ;;;   - write-aarch64-program: emit assembly to a file
+;;;   - write-aarch64-program-file: read forms from a source file first
 ;;;   - compile-program: educational debugging view of the intermediate stages
 ;;; ============================================================================
 
 (define (compile-to-cfg expr)
-  (let* ((uniquified (uniquify expr))
-         (desugared (desugar-letrec uniquified))
-         (closure-converted (closure-convert desugared))
-         (cfa-normalized (normalize-for-cfa closure-converted))
-         (cfa-analysis (run-0cfa cfa-normalized))
-         (cfa-rewritten (rewrite-known-calls cfa-normalized cfa-analysis)))
-    (let-values (((tac-instrs procedures) (expr->tac cfa-rewritten)))
-      (values uniquified
-              desugared
-              closure-converted
-              cfa-normalized
-              cfa-rewritten
-              (build-cfg tac-instrs)
+  ;; Every public entry point goes through program lowering first, even the
+  ;; original "single expression" path. That keeps the whole compiler talking
+  ;; about one uniform internal program shape.
+  (let-values (((lowered-program global-count) (lower-source-program expr)))
+    (let* ((uniquified (uniquify lowered-program))
+           (desugared (desugar-letrec uniquified))
+           (closure-converted (closure-convert desugared))
+           (cfa-normalized (normalize-for-cfa closure-converted))
+           (cfa-analysis (run-0cfa cfa-normalized))
+           (cfa-rewritten (rewrite-known-calls cfa-normalized cfa-analysis)))
+      (let-values (((tac-instrs procedures) (expr->tac cfa-rewritten)))
+        (values lowered-program
+                global-count
+                uniquified
+                desugared
+                closure-converted
+                cfa-normalized
+                cfa-rewritten
+                (build-cfg tac-instrs)
                 (map (lambda (procedure)
                        (cons procedure
                              (build-cfg (procedure-instructions procedure))))
-                     procedures)))))
+                     procedures))))))
 
 (define (compile-to-backend expr)
-  (let-values (((uniquified desugared closure-converted cfa-normalized
+  (let-values (((lowered-program global-count uniquified desugared closure-converted cfa-normalized
                              cfa-rewritten entry-cfg procedures)
                  (compile-to-cfg expr)))
     (let ((entry-machine
@@ -3719,7 +3999,9 @@
                    (procedure-params (car procedure+cfg))
                    (cdr procedure+cfg)))
                 procedures)))
-      (values uniquified
+      (values lowered-program
+              global-count
+              uniquified
               desugared
               closure-converted
               cfa-normalized
@@ -3730,13 +4012,28 @@
               procedure-machines))))
 
 (define (write-aarch64-program expr path)
-  (let-values (((uniquified desugared closure-converted cfa-normalized
-                             cfa-rewritten entry-cfg procedures
-                              entry-machine procedure-machines)
-                 (compile-to-backend expr)))
+  (let-values (((lowered-program global-count uniquified desugared closure-converted cfa-normalized
+                              cfa-rewritten entry-cfg procedures
+                               entry-machine procedure-machines)
+                  (compile-to-backend expr)))
     (call-with-output-file path
       (lambda (port)
-        (emit-aarch64-program port entry-machine procedure-machines)))))
+        (emit-aarch64-program port entry-machine procedure-machines global-count)))))
+
+(define (write-aarch64-program-forms forms path)
+  (write-aarch64-program (cons 'program forms) path))
+
+(define (read-program-forms path)
+  (call-with-input-file path
+    (lambda (port)
+      (let loop ((forms '()))
+        (let ((form (read port)))
+          (if (eof-object? form)
+              (reverse forms)
+              (loop (cons form forms))))))))
+
+(define (write-aarch64-program-file input-path output-path)
+  (write-aarch64-program-forms (read-program-forms input-path) output-path))
 
 (define (compile-program expr)
   ;; compile-program is intentionally pedagogical: it prints the major
@@ -3745,11 +4042,17 @@
   (display "=== Source Program ===\n")
   (write expr) (newline)
   
-  (display "\n=== After Uniquify ===\n")
-  (let-values (((uniquified desugared closure-converted cfa-normalized
-                            cfa-rewritten entry-cfg procedures
-                             entry-machine procedure-machines)
-                (compile-to-backend expr)))
+  (display "\n=== After Program Lowering ===\n")
+  (let-values (((lowered-program global-count uniquified desugared closure-converted cfa-normalized
+                              cfa-rewritten entry-cfg procedures
+                               entry-machine procedure-machines)
+                 (compile-to-backend expr)))
+    (write lowered-program) (newline)
+    (display "Global slots: ")
+    (write global-count)
+    (newline)
+    
+    (display "\n=== After Uniquify ===\n")
     (write uniquified) (newline)
     
     (display "\n=== After letrec Desugaring ===\n")
@@ -3780,6 +4083,9 @@
                 procedures))
     
     (display "\n=== Compilation Complete ===\n")))
+
+(define (compile-program-forms forms)
+  (compile-program (cons 'program forms)))
 
 ;;; Test fixtures and demo helpers live in separate test-owned files so loading
 ;;; the compiler does not implicitly run or define the regression suite.

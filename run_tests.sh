@@ -56,6 +56,30 @@ assert_output() {
   printf 'ok %s\n' "$test_name"
 }
 
+assert_file_output() {
+  local case_name="$1"
+  local expected="$2"
+  local source_text="$3"
+  local heap_bytes="${4:-}"
+  local source_path asm_path exe_path
+  source_path="$TMPDIR/$case_name.scm"
+  asm_path="$(asm_path_for "$case_name")"
+  exe_path="$(exe_path_for "$case_name")"
+  printf '%s\n' "$source_text" >"$source_path"
+  guile --r7rs -c \
+    "(load \"$ROOT/compiler.scm\") (write-aarch64-program-file \"$source_path\" \"$asm_path\")"
+  clang -arch arm64 -o "$exe_path" \
+    "$asm_path" \
+    "$ROOT/runtime.c" \
+    "$ROOT/codegen_harness.c"
+  if [[ -n "$heap_bytes" ]]; then
+    HOP_HEAP_BYTES="$heap_bytes" "$exe_path" "$expected" >/dev/null
+  else
+    "$exe_path" "$expected" >/dev/null
+  fi
+  printf 'ok %s\n' "$case_name"
+}
+
 assert_asm_contains() {
   local test_name="$1"
   local pattern="$2"
@@ -116,6 +140,11 @@ runtime_cases=(
   "test34|6"
   "test35|1830|2048"
   "test36|1275|2048"
+  "test37|8"
+  "test38|#t"
+  "test39|3"
+  "test40|16"
+  "test41|1830|2048"
 )
 
 for case in "${runtime_cases[@]}"; do
@@ -132,5 +161,10 @@ assert_asm_contains "test28" 'b(l)? _cfa\.proc\.[0-9]+' 'nested direct closure c
 assert_asm_not_contains "test28" '_hop_(tail_)?call_[0-9]+' 'generic call helper'
 
 assert_asm_contains "test33" '_hop_(tail_)?call_[0-9]+' 'polymorphic captured closure helper'
+
+assert_file_output \
+  "file-test1" \
+  "42" \
+  $'(define base 40)\n(begin (define bump (lambda (x) (primop + base x))))\n(app bump 2)'
 
 echo "compiler tests passed"

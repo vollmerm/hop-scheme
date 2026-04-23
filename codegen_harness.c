@@ -14,6 +14,8 @@ static void hop_format_value(char *buffer, size_t size, hop_value value) {
         snprintf(buffer, size, "#f");
     } else if (value == HOP_NULL) {
         snprintf(buffer, size, "()");
+    } else if (value == HOP_UNINITIALIZED) {
+        snprintf(buffer, size, "#<uninitialized>");
     } else if (hop_has_tag(value, HOP_PAIR_TAG)) {
         snprintf(buffer, size, "#<pair>");
     } else if (hop_has_tag(value, HOP_BOX_TAG)) {

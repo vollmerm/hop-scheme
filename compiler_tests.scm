@@ -290,6 +290,64 @@
      (let ((f (app make 50)))
        (app f 0))))
 
+(define test37
+  '(program
+     (define x 5)
+     (define y (primop + x 2))
+     (primop + y 1)))
+
+(define test38
+  '(program
+     (define even?
+       (lambda (n)
+         (if (primop = n 0)
+             #t
+             (app odd? (primop - n 1)))))
+     (define odd?
+       (lambda (n)
+         (if (primop = n 0)
+             #f
+             (app even? (primop - n 1)))))
+     (app even? 4)))
+
+(define test39
+  '(program
+     (begin
+       (define x 1)
+       (define y 2))
+     (primop + x y)))
+
+(define test40
+  '(program
+     (define offset 10)
+     (define mk
+       (lambda (x)
+         (lambda (y)
+           (primop + offset (primop + x y)))))
+     (define f (app mk 5))
+     (app f 1)))
+
+(define test41
+  '(program
+     (define xs
+       (letrec ((build
+                 (lambda (n acc)
+                   (if (primop = n 0)
+                       acc
+                       (let ((junk (box n)))
+                         (app build
+                              (primop - n 1)
+                              (cons n acc)))))))
+         (app build 60 ())))
+     (letrec ((sum
+               (lambda (ys acc)
+                 (if (null? ys)
+                     acc
+                     (app sum
+                          (cdr ys)
+                          (primop + acc (car ys)))))))
+       (app sum xs 0))))
+
 (define sample-tests
   (list (cons "Test 1: Simple arithmetic" test1)
         (cons "Test 2: Lambda application" test2)
@@ -323,9 +381,14 @@
         (cons "Test 31: Nested pair traversal" test31)
         (cons "Test 32: False selects else branch" test32)
         (cons "Test 33: Captured polymorphic closure fallback" test33)
-        (cons "Test 34: Self-tail letrec returns captured closure" test34)
-        (cons "Test 35: Pair GC stress with transient boxes" test35)
-        (cons "Test 36: Closure GC stress with nested captures" test36)))
+         (cons "Test 34: Self-tail letrec returns captured closure" test34)
+         (cons "Test 35: Pair GC stress with transient boxes" test35)
+         (cons "Test 36: Closure GC stress with nested captures" test36)
+         (cons "Test 37: Top-level define feeds later forms" test37)
+         (cons "Test 38: Top-level globals support forward references" test38)
+         (cons "Test 39: Top-level begin flattens into file scope" test39)
+         (cons "Test 40: Nested lambdas read globals" test40)
+         (cons "Test 41: Global roots survive GC" test41)))
 
 (define named-tests
   ;; These are runnable end-to-end regression cases. test6 and test7 stay as
@@ -359,10 +422,15 @@
         (cons 'test30 test30)
         (cons 'test31 test31)
         (cons 'test32 test32)
-        (cons 'test33 test33)
-        (cons 'test34 test34)
-        (cons 'test35 test35)
-        (cons 'test36 test36)))
+         (cons 'test33 test33)
+         (cons 'test34 test34)
+         (cons 'test35 test35)
+         (cons 'test36 test36)
+         (cons 'test37 test37)
+         (cons 'test38 test38)
+         (cons 'test39 test39)
+         (cons 'test40 test40)
+         (cons 'test41 test41)))
 
 (define (lookup-named-test name)
   (let ((binding (assoc name named-tests)))

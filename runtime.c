@@ -48,6 +48,8 @@ typedef struct {
 
 static hop_heap hop_runtime_heap = {0};
 void *hop_gc_top_frame = NULL;
+extern uint64_t hop_global_slot_count;
+extern hop_value hop_global_slots[];
 
 __attribute__((noreturn)) static void hop_panic(const char *message) {
     fprintf(stderr, "%s\n", message);
@@ -220,6 +222,14 @@ static void hop_copy_temp_roots(hop_value *roots, size_t count) {
     }
 }
 
+static void hop_copy_global_roots(void) {
+    uint64_t index;
+
+    for (index = 0; index < hop_global_slot_count; index += 1) {
+        hop_global_slots[index] = hop_copy_value(hop_global_slots[index]);
+    }
+}
+
 static void hop_scan_copied_objects(void) {
     uint8_t *scan = hop_runtime_heap.to_space;
 
@@ -265,6 +275,7 @@ static void hop_collect(hop_value *temp_roots, size_t temp_root_count) {
     hop_gc_copy_alloc = hop_runtime_heap.to_space;
     hop_gc_copy_limit = hop_runtime_heap.to_space + hop_runtime_heap.semispace_bytes;
 
+    hop_copy_global_roots();
     hop_copy_stack_roots();
     hop_copy_temp_roots(temp_roots, temp_root_count);
     hop_scan_copied_objects();
@@ -510,4 +521,22 @@ hop_value hop_tail_call_3(hop_value arg0,
                           hop_value arg2,
                           hop_value closure_value) {
     return hop_call_3(arg0, arg1, arg2, closure_value);
+}
+
+hop_value hop_global_ref(uint64_t index) {
+    if (index >= hop_global_slot_count) {
+        hop_panic("global index out of range");
+    }
+    if (hop_global_slots[index] == HOP_UNINITIALIZED) {
+        hop_panic("read of uninitialized global");
+    }
+    return hop_global_slots[index];
+}
+
+hop_value hop_global_set(uint64_t index, hop_value value) {
+    if (index >= hop_global_slot_count) {
+        hop_panic("global index out of range");
+    }
+    hop_global_slots[index] = value;
+    return value;
 }

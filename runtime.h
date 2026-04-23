@@ -46,6 +46,7 @@ typedef struct {
 #define HOP_NULL 20
 #define HOP_FALSE 36
 #define HOP_TRUE 52
+#define HOP_UNINITIALIZED 68
 
 static inline hop_value hop_encode_fixnum(int64_t value) {
     return (hop_value)(value << HOP_FIXNUM_SHIFT);
@@ -72,6 +73,8 @@ static inline void *hop_untag_pointer(hop_value value) {
 }
 
 extern void *hop_gc_top_frame;
+extern uint64_t hop_global_slot_count;
+extern hop_value hop_global_slots[];
 
 hop_value hop_alloc_box(hop_value value);
 hop_value hop_alloc_pair(hop_value car, hop_value cdr);
@@ -89,5 +92,7 @@ hop_value hop_tail_call_0(hop_value closure_value);
 hop_value hop_tail_call_1(hop_value arg0, hop_value closure_value);
 hop_value hop_tail_call_2(hop_value arg0, hop_value arg1, hop_value closure_value);
 hop_value hop_tail_call_3(hop_value arg0, hop_value arg1, hop_value arg2, hop_value closure_value);
+hop_value hop_global_ref(uint64_t index);
+hop_value hop_global_set(uint64_t index, hop_value value);
 
 #endif
