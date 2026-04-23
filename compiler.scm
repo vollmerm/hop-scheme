@@ -2883,6 +2883,16 @@
     ((store-box store-global branch-if jump ret tail-call tail-call-known) '())
     (else (error "Unknown machine instruction in def analysis" instr))))
 
+(define (machine-instr-bias-source instr)
+  ;; A plain copy is the easiest place to recover a redundant move: if the
+  ;; destination can reuse the source register, the emitted move disappears.
+  (case (car instr)
+    ((move)
+     (if (symbol? (caddr instr))
+         (caddr instr)
+         #f))
+    (else #f)))
+
 (define (machine-block-use block)
   (let loop ((instrs (machine-block-instructions block))
              (defs '())
@@ -2939,6 +2949,33 @@
         (if changed
             (loop)
             (values in-vec out-vec))))))
+
+(define (compute-instruction-live-before blocks out-vec)
+  ;; The block-level in/out sets tell us which variables are live at block
+  ;; boundaries. Walk each block backwards to refine that into a per-instruction
+  ;; live-before set. We use those fine-grained sets to decide exactly which
+  ;; register-held values must be materialized into stack-visible root slots
+  ;; before a GC safepoint.
+  (let block-loop ((remaining blocks) (index 0) (result '()))
+    (if (null? remaining)
+        (reverse result)
+        (let ((instrs (machine-block-instructions (car remaining))))
+          (let instr-loop ((rest (reverse instrs))
+                           (live-after (vector-ref out-vec index))
+                           (live-befores '()))
+            (if (null? rest)
+                (block-loop (cdr remaining)
+                            (+ index 1)
+                            (cons live-befores result))
+                (let* ((instr (car rest))
+                       (defs (machine-instr-defs instr))
+                       (uses (machine-instr-uses instr))
+                       (live-before
+                        (set-union uses
+                                   (set-difference live-after defs))))
+                  (instr-loop (cdr rest)
+                              live-before
+                              (cons live-before live-befores)))))))))
 
 (define (interval-start interval) (cadr interval))
 (define (interval-end interval) (caddr interval))
@@ -3030,6 +3067,23 @@
         (loop (cdr rest)
               (insert-by-start (car rest) result)))))
 
+(define (collect-move-biases blocks)
+  (let block-loop ((remaining blocks) (biases '()))
+    (if (null? remaining)
+        biases
+        (let instr-loop ((instrs (machine-block-instructions (car remaining)))
+                         (current biases))
+          (if (null? instrs)
+              (block-loop (cdr remaining) current)
+              (let* ((instr (car instrs))
+                     (defs (machine-instr-defs instr))
+                     (bias-source (machine-instr-bias-source instr)))
+                (instr-loop
+                 (cdr instrs)
+                 (if (and bias-source (pair? defs))
+                     (cons (cons (car defs) bias-source) current)
+                     current))))))))
+
 (define (insert-active interval active)
   (if (null? active)
       (list interval)
@@ -3053,57 +3107,94 @@
           (cons (car registers)
                 (insert-register register (cdr registers))))))
 
-(define (linear-scan-allocate intervals)
+(define (remove-register register registers)
+  (cond
+    ((null? registers) '())
+    ((eq? (car registers) register) (cdr registers))
+    (else
+     (cons (car registers)
+           (remove-register register (cdr registers))))))
+
+(define (lookup-bias biases var)
+  (let ((binding (assoc var biases)))
+    (if binding
+        (cdr binding)
+        #f)))
+
+(define (preferred-register-for var homes biases)
+  (let ((preferred-var (lookup-bias biases var)))
+    (if preferred-var
+        (let ((preferred-home (lookup-home homes preferred-var)))
+          (if (and (pair? preferred-home) (eq? (car preferred-home) 'register))
+              (cadr preferred-home)
+              #f))
+        #f)))
+
+(define (linear-scan-allocate intervals biases)
   (let loop ((remaining (sort-intervals-by-start intervals))
              (active '())
              (free-registers aarch64-callee-saved)
              (homes '())
              (next-slot 0))
     (if (null? remaining)
-        (values homes next-slot)
-        (let* ((current (car remaining))
-               (start (interval-start current)))
-           (let expire ((rest active)
-                        (still-active '())
-                        (available free-registers))
-             (if (null? rest)
-                 (if (null? available)
+         (values homes next-slot)
+         (let* ((current (car remaining))
+                (current-var (car current))
+                (start (interval-start current))
+                (preferred-var (lookup-bias biases current-var))
+                (preferred-register
+                 (preferred-register-for current-var homes biases)))
+            (let expire ((rest active)
+                         (still-active '())
+                         (available free-registers))
+              (if (null? rest)
+                  (if (null? available)
                      ;; This minimal allocator spills instead of splitting
                      ;; intervals: if no register is free, the value gets a
                      ;; stack slot for its whole live range.
-                     (loop (cdr remaining)
-                           still-active
-                           available
-                          (cons (cons (car current) `(stack-slot ,next-slot)) homes)
-                          (+ next-slot 1))
-                    (let* ((register (car available))
-                           (new-active
-                            (insert-active
-                             (list (car current)
-                                   (interval-start current)
-                                   (interval-end current)
-                                   register)
-                             still-active)))
                       (loop (cdr remaining)
-                            new-active
-                            (cdr available)
-                            (cons (cons (car current) `(register ,register)) homes)
-                            next-slot)))
-                (let* ((entry (car rest))
-                       (end (caddr entry))
-                       (register (cadddr entry)))
-                  (if (< end start)
-                      (expire (cdr rest)
-                              still-active
-                              (insert-register register available))
+                            still-active
+                            available
+                           (cons (cons (car current) `(stack-slot ,next-slot)) homes)
+                           (+ next-slot 1))
+                     (let* ((register
+                             (if (and preferred-register
+                                      (memq preferred-register available))
+                                 preferred-register
+                                 (car available)))
+                            (remaining-registers
+                             (remove-register register available))
+                            (new-active
+                             (insert-active
+                              (list (car current)
+                                    (interval-start current)
+                                    (interval-end current)
+                                    register)
+                              still-active)))
+                       (loop (cdr remaining)
+                             new-active
+                             remaining-registers
+                             (cons (cons (car current) `(register ,register)) homes)
+                             next-slot)))
+                 (let* ((entry (car rest))
+                        (entry-var (car entry))
+                        (end (caddr entry))
+                        (register (cadddr entry)))
+                   (if (or (< end start)
+                           (and preferred-var
+                                (eq? entry-var preferred-var)
+                                (= end start)))
                        (expire (cdr rest)
-                               (insert-active entry still-active)
+                               still-active
+                               (insert-register register available))
+                        (expire (cdr rest)
+                                (insert-active entry still-active)
                                available)))))))))
 
 (define (allocate-root-homes homes next-slot)
   ;; Register-homed values still need a stack-visible root slot because GC only
-  ;; walks frame slots. Keep a dedicated shadow slot per register home and keep
-  ;; it synchronized after each definition.
+  ;; walks frame slots. Each register home gets a dedicated shadow slot; we fill
+  ;; those slots lazily at safepoints rather than after every definition.
   (let loop ((rest homes) (slot next-slot) (result '()))
     (if (null? rest)
         (values result slot)
@@ -3209,80 +3300,104 @@
     (else
       (error "Unknown machine instruction during allocation" instr))))
 
-(define (instruction-root-syncs instr homes root-homes)
+(define (safepoint-machine-instruction? instr)
+  (memq (car instr) '(alloc-box alloc-pair alloc-closure call call-known)))
+
+(define (live-root-syncs live-before homes root-homes)
   (append-map
    (lambda (var)
-     (let ((root-home (lookup-root-home root-homes var))
-           (home (lookup-home homes var)))
-       (if root-home
-           (list `(move ,root-home ,home))
-           '())))
-   (machine-instr-defs instr)))
+      (let ((root-home (lookup-root-home root-homes var))
+            (home (lookup-home homes var)))
+        (if root-home
+            (list `(move ,root-home ,home))
+            '())))
+   live-before))
 
-(define (rewrite-machine-instruction-with-root-sync instr homes root-homes)
+(define (instruction->list instr)
+  (if (and (pair? instr)
+           (eq? (car instr) 'move)
+           (equal? (cadr instr) (caddr instr)))
+      '()
+      (list instr)))
+
+(define (rewrite-machine-instruction-with-safepoint-sync
+          instr
+          live-before
+          homes
+          root-homes)
   (append
-   (list (rewrite-machine-instruction instr homes))
-   (instruction-root-syncs instr homes root-homes)))
+   (if (safepoint-machine-instruction? instr)
+       (live-root-syncs live-before homes root-homes)
+       '())
+    (instruction->list (rewrite-machine-instruction instr homes))))
 
-(define (rewrite-machine-block-instructions instrs homes root-homes)
-  ;; Keep leading move-in instructions contiguous so entry-block label placement
-  ;; still treats parameter setup as prologue code. Their root-sync moves are
-  ;; emitted immediately after the whole move-in prefix instead of interleaving
-  ;; them between parameter loads.
-  (let loop ((rest instrs) (prefix '()) (prefix-syncs '()))
-    (if (and (pair? rest) (eq? (caar rest) 'move-in))
-        (loop (cdr rest)
-              (append prefix
-                      (list (rewrite-machine-instruction (car rest) homes)))
-              (append prefix-syncs
-                      (instruction-root-syncs (car rest) homes root-homes)))
-        (append prefix
-                prefix-syncs
-                (append-map
-                 (lambda (instr)
-                   (rewrite-machine-instruction-with-root-sync
-                    instr
-                    homes
-                    root-homes))
-                 rest)))))
+(define (rewrite-machine-block-instructions instrs live-befores homes root-homes)
+  (if (null? instrs)
+      '()
+      (append
+       (rewrite-machine-instruction-with-safepoint-sync
+        (car instrs)
+        (car live-befores)
+        homes
+        root-homes)
+       (rewrite-machine-block-instructions
+        (cdr instrs)
+        (cdr live-befores)
+        homes
+        root-homes))))
 
 (define (allocate-machine-procedure proc)
   (let ((blocks (machine-procedure-blocks proc)))
     (let-values (((in-vec out-vec) (compute-liveness blocks)))
-      (let-values (((homes next-slot)
-                    (linear-scan-allocate
-                      (collect-intervals blocks in-vec out-vec))))
-        (let-values (((root-homes frame-slots)
-                      (allocate-root-homes homes next-slot)))
-          (let ((rewritten-blocks
-              (map (lambda (block)
-                     (make-machine-block
-                      (machine-block-label block)
-                       (rewrite-machine-block-instructions
-                        (machine-block-instructions block)
-                        homes
-                        root-homes)
-                        (machine-block-successors block)))
-                    blocks))
-                (used-registers
-                (dedupe-symbols
-                 (let loop ((rest homes) (result '()))
-                   (if (null? rest)
-                       result
-                      (let ((home (cdar rest)))
-                        (loop (cdr rest)
-                              (if (and (pair? home) (eq? (car home) 'register))
-                                  (cons (cadr home) result)
-                                  result))))))))
-          (make-machine-procedure
-           (machine-procedure-name proc)
-            (machine-procedure-params proc)
-            (machine-procedure-param-locations proc)
-            rewritten-blocks
-            homes
-            root-homes
-            frame-slots
-            used-registers)))))))
+      (let* ((instruction-live-before
+              (compute-instruction-live-before blocks out-vec))
+             (biases (collect-move-biases blocks)))
+        (let-values (((homes next-slot)
+                      (linear-scan-allocate
+                       (collect-intervals blocks in-vec out-vec)
+                       biases)))
+          (let-values (((root-homes frame-slots)
+                        (allocate-root-homes homes next-slot)))
+            (let* ((rewritten-blocks
+                    (let loop ((remaining-blocks blocks)
+                               (remaining-live-before instruction-live-before)
+                               (result '()))
+                      (if (null? remaining-blocks)
+                          (reverse result)
+                          (let ((block (car remaining-blocks))
+                                (live-befores (car remaining-live-before)))
+                            (loop
+                             (cdr remaining-blocks)
+                             (cdr remaining-live-before)
+                             (cons
+                              (make-machine-block
+                               (machine-block-label block)
+                               (rewrite-machine-block-instructions
+                                (machine-block-instructions block)
+                                live-befores
+                                homes
+                                root-homes)
+                               (machine-block-successors block))
+                              result))))))
+                   (used-registers
+                    (dedupe-symbols
+                     (let loop ((rest homes) (result '()))
+                       (if (null? rest)
+                           result
+                           (let ((home (cdar rest)))
+                             (loop (cdr rest)
+                                   (if (and (pair? home) (eq? (car home) 'register))
+                                       (cons (cadr home) result)
+                                       result))))))))
+              (make-machine-procedure
+               (machine-procedure-name proc)
+               (machine-procedure-params proc)
+               (machine-procedure-param-locations proc)
+               rewritten-blocks
+               homes
+               root-homes
+               frame-slots
+               used-registers))))))))
 
 (define (max-outgoing-stack-args blocks)
   (let block-loop ((remaining blocks) (best 0))
@@ -3620,8 +3735,11 @@
      (error "Unsupported destination operand in assembly emission" operand))))
 
 (define (emit-move port dst src proc)
-  (emit-load-operand port "x9" src proc)
-  (emit-store-operand port "x9" dst proc))
+  (if (equal? dst src)
+      'done
+      (begin
+        (emit-load-operand port "x9" src proc)
+        (emit-store-operand port "x9" dst proc))))
 
 (define (emit-procedure-address port reg proc-name)
   (emit-asm-line port

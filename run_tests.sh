@@ -147,6 +147,7 @@ runtime_cases=(
   "test41|1830|2048"
   "test42|7|2048"
   "test43|7|2048"
+  "test44|7|1024"
 )
 
 for case in "${runtime_cases[@]}"; do
@@ -164,6 +165,8 @@ assert_asm_not_contains "test28" '_hop_(tail_)?call_[0-9]+' 'generic call helper
 
 assert_asm_contains "test33" '_hop_(tail_)?call_[0-9]+' 'polymorphic captured closure helper'
 assert_asm_contains "test5" '\bx(19|20|21|22|23|24|25|26|27|28)\b' 'callee-saved register allocation'
+assert_asm_not_contains "test16" '\bx23\b' 'uncoalesced temporary register in recursive loop'
+assert_asm_not_contains "test5" 'str x9, \[sp, #(24|32|40)\]' 'eager root shadow writes without safepoints'
 
 assert_file_output \
   "file-test1" \
