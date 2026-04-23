@@ -148,6 +148,7 @@ runtime_cases=(
   "test42|7|2048"
   "test43|7|2048"
   "test44|7|1024"
+  "test45|36"
 )
 
 for case in "${runtime_cases[@]}"; do

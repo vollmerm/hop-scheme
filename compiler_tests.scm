@@ -376,13 +376,25 @@
 
 (define test44
   '(let ((keep (box 7)))
-     (letrec ((burn
-               (lambda (n)
-                 (if (primop = n 0)
-                     (unbox keep)
-                     (let ((junk (cons n ())))
-                       (app burn (primop - n 1)))))))
-       (app burn 80))))
+      (letrec ((burn
+                (lambda (n)
+                  (if (primop = n 0)
+                      (unbox keep)
+                      (let ((junk (cons n ())))
+                        (app burn (primop - n 1)))))))
+        (app burn 80))))
+
+(define test45
+  '(let ((sum8
+          (lambda (a b c d e f g h)
+            (primop + a
+                     (primop + b
+                              (primop + c
+                                       (primop + d
+                                                (primop + e
+                                                         (primop + f
+                                                                  (primop + g h))))))))))
+     (app sum8 1 2 3 4 5 6 7 8)))
 
 (define sample-tests
   (list (cons "Test 1: Simple arithmetic" test1)
@@ -417,17 +429,18 @@
         (cons "Test 31: Nested pair traversal" test31)
         (cons "Test 32: False selects else branch" test32)
         (cons "Test 33: Captured polymorphic closure fallback" test33)
-         (cons "Test 34: Self-tail letrec returns captured closure" test34)
-         (cons "Test 35: Pair GC stress with transient boxes" test35)
-         (cons "Test 36: Closure GC stress with nested captures" test36)
-         (cons "Test 37: Top-level define feeds later forms" test37)
-          (cons "Test 38: Top-level globals support forward references" test38)
-          (cons "Test 39: Top-level begin flattens into file scope" test39)
-          (cons "Test 40: Nested lambdas read globals" test40)
-          (cons "Test 41: Global roots survive GC" test41)
-         (cons "Test 42: Caller roots survive allocating direct calls" test42)
-         (cons "Test 43: Caller roots survive allocating closure calls" test43)
-         (cons "Test 44: Forced GC cycle with transient allocations" test44)))
+        (cons "Test 34: Self-tail letrec returns captured closure" test34)
+        (cons "Test 35: Pair GC stress with transient boxes" test35)
+        (cons "Test 36: Closure GC stress with nested captures" test36)
+        (cons "Test 37: Top-level define feeds later forms" test37)
+        (cons "Test 38: Top-level globals support forward references" test38)
+        (cons "Test 39: Top-level begin flattens into file scope" test39)
+        (cons "Test 40: Nested lambdas read globals" test40)
+        (cons "Test 41: Global roots survive GC" test41)
+        (cons "Test 42: Caller roots survive allocating direct calls" test42)
+        (cons "Test 43: Caller roots survive allocating closure calls" test43)
+        (cons "Test 44: Forced GC cycle with transient allocations" test44)
+        (cons "Test 45: Eight-parameter lambda application" test45)))
 
 (define named-tests
   ;; These are runnable end-to-end regression cases. test6 and test7 stay as
@@ -470,9 +483,10 @@
          (cons 'test39 test39)
          (cons 'test40 test40)
          (cons 'test41 test41)
-         (cons 'test42 test42)
-         (cons 'test43 test43)
-         (cons 'test44 test44)))
+          (cons 'test42 test42)
+          (cons 'test43 test43)
+          (cons 'test44 test44)
+          (cons 'test45 test45)))
 
 (define (lookup-named-test name)
   (let ((binding (assoc name named-tests)))
