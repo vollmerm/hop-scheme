@@ -416,22 +416,81 @@ hop_value hop_alloc_closure_3(void *code, hop_value env0, hop_value env1, hop_va
     return hop_tag_pointer(closure, HOP_CLOSURE_TAG);
 }
 
+#define HOP_MAX_CLOSURE_ENV 16
+static hop_value hop_temp_closure_roots[HOP_MAX_CLOSURE_ENV];
+
+hop_value hop_alloc_closure_n(void *code, int64_t count, hop_value *envs) {
+    hop_value *closure;
+    int64_t i;
+
+    if (count > HOP_MAX_CLOSURE_ENV) {
+        hop_panic("too many closure captures");
+    }
+    /*
+     * Copy the captures into a static root buffer before allocating.  If the
+     * allocator triggers a collection, the collector updates every live root
+     * slot in every compiled frame, and then also rewrites hop_temp_closure_roots
+     * via hop_copy_temp_roots.  The envs array (in the outgoing-arg area of the
+     * caller's frame) is NOT scanned, but we copied the values out before GC
+     * can run, so post-GC values come from the static buffer.
+     */
+    for (i = 0; i < count; i++) {
+        hop_temp_closure_roots[i] = envs[i];
+    }
+    closure = hop_alloc_words(2 + (size_t)count, hop_temp_closure_roots, (size_t)count);
+    closure[0] = (hop_value)hop_make_header(HOP_OBJ_CLOSURE, (hop_word)count);
+    closure[1] = (hop_value)(uintptr_t)code;
+    for (i = 0; i < count; i++) {
+        hop_closure_env(closure)[i] = hop_temp_closure_roots[i];
+    }
+    return hop_tag_pointer(closure, HOP_CLOSURE_TAG);
+}
+
 typedef hop_value (*hop_fun_0_0)(void);
 typedef hop_value (*hop_fun_0_1)(hop_value);
 typedef hop_value (*hop_fun_0_2)(hop_value, hop_value);
 typedef hop_value (*hop_fun_0_3)(hop_value, hop_value, hop_value);
+typedef hop_value (*hop_fun_0_4)(hop_value, hop_value, hop_value, hop_value);
+typedef hop_value (*hop_fun_0_5)(hop_value, hop_value, hop_value, hop_value, hop_value);
+typedef hop_value (*hop_fun_0_6)(hop_value, hop_value, hop_value, hop_value, hop_value, hop_value);
+typedef hop_value (*hop_fun_0_7)(hop_value, hop_value, hop_value, hop_value, hop_value, hop_value, hop_value);
+typedef hop_value (*hop_fun_0_8)(hop_value, hop_value, hop_value, hop_value, hop_value, hop_value, hop_value, hop_value);
 typedef hop_value (*hop_fun_1_0)(hop_value);
 typedef hop_value (*hop_fun_1_1)(hop_value, hop_value);
 typedef hop_value (*hop_fun_1_2)(hop_value, hop_value, hop_value);
 typedef hop_value (*hop_fun_1_3)(hop_value, hop_value, hop_value, hop_value);
+typedef hop_value (*hop_fun_1_4)(hop_value, hop_value, hop_value, hop_value, hop_value);
+typedef hop_value (*hop_fun_1_5)(hop_value, hop_value, hop_value, hop_value, hop_value, hop_value);
+typedef hop_value (*hop_fun_1_6)(hop_value, hop_value, hop_value, hop_value, hop_value, hop_value, hop_value);
+typedef hop_value (*hop_fun_1_7)(hop_value, hop_value, hop_value, hop_value, hop_value, hop_value, hop_value, hop_value);
 typedef hop_value (*hop_fun_2_0)(hop_value, hop_value);
 typedef hop_value (*hop_fun_2_1)(hop_value, hop_value, hop_value);
 typedef hop_value (*hop_fun_2_2)(hop_value, hop_value, hop_value, hop_value);
 typedef hop_value (*hop_fun_2_3)(hop_value, hop_value, hop_value, hop_value, hop_value);
+typedef hop_value (*hop_fun_2_4)(hop_value, hop_value, hop_value, hop_value, hop_value, hop_value);
+typedef hop_value (*hop_fun_2_5)(hop_value, hop_value, hop_value, hop_value, hop_value, hop_value, hop_value);
+typedef hop_value (*hop_fun_2_6)(hop_value, hop_value, hop_value, hop_value, hop_value, hop_value, hop_value, hop_value);
 typedef hop_value (*hop_fun_3_0)(hop_value, hop_value, hop_value);
 typedef hop_value (*hop_fun_3_1)(hop_value, hop_value, hop_value, hop_value);
 typedef hop_value (*hop_fun_3_2)(hop_value, hop_value, hop_value, hop_value, hop_value);
 typedef hop_value (*hop_fun_3_3)(hop_value, hop_value, hop_value, hop_value, hop_value, hop_value);
+typedef hop_value (*hop_fun_3_4)(hop_value, hop_value, hop_value, hop_value, hop_value, hop_value, hop_value);
+typedef hop_value (*hop_fun_3_5)(hop_value, hop_value, hop_value, hop_value, hop_value, hop_value, hop_value, hop_value);
+typedef hop_value (*hop_fun_4_0)(hop_value, hop_value, hop_value, hop_value);
+typedef hop_value (*hop_fun_4_1)(hop_value, hop_value, hop_value, hop_value, hop_value);
+typedef hop_value (*hop_fun_4_2)(hop_value, hop_value, hop_value, hop_value, hop_value, hop_value);
+typedef hop_value (*hop_fun_4_3)(hop_value, hop_value, hop_value, hop_value, hop_value, hop_value, hop_value);
+typedef hop_value (*hop_fun_4_4)(hop_value, hop_value, hop_value, hop_value, hop_value, hop_value, hop_value, hop_value);
+typedef hop_value (*hop_fun_5_0)(hop_value, hop_value, hop_value, hop_value, hop_value);
+typedef hop_value (*hop_fun_5_1)(hop_value, hop_value, hop_value, hop_value, hop_value, hop_value);
+typedef hop_value (*hop_fun_5_2)(hop_value, hop_value, hop_value, hop_value, hop_value, hop_value, hop_value);
+typedef hop_value (*hop_fun_5_3)(hop_value, hop_value, hop_value, hop_value, hop_value, hop_value, hop_value, hop_value);
+typedef hop_value (*hop_fun_6_0)(hop_value, hop_value, hop_value, hop_value, hop_value, hop_value);
+typedef hop_value (*hop_fun_6_1)(hop_value, hop_value, hop_value, hop_value, hop_value, hop_value, hop_value);
+typedef hop_value (*hop_fun_6_2)(hop_value, hop_value, hop_value, hop_value, hop_value, hop_value, hop_value, hop_value);
+typedef hop_value (*hop_fun_7_0)(hop_value, hop_value, hop_value, hop_value, hop_value, hop_value, hop_value);
+typedef hop_value (*hop_fun_7_1)(hop_value, hop_value, hop_value, hop_value, hop_value, hop_value, hop_value, hop_value);
+typedef hop_value (*hop_fun_8_0)(hop_value, hop_value, hop_value, hop_value, hop_value, hop_value, hop_value, hop_value);
 
 hop_value hop_call_0(hop_value closure_value) {
     hop_value *closure = hop_as_closure(closure_value);
@@ -445,6 +504,16 @@ hop_value hop_call_0(hop_value closure_value) {
         return ((hop_fun_2_0)hop_closure_code(closure))(env[0], env[1]);
     case 3:
         return ((hop_fun_3_0)hop_closure_code(closure))(env[0], env[1], env[2]);
+    case 4:
+        return ((hop_fun_4_0)hop_closure_code(closure))(env[0], env[1], env[2], env[3]);
+    case 5:
+        return ((hop_fun_5_0)hop_closure_code(closure))(env[0], env[1], env[2], env[3], env[4]);
+    case 6:
+        return ((hop_fun_6_0)hop_closure_code(closure))(env[0], env[1], env[2], env[3], env[4], env[5]);
+    case 7:
+        return ((hop_fun_7_0)hop_closure_code(closure))(env[0], env[1], env[2], env[3], env[4], env[5], env[6]);
+    case 8:
+        return ((hop_fun_8_0)hop_closure_code(closure))(env[0], env[1], env[2], env[3], env[4], env[5], env[6], env[7]);
     default:
         hop_panic("unsupported closure env count for hop_call_0");
     }
@@ -462,6 +531,14 @@ hop_value hop_call_1(hop_value arg0, hop_value closure_value) {
         return ((hop_fun_2_1)hop_closure_code(closure))(env[0], env[1], arg0);
     case 3:
         return ((hop_fun_3_1)hop_closure_code(closure))(env[0], env[1], env[2], arg0);
+    case 4:
+        return ((hop_fun_4_1)hop_closure_code(closure))(env[0], env[1], env[2], env[3], arg0);
+    case 5:
+        return ((hop_fun_5_1)hop_closure_code(closure))(env[0], env[1], env[2], env[3], env[4], arg0);
+    case 6:
+        return ((hop_fun_6_1)hop_closure_code(closure))(env[0], env[1], env[2], env[3], env[4], env[5], arg0);
+    case 7:
+        return ((hop_fun_7_1)hop_closure_code(closure))(env[0], env[1], env[2], env[3], env[4], env[5], env[6], arg0);
     default:
         hop_panic("unsupported closure env count for hop_call_1");
     }
@@ -479,6 +556,12 @@ hop_value hop_call_2(hop_value arg0, hop_value arg1, hop_value closure_value) {
         return ((hop_fun_2_2)hop_closure_code(closure))(env[0], env[1], arg0, arg1);
     case 3:
         return ((hop_fun_3_2)hop_closure_code(closure))(env[0], env[1], env[2], arg0, arg1);
+    case 4:
+        return ((hop_fun_4_2)hop_closure_code(closure))(env[0], env[1], env[2], env[3], arg0, arg1);
+    case 5:
+        return ((hop_fun_5_2)hop_closure_code(closure))(env[0], env[1], env[2], env[3], env[4], arg0, arg1);
+    case 6:
+        return ((hop_fun_6_2)hop_closure_code(closure))(env[0], env[1], env[2], env[3], env[4], env[5], arg0, arg1);
     default:
         hop_panic("unsupported closure env count for hop_call_2");
     }
@@ -499,8 +582,117 @@ hop_value hop_call_3(hop_value arg0,
         return ((hop_fun_2_3)hop_closure_code(closure))(env[0], env[1], arg0, arg1, arg2);
     case 3:
         return ((hop_fun_3_3)hop_closure_code(closure))(env[0], env[1], env[2], arg0, arg1, arg2);
+    case 4:
+        return ((hop_fun_4_3)hop_closure_code(closure))(env[0], env[1], env[2], env[3], arg0, arg1, arg2);
+    case 5:
+        return ((hop_fun_5_3)hop_closure_code(closure))(env[0], env[1], env[2], env[3], env[4], arg0, arg1, arg2);
     default:
         hop_panic("unsupported closure env count for hop_call_3");
+    }
+}
+
+hop_value hop_call_4(hop_value arg0,
+                     hop_value arg1,
+                     hop_value arg2,
+                     hop_value arg3,
+                     hop_value closure_value) {
+    hop_value *closure = hop_as_closure(closure_value);
+    hop_value *env = hop_closure_env(closure);
+    switch (hop_closure_env_count(closure)) {
+    case 0:
+        return ((hop_fun_0_4)hop_closure_code(closure))(arg0, arg1, arg2, arg3);
+    case 1:
+        return ((hop_fun_1_4)hop_closure_code(closure))(env[0], arg0, arg1, arg2, arg3);
+    case 2:
+        return ((hop_fun_2_4)hop_closure_code(closure))(env[0], env[1], arg0, arg1, arg2, arg3);
+    case 3:
+        return ((hop_fun_3_4)hop_closure_code(closure))(env[0], env[1], env[2], arg0, arg1, arg2, arg3);
+    case 4:
+        return ((hop_fun_4_4)hop_closure_code(closure))(env[0], env[1], env[2], env[3], arg0, arg1, arg2, arg3);
+    default:
+        hop_panic("unsupported closure env count for hop_call_4");
+    }
+}
+
+hop_value hop_call_5(hop_value arg0,
+                     hop_value arg1,
+                     hop_value arg2,
+                     hop_value arg3,
+                     hop_value arg4,
+                     hop_value closure_value) {
+    hop_value *closure = hop_as_closure(closure_value);
+    hop_value *env = hop_closure_env(closure);
+    switch (hop_closure_env_count(closure)) {
+    case 0:
+        return ((hop_fun_0_5)hop_closure_code(closure))(arg0, arg1, arg2, arg3, arg4);
+    case 1:
+        return ((hop_fun_1_5)hop_closure_code(closure))(env[0], arg0, arg1, arg2, arg3, arg4);
+    case 2:
+        return ((hop_fun_2_5)hop_closure_code(closure))(env[0], env[1], arg0, arg1, arg2, arg3, arg4);
+    case 3:
+        return ((hop_fun_3_5)hop_closure_code(closure))(env[0], env[1], env[2], arg0, arg1, arg2, arg3, arg4);
+    default:
+        hop_panic("unsupported closure env count for hop_call_5");
+    }
+}
+
+hop_value hop_call_6(hop_value arg0,
+                     hop_value arg1,
+                     hop_value arg2,
+                     hop_value arg3,
+                     hop_value arg4,
+                     hop_value arg5,
+                     hop_value closure_value) {
+    hop_value *closure = hop_as_closure(closure_value);
+    hop_value *env = hop_closure_env(closure);
+    switch (hop_closure_env_count(closure)) {
+    case 0:
+        return ((hop_fun_0_6)hop_closure_code(closure))(arg0, arg1, arg2, arg3, arg4, arg5);
+    case 1:
+        return ((hop_fun_1_6)hop_closure_code(closure))(env[0], arg0, arg1, arg2, arg3, arg4, arg5);
+    case 2:
+        return ((hop_fun_2_6)hop_closure_code(closure))(env[0], env[1], arg0, arg1, arg2, arg3, arg4, arg5);
+    default:
+        hop_panic("unsupported closure env count for hop_call_6");
+    }
+}
+
+hop_value hop_call_7(hop_value arg0,
+                     hop_value arg1,
+                     hop_value arg2,
+                     hop_value arg3,
+                     hop_value arg4,
+                     hop_value arg5,
+                     hop_value arg6,
+                     hop_value closure_value) {
+    hop_value *closure = hop_as_closure(closure_value);
+    hop_value *env = hop_closure_env(closure);
+    switch (hop_closure_env_count(closure)) {
+    case 0:
+        return ((hop_fun_0_7)hop_closure_code(closure))(arg0, arg1, arg2, arg3, arg4, arg5, arg6);
+    case 1:
+        return ((hop_fun_1_7)hop_closure_code(closure))(env[0], arg0, arg1, arg2, arg3, arg4, arg5, arg6);
+    default:
+        hop_panic("unsupported closure env count for hop_call_7");
+    }
+}
+
+hop_value hop_call_8(hop_value arg0,
+                     hop_value arg1,
+                     hop_value arg2,
+                     hop_value arg3,
+                     hop_value arg4,
+                     hop_value arg5,
+                     hop_value arg6,
+                     hop_value arg7,
+                     hop_value closure_value) {
+    hop_value *closure = hop_as_closure(closure_value);
+    hop_value *env = hop_closure_env(closure);
+    switch (hop_closure_env_count(closure)) {
+    case 0:
+        return ((hop_fun_0_8)hop_closure_code(closure))(arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7);
+    default:
+        hop_panic("unsupported closure env count for hop_call_8");
     }
 }
 
@@ -521,6 +713,56 @@ hop_value hop_tail_call_3(hop_value arg0,
                           hop_value arg2,
                           hop_value closure_value) {
     return hop_call_3(arg0, arg1, arg2, closure_value);
+}
+
+hop_value hop_tail_call_4(hop_value arg0,
+                          hop_value arg1,
+                          hop_value arg2,
+                          hop_value arg3,
+                          hop_value closure_value) {
+    return hop_call_4(arg0, arg1, arg2, arg3, closure_value);
+}
+
+hop_value hop_tail_call_5(hop_value arg0,
+                          hop_value arg1,
+                          hop_value arg2,
+                          hop_value arg3,
+                          hop_value arg4,
+                          hop_value closure_value) {
+    return hop_call_5(arg0, arg1, arg2, arg3, arg4, closure_value);
+}
+
+hop_value hop_tail_call_6(hop_value arg0,
+                          hop_value arg1,
+                          hop_value arg2,
+                          hop_value arg3,
+                          hop_value arg4,
+                          hop_value arg5,
+                          hop_value closure_value) {
+    return hop_call_6(arg0, arg1, arg2, arg3, arg4, arg5, closure_value);
+}
+
+hop_value hop_tail_call_7(hop_value arg0,
+                          hop_value arg1,
+                          hop_value arg2,
+                          hop_value arg3,
+                          hop_value arg4,
+                          hop_value arg5,
+                          hop_value arg6,
+                          hop_value closure_value) {
+    return hop_call_7(arg0, arg1, arg2, arg3, arg4, arg5, arg6, closure_value);
+}
+
+hop_value hop_tail_call_8(hop_value arg0,
+                          hop_value arg1,
+                          hop_value arg2,
+                          hop_value arg3,
+                          hop_value arg4,
+                          hop_value arg5,
+                          hop_value arg6,
+                          hop_value arg7,
+                          hop_value closure_value) {
+    return hop_call_8(arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7, closure_value);
 }
 
 hop_value hop_global_ref(uint64_t index) {

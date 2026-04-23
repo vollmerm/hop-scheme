@@ -3313,6 +3313,23 @@
             '())))
    live-before))
 
+(define (live-root-reloads live-after def-var homes root-homes)
+  ;; After a safepoint, reload every live register-homed variable from its
+  ;; root slot so that GC-updated pointers are visible to subsequent code.
+  ;; We skip def-var because the safepoint instruction just wrote a fresh
+  ;; new-space value into its register home; reloading from the root slot
+  ;; (which was not updated by the pre-safepoint sync) would clobber it.
+  (append-map
+   (lambda (var)
+     (if (eq? var def-var)
+         '()
+         (let ((root-home (lookup-root-home root-homes var))
+               (home (lookup-home homes var)))
+           (if (and root-home (register-operand? home))
+               (list `(move ,home ,root-home))
+               '()))))
+   live-after))
+
 (define (instruction->list instr)
   (if (and (pair? instr)
            (eq? (car instr) 'move)
@@ -3323,28 +3340,34 @@
 (define (rewrite-machine-instruction-with-safepoint-sync
           instr
           live-before
+          live-after
           homes
           root-homes)
   (append
    (if (safepoint-machine-instruction? instr)
        (live-root-syncs live-before homes root-homes)
        '())
-    (instruction->list (rewrite-machine-instruction instr homes))))
+    (instruction->list (rewrite-machine-instruction instr homes))
+    (if (safepoint-machine-instruction? instr)
+        (live-root-reloads live-after (cadr instr) homes root-homes)
+        '())))
 
 (define (rewrite-machine-block-instructions instrs live-befores homes root-homes)
   (if (null? instrs)
       '()
-      (append
-       (rewrite-machine-instruction-with-safepoint-sync
-        (car instrs)
-        (car live-befores)
-        homes
-        root-homes)
-       (rewrite-machine-block-instructions
-        (cdr instrs)
-        (cdr live-befores)
-        homes
-        root-homes))))
+      (let ((live-after (if (null? (cdr live-befores)) '() (cadr live-befores))))
+        (append
+         (rewrite-machine-instruction-with-safepoint-sync
+          (car instrs)
+          (car live-befores)
+          live-after
+          homes
+          root-homes)
+         (rewrite-machine-block-instructions
+          (cdr instrs)
+          (cdr live-befores)
+          homes
+          root-homes)))))
 
 (define (allocate-machine-procedure proc)
   (let ((blocks (machine-procedure-blocks proc)))
@@ -3630,19 +3653,29 @@
 (define (procedure-saved-bytes proc)
   (* 8 (length (machine-procedure-used-registers proc))))
 
+(define (procedure-outgoing-bytes proc)
+  (* 8 (max-outgoing-stack-args (machine-procedure-blocks proc))))
+
+;;; Outgoing stack args occupy the lowest part of the frame (sp+0 upward) so
+;;; that at the moment of a call instruction sp already points at arg[0], which
+;;; is what the AArch64 PCS requires for stack-passed arguments.
 (define (procedure-outgoing-base proc)
-  (+ (procedure-saved-bytes proc)
-     (* 8 (machine-procedure-frame-slots proc))))
+  0)
 
 (define (incoming-stack-arg-offset index)
   (+ 16 (* 8 index)))
 
+;;; Root slots sit above the outgoing-arg area and the callee-saved-register
+;;; save area.  Offsets are relative to sp (= x29 - stack_size).
 (define (stack-slot-offset proc index)
-  (+ (procedure-saved-bytes proc)
+  (+ (procedure-outgoing-bytes proc)
+     (procedure-saved-bytes proc)
      (* 8 index)))
 
 (define (saved-register-offset proc reg)
-  (let loop ((rest (machine-procedure-used-registers proc)) (offset 0))
+  ;; Callee-saved registers are stored just above the outgoing-arg area.
+  (let loop ((rest (machine-procedure-used-registers proc))
+             (offset (procedure-outgoing-bytes proc)))
     (cond
       ((null? rest) (error "Unknown saved register" reg))
       ((eq? (car rest) reg) offset)
@@ -3848,26 +3881,42 @@
 
 (define (emit-alloc-closure port dst proc-name captures proc)
   (let ((count (length captures)))
-    (when (> count 3)
-      (error "Too many closure captures for minimal runtime" count))
-    (emit-procedure-address port "x0" proc-name)
-    (let loop ((rest captures) (index 1))
-      (if (null? rest)
-          'done
-          (begin
-            (emit-load-operand port
-                               (string-append "x" (number->string index))
-                               (car rest)
-                               proc)
-            (loop (cdr rest) (+ index 1)))))
-    (emit-asm-line port
-                   (string-append "    bl _hop_alloc_closure_"
-                                  (number->string count)))
+    (if (<= count 3)
+        ;; Fast path: pass up to 3 captures directly in x1..x3.
+        (begin
+          (emit-procedure-address port "x0" proc-name)
+          (let loop ((rest captures) (index 1))
+            (if (null? rest)
+                'done
+                (begin
+                  (emit-load-operand port
+                                     (string-append "x" (number->string index))
+                                     (car rest)
+                                     proc)
+                  (loop (cdr rest) (+ index 1)))))
+          (emit-asm-line port
+                         (string-append "    bl _hop_alloc_closure_"
+                                        (number->string count))))
+        ;; General path: store all captures to the outgoing-arg area at [sp,#8*i],
+        ;; then call hop_alloc_closure_n(code, count, envs_ptr).
+        (begin
+          (let loop ((rest captures) (index 0))
+            (unless (null? rest)
+              (emit-load-operand port "x9" (car rest) proc)
+              (emit-asm-line port
+                             (string-append "    str x9, [sp, #"
+                                            (number->string (* 8 index))
+                                            "]"))
+              (loop (cdr rest) (+ index 1))))
+          (emit-procedure-address port "x0" proc-name)
+          (emit-asm-line port
+                         (string-append "    mov x1, #"
+                                        (number->string count)))
+          (emit-asm-line port "    mov x2, sp")
+          (emit-asm-line port "    bl _hop_alloc_closure_n")))
     (emit-store-operand port "x0" dst proc)))
 
 (define (emit-call-helper port argc tail?)
-  (when (> argc 3)
-    (error "Too many call arguments for minimal runtime" argc))
   (emit-asm-line port
                  (string-append "    "
                                 (if tail? "b" "bl")
@@ -4075,12 +4124,18 @@
 
 (define (emit-procedure-descriptor port proc)
   ;; A descriptor is the runtime's compact summary of a frame layout.
-  ;; For this first collector we only need:
+  ;; For this collector we only need:
   ;;   - how many frame slots may hold Scheme values
   ;;   - how many bytes to step from x29 down to slot 0
-  ;; That is enough for a precise stack walk because the current backend keeps
-  ;; GC-visible values in those slots at allocation safepoints, even when the
-  ;; fast path between safepoints uses callee-saved registers.
+  ;; The second field is NOT the total stack_size; it is the offset from x29
+  ;; to the first root slot.  With the current frame layout:
+  ;;   [sp]  outgoing-arg area
+  ;;   [sp + outgoing_bytes]  callee-saved registers
+  ;;   [sp + outgoing_bytes + saved_bytes + alignment_padding]  root slots  ← slot 0
+  ;;   [x29 - gc_header_bytes]  GC header
+  ;;   [x29]  saved x29/x30
+  ;; x29 - slot_0_address = stack_size(aligned) - outgoing_bytes - saved_bytes.
+  ;; This correctly accounts for any alignment padding inserted by stack-align.
   (emit-asm-line port (string-append ".p2align 3"))
   (emit-asm-line port (string-append (gc-desc-label (machine-procedure-name proc)) ":"))
   (emit-asm-line port
@@ -4088,7 +4143,9 @@
                                 (number->string (machine-procedure-frame-slots proc))))
   (emit-asm-line port
                  (string-append "    .quad "
-                                (number->string (stack-size-for proc)))))
+                                (number->string (- (stack-size-for proc)
+                                                   (procedure-outgoing-bytes proc)
+                                                   (procedure-saved-bytes proc))))))
 
 (define (emit-global-slots port global-count)
   (emit-asm-line port (string-append ".globl " (asm-name 'hop_global_slot_count)))
