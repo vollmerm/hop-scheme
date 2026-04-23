@@ -340,13 +340,39 @@
                               (cons n acc)))))))
          (app build 60 ())))
      (letrec ((sum
-               (lambda (ys acc)
-                 (if (null? ys)
-                     acc
-                     (app sum
-                          (cdr ys)
-                          (primop + acc (car ys)))))))
-       (app sum xs 0))))
+                (lambda (ys acc)
+                  (if (null? ys)
+                      acc
+                      (app sum
+                           (cdr ys)
+                           (primop + acc (car ys)))))))
+        (app sum xs 0))))
+
+(define test42
+  '(let ((p (cons 7 ())))
+     (letrec ((burn
+               (lambda (n)
+                 (if (primop = n 0)
+                     0
+                     (let ((junk (cons n ())))
+                       (app burn (primop - n 1)))))))
+       (app burn 60)
+       (car p))))
+
+(define test43
+  '(let ((keep (cons 7 ())))
+     (let ((worker
+            (lambda (n)
+              (letrec ((fill
+                        (lambda (k acc)
+                          (if (primop = k 0)
+                              acc
+                              (app fill
+                                   (primop - k 1)
+                                   (cons k acc))))))
+                (app fill n ())))))
+       (app worker 40)
+       (car keep))))
 
 (define sample-tests
   (list (cons "Test 1: Simple arithmetic" test1)
@@ -385,10 +411,12 @@
          (cons "Test 35: Pair GC stress with transient boxes" test35)
          (cons "Test 36: Closure GC stress with nested captures" test36)
          (cons "Test 37: Top-level define feeds later forms" test37)
-         (cons "Test 38: Top-level globals support forward references" test38)
-         (cons "Test 39: Top-level begin flattens into file scope" test39)
-         (cons "Test 40: Nested lambdas read globals" test40)
-         (cons "Test 41: Global roots survive GC" test41)))
+          (cons "Test 38: Top-level globals support forward references" test38)
+          (cons "Test 39: Top-level begin flattens into file scope" test39)
+          (cons "Test 40: Nested lambdas read globals" test40)
+          (cons "Test 41: Global roots survive GC" test41)
+          (cons "Test 42: Caller roots survive allocating direct calls" test42)
+          (cons "Test 43: Caller roots survive allocating closure calls" test43)))
 
 (define named-tests
   ;; These are runnable end-to-end regression cases. test6 and test7 stay as
@@ -427,10 +455,12 @@
          (cons 'test35 test35)
          (cons 'test36 test36)
          (cons 'test37 test37)
-         (cons 'test38 test38)
-         (cons 'test39 test39)
-         (cons 'test40 test40)
-         (cons 'test41 test41)))
+          (cons 'test38 test38)
+          (cons 'test39 test39)
+          (cons 'test40 test40)
+          (cons 'test41 test41)
+          (cons 'test42 test42)
+          (cons 'test43 test43)))
 
 (define (lookup-named-test name)
   (let ((binding (assoc name named-tests)))

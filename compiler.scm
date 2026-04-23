@@ -1774,13 +1774,14 @@
   (successors machine-block-successors))
 
 (define-record-type <machine-procedure>
-  (make-machine-procedure name params param-locations blocks homes frame-slots used-registers)
+  (make-machine-procedure name params param-locations blocks homes root-homes frame-slots used-registers)
   machine-procedure?
   (name machine-procedure-name)
   (params machine-procedure-params)
   (param-locations machine-procedure-param-locations)
   (blocks machine-procedure-blocks)
   (homes machine-procedure-homes)
+  (root-homes machine-procedure-root-homes)
   (frame-slots machine-procedure-frame-slots)
   (used-registers machine-procedure-used-registers))
 
@@ -2658,7 +2659,10 @@
 
 (define aarch64-arg-registers '(x0 x1 x2 x3 x4 x5 x6 x7))
 (define aarch64-return-register 'x0)
-(define aarch64-callee-saved '())
+;; These are the general-purpose registers this backend may keep hop_value
+;; temporaries in between safepoints. They are callee-saved in the platform ABI,
+;; so ordinary calls preserve them once we spill/restore them in the prologue.
+(define aarch64-callee-saved '(x19 x20 x21 x22 x23 x24 x25 x26 x27 x28))
 (define gc-frame-header-bytes 16)
 
 (define (set-union xs ys)
@@ -2781,6 +2785,7 @@
                                   params
                                   param-locations
                                   (reverse result)
+                                  '()
                                   '()
                                   0
                                   '())
@@ -3091,9 +3096,24 @@
                       (expire (cdr rest)
                               still-active
                               (insert-register register available))
-                      (expire (cdr rest)
-                              (insert-active entry still-active)
-                              available)))))))))
+                       (expire (cdr rest)
+                               (insert-active entry still-active)
+                               available)))))))))
+
+(define (allocate-root-homes homes next-slot)
+  ;; Register-homed values still need a stack-visible root slot because GC only
+  ;; walks frame slots. Keep a dedicated shadow slot per register home and keep
+  ;; it synchronized after each definition.
+  (let loop ((rest homes) (slot next-slot) (result '()))
+    (if (null? rest)
+        (values result slot)
+        (let ((var (caar rest))
+              (home (cdar rest)))
+          (if (and (pair? home) (eq? (car home) 'register))
+              (loop (cdr rest)
+                    (+ slot 1)
+                    (cons (cons var `(stack-slot ,slot)) result))
+              (loop (cdr rest) slot result))))))
 
 (define (lookup-home homes operand)
   (if (symbol? operand)
@@ -3102,6 +3122,12 @@
             (cdr binding)
             operand))
       operand))
+
+(define (lookup-root-home root-homes var)
+  (let ((binding (assoc var root-homes)))
+    (if binding
+        (cdr binding)
+        #f)))
 
 (define (rewrite-machine-instruction instr homes)
   (case (car instr)
@@ -3179,30 +3205,70 @@
                  ,(cadddr instr)))
     ((jump) instr)
     ((ret)
-     `(ret ,(lookup-home homes (cadr instr))))
+      `(ret ,(lookup-home homes (cadr instr))))
     (else
-     (error "Unknown machine instruction during allocation" instr))))
+      (error "Unknown machine instruction during allocation" instr))))
+
+(define (instruction-root-syncs instr homes root-homes)
+  (append-map
+   (lambda (var)
+     (let ((root-home (lookup-root-home root-homes var))
+           (home (lookup-home homes var)))
+       (if root-home
+           (list `(move ,root-home ,home))
+           '())))
+   (machine-instr-defs instr)))
+
+(define (rewrite-machine-instruction-with-root-sync instr homes root-homes)
+  (append
+   (list (rewrite-machine-instruction instr homes))
+   (instruction-root-syncs instr homes root-homes)))
+
+(define (rewrite-machine-block-instructions instrs homes root-homes)
+  ;; Keep leading move-in instructions contiguous so entry-block label placement
+  ;; still treats parameter setup as prologue code. Their root-sync moves are
+  ;; emitted immediately after the whole move-in prefix instead of interleaving
+  ;; them between parameter loads.
+  (let loop ((rest instrs) (prefix '()) (prefix-syncs '()))
+    (if (and (pair? rest) (eq? (caar rest) 'move-in))
+        (loop (cdr rest)
+              (append prefix
+                      (list (rewrite-machine-instruction (car rest) homes)))
+              (append prefix-syncs
+                      (instruction-root-syncs (car rest) homes root-homes)))
+        (append prefix
+                prefix-syncs
+                (append-map
+                 (lambda (instr)
+                   (rewrite-machine-instruction-with-root-sync
+                    instr
+                    homes
+                    root-homes))
+                 rest)))))
 
 (define (allocate-machine-procedure proc)
   (let ((blocks (machine-procedure-blocks proc)))
     (let-values (((in-vec out-vec) (compute-liveness blocks)))
-      (let-values (((homes frame-slots)
+      (let-values (((homes next-slot)
                     (linear-scan-allocate
-                     (collect-intervals blocks in-vec out-vec))))
-        (let ((rewritten-blocks
-               (map (lambda (block)
-                      (make-machine-block
-                       (machine-block-label block)
-                       (map (lambda (instr)
-                              (rewrite-machine-instruction instr homes))
-                            (machine-block-instructions block))
-                       (machine-block-successors block)))
+                      (collect-intervals blocks in-vec out-vec))))
+        (let-values (((root-homes frame-slots)
+                      (allocate-root-homes homes next-slot)))
+          (let ((rewritten-blocks
+              (map (lambda (block)
+                     (make-machine-block
+                      (machine-block-label block)
+                       (rewrite-machine-block-instructions
+                        (machine-block-instructions block)
+                        homes
+                        root-homes)
+                        (machine-block-successors block)))
                     blocks))
-              (used-registers
-               (dedupe-symbols
-                (let loop ((rest homes) (result '()))
-                  (if (null? rest)
-                      result
+                (used-registers
+                (dedupe-symbols
+                 (let loop ((rest homes) (result '()))
+                   (if (null? rest)
+                       result
                       (let ((home (cdar rest)))
                         (loop (cdr rest)
                               (if (and (pair? home) (eq? (car home) 'register))
@@ -3210,12 +3276,13 @@
                                   result))))))))
           (make-machine-procedure
            (machine-procedure-name proc)
-           (machine-procedure-params proc)
-           (machine-procedure-param-locations proc)
-           rewritten-blocks
-           homes
-           frame-slots
-           used-registers))))))
+            (machine-procedure-params proc)
+            (machine-procedure-param-locations proc)
+            rewritten-blocks
+            homes
+            root-homes
+            frame-slots
+            used-registers)))))))
 
 (define (max-outgoing-stack-args blocks)
   (let block-loop ((remaining blocks) (best 0))
@@ -3234,8 +3301,9 @@
   ;; body. The header lives just above the saved x29/x30 pair and stores:
   ;;   [x29, #-16] previous GC frame
   ;;   [x29, # -8] pointer to this procedure's GC descriptor
-  ;; The rest of the frame is the usual saved-register / stack-slot /
-  ;; outgoing-arg area.
+  ;; The rest of the frame is the usual saved-register / root-slot /
+  ;; outgoing-arg area. "frame slots" includes both true spills and the shadow
+  ;; root slots that keep register-homed values visible to the collector.
   (stack-align
    (+ gc-frame-header-bytes
       (* 8 (+ (machine-procedure-frame-slots proc)
@@ -3264,12 +3332,11 @@
          ;; make frame teardown explicit around tail calls and returns.
          ;;
          ;; GC note: ordinary calls keep the current frame live, so all roots
-         ;; must already be materialized in homes (stack slots in the current
-         ;; implementation) before control transfers to a helper that may
-         ;; allocate.
-         (append (lower-arg-moves args)
-                  (list `(move-out ,(arg-location (length args)) ,closure)
-                        `(call-indirect ,(length args))
+         ;; must already be materialized in GC-visible frame slots before
+         ;; control transfers to a helper or callee that may allocate.
+          (append (lower-arg-moves args)
+                   (list `(move-out ,(arg-location (length args)) ,closure)
+                         `(call-indirect ,(length args))
                        `(move ,dst (arg-register ,aarch64-return-register))))))
     ((call-known)
      (let ((dst (cadr instr))
@@ -3323,12 +3390,10 @@
                               ;; Epilogues are inserted instruction-by-instruction
                               ;; when returns and tail calls are finalized.
                               ;;
-                              ;; GC note: init-frame-slots clears every root slot
-                              ;; before the frame becomes visible to the
-                              ;; collector. gc-push-frame publishes the frame
-                              ;; only after that, so the collector never sees
-                              ;; uninitialized garbage and mistake it for a live
-                              ;; Scheme pointer.
+                              ;; GC note: init-frame-slots clears every GC-visible
+                              ;; frame slot before the frame becomes visible to
+                              ;; the collector. That covers both true spills and
+                              ;; the shadow root slots used for register homes.
                               (list `(allocate-frame ,stack-size)
                                     `(save-callee-saved ,saved-registers)
                                     `(init-frame-slots ,(machine-procedure-frame-slots proc))
@@ -3356,6 +3421,7 @@
      (machine-procedure-param-locations proc)
      final-blocks
      (machine-procedure-homes proc)
+     (machine-procedure-root-homes proc)
      (machine-procedure-frame-slots proc)
      saved-registers)))
 
@@ -3408,6 +3474,9 @@
   (newline)
   (display "    Homes: ")
   (write (machine-procedure-homes proc))
+  (newline)
+  (display "    Root homes: ")
+  (write (machine-procedure-root-homes proc))
   (newline)
   (display "    Frame slots: ")
   (write (machine-procedure-frame-slots proc))
@@ -3511,11 +3580,11 @@
          (emit-asm-line port
                         (string-append "    mov " target ", " src)))))
     ((and (pair? operand) (eq? (car operand) 'stack-slot))
-     ;; Stack slots are the compiler's precise root homes. When the runtime
-     ;; walks frames during GC, these are exactly the locations it rewrites.
-     (emit-asm-line port
-                    (string-append "    ldr " target ", [sp, #"
-                                   (number->string
+      ;; Stack slots are the runtime-visible root homes. That includes ordinary
+      ;; spills and the shadow slots that mirror register-homed values.
+      (emit-asm-line port
+                     (string-append "    ldr " target ", [sp, #"
+                                    (number->string
                                     (stack-slot-offset proc (cadr operand)))
                                    "]")))
     ((and (pair? operand) (eq? (car operand) 'stack-arg))
@@ -3592,8 +3661,8 @@
   ;;   - store the result back into a home
   ;;
   ;; The helper may allocate, but that is safe because every other live Scheme
-  ;; value is still sitting in an explicit stack slot rather than only in
-  ;; scratch registers.
+  ;; value has already been mirrored into a GC-visible frame slot rather than
+  ;; only existing in a machine register.
   (emit-load-operand port "x0" operand proc)
   (emit-asm-line port (string-append "    bl " helper))
   (emit-store-operand port "x0" dst proc))
@@ -3889,10 +3958,11 @@
 (define (emit-procedure-descriptor port proc)
   ;; A descriptor is the runtime's compact summary of a frame layout.
   ;; For this first collector we only need:
-  ;;   - how many stack slots may hold Scheme values
+  ;;   - how many frame slots may hold Scheme values
   ;;   - how many bytes to step from x29 down to slot 0
   ;; That is enough for a precise stack walk because the current backend keeps
-  ;; live values in those slots at allocation safepoints.
+  ;; GC-visible values in those slots at allocation safepoints, even when the
+  ;; fast path between safepoints uses callee-saved registers.
   (emit-asm-line port (string-append ".p2align 3"))
   (emit-asm-line port (string-append (gc-desc-label (machine-procedure-name proc)) ":"))
   (emit-asm-line port
