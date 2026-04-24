@@ -91,6 +91,62 @@
 ;;; Accept either a single expression or an explicit `(program ...)` wrapper,
 ;;; flatten top-level `begin`, assign compiler-known global slots, and rewrite
 ;;; top-level define into explicit global initialization.
+;;;
+;;; INPUT GRAMMAR (Source)
+;;;
+;;;   Source  ::= (program Form*)   ; multi-form top level
+;;;             | Expr              ; bare expression
+;;;
+;;;   Form    ::= (define Var Expr) ; top-level variable definition
+;;;             | (begin Form*)     ; spliced form group
+;;;             | Expr
+;;;
+;;;   Expr    ::= Var               ; variable reference
+;;;             | Literal           ; integer, boolean, or ()
+;;;             | (begin Expr+)
+;;;             | (if Expr Expr Expr)
+;;;             | (let ((Var Expr)) Expr+)
+;;;             | (letrec ((Var Expr)+) Expr+)  ; lambda bindings only
+;;;             | (lambda (Var*) Expr+)
+;;;             | (primop PrimOp Expr*)
+;;;             | (app Expr Expr*)
+;;;             | (cons Expr Expr)
+;;;             | (car Expr)
+;;;             | (cdr Expr)
+;;;             | (pair? Expr)
+;;;             | (null? Expr)
+;;;             | (box Expr)
+;;;             | (unbox Expr)
+;;;             | (set-box! Expr Expr)
+;;;
+;;;   PrimOp  ::= + | - | * | = | <
+;;;   Literal ::= Integer | #t | #f | ()
+;;;
+;;; OUTPUT GRAMMAR (Lowered)
+;;;
+;;;   Expr    ::= Var
+;;;             | Literal
+;;;             | (global N)            ; read from global slot N (integer)
+;;;             | (set-global! N Expr)  ; write to global slot N
+;;;             | (begin Expr+)
+;;;             | (if Expr Expr Expr)
+;;;             | (let ((Var Expr)) Expr+)
+;;;             | (letrec ((Var Expr)+) Expr+)
+;;;             | (lambda (Var*) Expr+)
+;;;             | (primop PrimOp Expr*)
+;;;             | (app Expr Expr*)
+;;;             | (cons Expr Expr)
+;;;             | (car Expr)
+;;;             | (cdr Expr)
+;;;             | (pair? Expr)
+;;;             | (null? Expr)
+;;;             | (box Expr)
+;;;             | (unbox Expr)
+;;;             | (set-box! Expr Expr)
+;;;
+;;; Changes: top-level `(define Var E)` → `(set-global! N E)`;
+;;;          free references to defined names → `(global N)`.
+;;;          The program is collapsed to a single Expr (possibly a `begin`).
 ;;; ============================================================================
 
 (define (program-source? source)
@@ -231,6 +287,12 @@
 ;;; Renames every binder so that each variable name is globally unique.
 ;;; After this pass, later stages no longer need to reason about shadowing by
 ;;; name; they can treat identifiers as stable handles for bindings.
+;;;
+;;; GRAMMAR: unchanged from the Lowered grammar (Pass 0 output).
+;;; This pass is structure-preserving; only the *names* of binders and their
+;;; references change.  Every Var bound by `let`, `letrec`, or `lambda` is
+;;; replaced by a fresh symbol of the form `original.N`.  Free variables
+;;; (globals, primitives) are left unchanged.
 ;;; ============================================================================
 
 (define (uniquify expr)
@@ -353,6 +415,38 @@
 ;;; This pass also preserves direct tail recursion by rewriting eligible calls
 ;;; to explicit self/group tail-call markers, which later stages can lower into
 ;;; jumps instead of ordinary calls.
+;;;
+;;; INPUT GRAMMAR: Uniquified (same structure as the Lowered grammar).
+;;;
+;;; OUTPUT GRAMMAR (Desugared)
+;;;
+;;;   Expr    ::= Var
+;;;             | Literal
+;;;             | (global N)
+;;;             | (set-global! N Expr)
+;;;             | (begin Expr+)
+;;;             | (if Expr Expr Expr)
+;;;             | (let ((Var Expr)) Expr+)
+;;;             ; `letrec` is gone; replaced by let/box/set-box! sequences
+;;;             | (lambda (Var*) Expr+)
+;;;             | (primop PrimOp Expr*)
+;;;             | (app Expr Expr*)          ; non-tail or non-recursive call
+;;;             | (self-tail-call Expr*)    ; direct self tail recursion
+;;;             | (group-tail-call Var Expr*) ; tail call to another group member
+;;;             | (cons Expr Expr)
+;;;             | (car Expr)
+;;;             | (cdr Expr)
+;;;             | (pair? Expr)
+;;;             | (null? Expr)
+;;;             | (box Expr)
+;;;             | (unbox Expr)             ; also used for reading recursive bindings
+;;;             | (set-box! Expr Expr)
+;;;
+;;; Changes: `letrec` is eliminated. Each binding name becomes a `let`-bound
+;;;          box, set with `set-box!` after all closures are built. References
+;;;          to recursive names become `(unbox Var)`. Direct self/mutual tail
+;;;          calls at eligible sites become `self-tail-call` / `group-tail-call`
+;;;          instead of `app`.
 ;;; ============================================================================
 
 (define (desugar-letrec expr)
@@ -830,6 +924,49 @@
 ;;;   1. code plus an explicit environment interface,
 ;;;   2. an explicit environment payload for captured values, and
 ;;;   3. closure-call / make-closure forms instead of source-level application.
+;;;
+;;; INPUT GRAMMAR: Desugared (Pass 2 output).
+;;;
+;;; OUTPUT GRAMMAR (Closure-Converted)
+;;;
+;;;   Expr    ::= SimpleExpr
+;;;             | (begin Expr+)
+;;;             | (if Expr Expr Expr)
+;;;             | (let ((Var Expr)) Expr)
+;;;             | (make-closure (lambda (Var*) Expr) CaptureExpr*)
+;;;             ;   ^ lambda is only legal nested here; `(global N)` appears
+;;;             ;     as a capture but not as a standalone Expr arm
+;;;             | (closure-call Expr Expr*)    ; generic indirect call
+;;;             | (self-tail-call Expr*)        ; direct self tail recursion
+;;;             | (group-tail-call Var Expr*)   ; mutual tail call
+;;;             | (group-closures MemberSpec* CaptureSpec*)
+;;;             ;   ^ mutually tail-recursive cluster emitted as a unit
+;;;             | (cons Expr Expr)
+;;;             | (car Expr)
+;;;             | (cdr Expr)
+;;;             | (pair? Expr)
+;;;             | (null? Expr)
+;;;             | (box Expr)
+;;;             | (unbox Expr)
+;;;             | (set-box! Expr Expr)
+;;;             | (set-global! N Expr)
+;;;             | (primop PrimOp Expr*)
+;;;
+;;;   SimpleExpr ::= Var               ; local variable (after cc, usually (local Var))
+;;;               | Literal
+;;;               | (local Var)        ; value available directly as a local
+;;;               | (closure Var)      ; value accessed from the closure environment
+;;;               | (global N)         ; value from a global slot
+;;;
+;;;   CaptureExpr ::= SimpleExpr
+;;;
+;;;   MemberSpec  ::= (BoxVar MemberName Params Body)
+;;;   CaptureSpec ::= (EnvVar SimpleExpr)
+;;;
+;;; Changes: `lambda` / `app` are gone as top-level Expr forms. `lambda`
+;;;          appears only inside `make-closure`. Variable references gain
+;;;          `(local ...)` / `(closure ...)` wrappers. `app` → `closure-call`.
+;;;          Mutually tail-recursive letrec clusters become `group-closures`.
 ;;; ============================================================================
 
 (define (free-vars expr bound)
@@ -1246,6 +1383,41 @@
 ;;; make-closure a stable procedure name and ensures closure-call operators and
 ;;; arguments are explicit simple names. That keeps the analysis small while
 ;;; preserving the source-shaped structure of the program.
+;;;
+;;; INPUT GRAMMAR: Closure-Converted (Pass 3 output).
+;;;
+;;; OUTPUT GRAMMAR (CFA-Normalized)
+;;;
+;;;   Expr    ::= SimpleExpr
+;;;             | (begin Expr+)
+;;;             | (if Expr Expr Expr)
+;;;             | (let ((Var Expr)) Expr+)
+;;;             | (make-closure ProcName (lambda (Var*) Expr) SimpleExpr*)
+;;;             ;   ^ same as before but now carries a stable synthetic name
+;;;             | (closure-call SimpleExpr SimpleExpr*)  ; rator+rands all simple
+;;;             | (self-tail-call SimpleExpr*)
+;;;             | (group-tail-call Var SimpleExpr*)
+;;;             | (group-closures MemberSpec* CaptureSpec*)
+;;;             | (cons Expr Expr)
+;;;             | (car Expr)
+;;;             | (cdr Expr)
+;;;             | (pair? Expr)
+;;;             | (null? Expr)
+;;;             | (box Expr)
+;;;             | (unbox Expr)
+;;;             | (set-box! Expr Expr)
+;;;             | (set-global! N Expr)
+;;;             | (primop PrimOp Expr*)
+;;;
+;;;   SimpleExpr ::= Var | Literal
+;;;               | (local Var) | (closure Var) | (global N)
+;;;
+;;; Changes from Pass 3 output:
+;;;   - `make-closure` gains an explicit `ProcName` symbol before the lambda.
+;;;   - The operator and all arguments of `closure-call`, `self-tail-call`,
+;;;     `group-tail-call`, and the captured values of `make-closure` are all
+;;;     `SimpleExpr`. Complex subexpressions are hoisted into fresh `let`
+;;;     bindings introduced by this pass.
 ;;; ============================================================================
 
 (define (cfa-simple-expr? expr)
@@ -1379,6 +1551,48 @@
        (error "Invalid expression in CFA normalization" expr))))
 
   (normalize expr))
+
+;;; ============================================================================
+;;; Pass 3.6: 0CFA Analysis and Known-Call Rewriting
+;;; run-0cfa computes a whole-program 0th-order control-flow analysis over the
+;;; CFA-normalized IR. rewrite-known-calls then uses that result to replace
+;;; generic `closure-call` sites with `known-call` wherever exactly one
+;;; procedure can flow to the operator.
+;;;
+;;; INPUT GRAMMAR: CFA-Normalized (Pass 3.5 output).
+;;;
+;;; OUTPUT GRAMMAR (CFA-Rewritten)
+;;;
+;;;   Expr    ::= SimpleExpr
+;;;             | (begin Expr+)
+;;;             | (if Expr Expr Expr)
+;;;             | (let ((Var Expr)) Expr+)
+;;;             | (make-closure ProcName (lambda (Var*) Expr) SimpleExpr*)
+;;;             | (closure-call SimpleExpr SimpleExpr*)  ; polymorphic call site
+;;;             | (known-call ProcName CaptureCount SimpleExpr SimpleExpr*)
+;;;             ;   ^ monomorphic call site: ProcName is the unique callee,
+;;;             ;     CaptureCount is how many env slots precede the user args,
+;;;             ;     SimpleExpr is the closure value (carries the environment)
+;;;             | (self-tail-call SimpleExpr*)
+;;;             | (group-tail-call Var SimpleExpr*)
+;;;             | (group-closures MemberSpec* CaptureSpec*)
+;;;             | (cons Expr Expr)
+;;;             | (car Expr)
+;;;             | (cdr Expr)
+;;;             | (pair? Expr)
+;;;             | (null? Expr)
+;;;             | (box Expr)
+;;;             | (unbox Expr)
+;;;             | (set-box! Expr Expr)
+;;;             | (set-global! N Expr)
+;;;             | (primop PrimOp Expr*)
+;;;
+;;;   SimpleExpr ::= Var | Literal
+;;;               | (local Var) | (closure Var) | (global N)
+;;;
+;;; Changes: some `closure-call` sites become `known-call`; everything else
+;;; is structurally unchanged.
+;;; ============================================================================
 
 (define (run-0cfa expr)
   ;; The analysis tracks five related facts:
@@ -1757,6 +1971,44 @@
 ;;; TAC makes evaluation order, temporary values, branches, and returns
 ;;; concrete. This is the point where expression trees become something closer
 ;;; to an imperative program.
+;;;
+;;; INPUT GRAMMAR: CFA-Rewritten (Pass 3.6 output).
+;;;
+;;; OUTPUT
+;;;
+;;; The result is NOT an expression; it is a pair of:
+;;;   - a flat list of TAC instructions (the entry-point body), and
+;;;   - a list of <procedure> records, one per lifted lambda/make-closure site.
+;;;
+;;;   Instr   ::= (assign Var RHS)
+;;;             | (label Label)
+;;;             | (if Var Label Label)
+;;;             | (goto Label)
+;;;             | (return Var)
+;;;             | (tail-call Var Var*)            ; indirect tail call
+;;;             | (direct-tail-call ProcName Var*) ; direct tail call
+;;;             | (set-box! Var Var)
+;;;             | (set-global! N Var)
+;;;
+;;;   RHS     ::= Var | Literal
+;;;             | (primop PrimOp Var*)
+;;;             | (cons Var Var)
+;;;             | (box Var)
+;;;             | (unbox Var) | (car Var) | (cdr Var)
+;;;             | (pair? Var) | (null? Var)
+;;;             | (global N)
+;;;             | (closure-env-ref Var N)     ; load env slot N from closure Var
+;;;             | (make-closure ProcName Var*) ; allocate closure over free vars
+;;;             | (closure-call Var Var*)      ; indirect call
+;;;             | (direct-call ProcName Var*)  ; direct call
+;;;
+;;;   Label   ::= Symbol
+;;;   Var     ::= Symbol
+;;;
+;;; Changes: expression nesting is gone. Every sub-expression result lands in a
+;;; fresh temporary. Lambdas are lifted to top-level <procedure> records.
+;;; `if` becomes a three-field branch instruction. `begin` sequences become
+;;; consecutive instructions with labels at join points.
 ;;; ============================================================================
 
 (define-record-type <procedure>
@@ -2515,6 +2767,30 @@
 ;;; The CFG is the boundary between the mostly source-shaped middle end and the
 ;;; backend. Once code is in CFG form, later stages can reason in terms of
 ;;; blocks, successors, liveness, and register allocation.
+;;;
+;;; INPUT: a flat list of TAC instructions (Pass 4 output).
+;;;
+;;; OUTPUT: a list of <basic-block> records.
+;;;
+;;;   BasicBlock ::= { label:      Label | #f
+;;;                  , instrs:     Instr*   ; same TAC instructions as input
+;;;                  , successors: BlockIndex* }
+;;;
+;;;   BlockIndex ::= Integer   ; 0-based index into the block list
+;;;
+;;; Block boundaries (leaders):
+;;;   - index 0 (the first instruction is always a leader),
+;;;   - any `(label L)` instruction,
+;;;   - any instruction that immediately follows a terminator
+;;;     (`if` / `goto` / `return` / `tail-call` / `direct-tail-call`).
+;;;
+;;; Successor edges come only from the terminator of each block:
+;;;   `(if _ then else)`        → two successors (then-block, else-block)
+;;;   `(goto L)`                → one successor (block labelled L)
+;;;   `(return _)`              → no successors (function exit)
+;;;   `(tail-call _ _*)`        → no successors (indirect tail transfer)
+;;;   `(direct-tail-call N _*)` → no successors (direct tail transfer)
+;;;   fall-through              → one successor (next block in list)
 ;;; ============================================================================
 
 (define (build-cfg tac-instrs)
@@ -2523,7 +2799,7 @@
   
   (define (terminator? instr)
     (and (pair? instr)
-         (memq (car instr) '(if goto return tail-call))))
+         (memq (car instr) '(if goto return tail-call direct-tail-call))))
 
   (define (is-leader? index instrs)
     ;; Determine if instruction at index is a basic block leader
@@ -2625,7 +2901,7 @@
                  block 
                  (list (hash-ref label->block target-label)))))
              
-              ((and (pair? last-instr) (memq (car last-instr) '(return tail-call)))
+              ((and (pair? last-instr) (memq (car last-instr) '(return tail-call direct-tail-call)))
                ;; Function/program exit
                (set-basic-block-successors! block '()))
              
@@ -2655,6 +2931,81 @@
 ;;;   3. finalization:
 ;;;      calling-convention details, prologue/epilogue code, and helper calls
 ;;;      are made explicit before assembly emission.
+;;;
+;;; ── Step 1: Instruction Selection ──────────────────────────────────────────
+;;;
+;;; INPUT: CFG of TAC instructions (Pass 5 output).
+;;;
+;;; OUTPUT: <machine-procedure> with <machine-block>* of abstract machine
+;;;         instructions. Operands are still *symbolic* (Var or Literal); no
+;;;         physical registers or stack offsets appear yet.
+;;;
+;;;   MachInstr ::= (move-in Var ArgLocation)   ; param arrives from calling conv
+;;;               | (move Var Operand)
+;;;               | (binop Op Var Operand Operand)
+;;;               | (alloc-pair Var Operand Operand)
+;;;               | (alloc-box Var Operand)
+;;;               | (load-box Var Operand)
+;;;               | (load-car Var Operand)
+;;;               | (load-cdr Var Operand)
+;;;               | (is-pair Var Operand)
+;;;               | (is-null Var Operand)
+;;;               | (load-closure-env Var Operand N)
+;;;               | (load-global Var N)
+;;;               | (alloc-closure Var ProcName Operand*)
+;;;               | (store-box Operand Operand)
+;;;               | (store-global N Operand)
+;;;               | (call Var Operand Operand*)      ; indirect call, Var = result
+;;;               | (call-known Var ProcName Operand*) ; direct call
+;;;               | (tail-call Operand Operand*)     ; indirect tail call
+;;;               | (tail-call-known ProcName Operand*) ; direct tail call
+;;;               | (branch-if Operand Label Label)
+;;;               | (jump Label)
+;;;               | (ret Operand)
+;;;
+;;;   ArgLocation ::= (arg-register Reg) | (stack-arg N)
+;;;   Operand     ::= Var | Literal | ArgLocation
+;;;
+;;; ── Step 2: Liveness Analysis + Linear-Scan Allocation ─────────────────────
+;;;
+;;; INPUT: <machine-procedure> with symbolic Var operands (step 1 output).
+;;;
+;;; OUTPUT: same instruction set with all Var operands replaced by homes:
+;;;
+;;;   Home ::= (register Reg)   ; callee-saved register
+;;;          | (stack-slot N)   ; frame slot (spill or GC root shadow)
+;;;          | (arg-register Reg)
+;;;          | (stack-arg N)
+;;;
+;;; Additional GC root-sync instructions are inserted around safepoints
+;;; (`alloc-box`, `alloc-pair`, `alloc-closure`, `call`, `call-known`):
+;;;   - before: `(move (stack-slot N) (register Reg))` for each live root
+;;;   - after:  `(move (register Reg) (stack-slot N))` reloads updated pointers
+;;;
+;;; ── Step 3: ABI Finalization ────────────────────────────────────────────────
+;;;
+;;; INPUT: allocated <machine-procedure> (step 2 output).
+;;;
+;;; OUTPUT: fully lowered instruction list ready for assembly emission.
+;;;         The `call`, `tail-call`, `call-known`, `tail-call-known`, and `ret`
+;;;         pseudo-instructions are expanded into ABI-concrete sequences.
+;;;         Prologue and epilogue pseudo-instructions are made explicit.
+;;;
+;;;   Additional finalized instructions (not present in earlier steps):
+;;;
+;;;   (allocate-frame N)              ; stp x29,x30 + sub sp
+;;;   (save-callee-saved Reg*)        ; store each used callee-saved reg
+;;;   (init-frame-slots N)            ; zero out GC root slots
+;;;   (gc-push-frame ProcName)        ; link frame into GC frame chain
+;;;   (gc-pop-frame)                  ; unlink before tail/return
+;;;   (restore-callee-saved Reg*)     ; reload callee-saved regs
+;;;   (deallocate-frame N)            ; add sp + ldp x29,x30
+;;;   (move-out Operand Operand)      ; place arg in calling-conv location
+;;;   (call-indirect N)               ; branch-with-link via hop_call_N helper
+;;;   (call-label ProcName)           ; branch-with-link to known label
+;;;   (tail-call-indirect N)          ; branch via hop_tail_call_N helper
+;;;   (tail-call-label ProcName)      ; branch to known label
+;;;   (ret)                           ; return (no operand; result already in x0)
 ;;; ============================================================================
 
 (define aarch64-arg-registers '(x0 x1 x2 x3 x4 x5 x6 x7))
@@ -3648,6 +3999,21 @@
 ;;; AArch64 assembly. By this point, the interesting compiler work is already
 ;;; done; emission is mostly a matter of printing each lowered instruction in
 ;;; the right concrete form.
+;;;
+;;; INPUT: a list of finalized <machine-procedure> records (Backend step 3
+;;;        output). All homes are physical (register, stack-slot), all
+;;;        calling-convention details are explicit, and prologue/epilogue
+;;;        pseudo-instructions are present.
+;;;
+;;; OUTPUT: textual AArch64 assembly (string / port). No grammar
+;;;         transformation occurs; this pass only renders IR as text.
+;;;
+;;; Notable target conventions:
+;;;   - Apple-style symbol names (underscore-prefixed where required).
+;;;   - Tagged `hop_value` integers passed/returned in x0.
+;;;   - `scheme_entry` is the public entry point called by codegen_harness.c.
+;;;   - Closure/allocation helpers (hop_call_N, hop_tail_call_N, hop_alloc_*)
+;;;     are declared external and called via BL/B.
 ;;; ============================================================================
 
 (define (procedure-saved-bytes proc)
