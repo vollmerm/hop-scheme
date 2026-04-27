@@ -396,6 +396,19 @@
                                                                   (primop + g h))))))))))
      (app sum8 1 2 3 4 5 6 7 8)))
 
+;; Regression test: car/cdr/cons/pair?/null? in application position after
+;; builtin canonicalization. These should compile identically to their primop
+;; equivalents. Expected result: 2
+(define test46
+  '(let ((xs (cons 2 (cons 3 ()))))
+     (car xs)))
+
+;; First-class test: car used as a first-class value passed to a
+;; higher-order function. Expected result: 5
+(define test47
+  '(let ((apply-fn (lambda (f p) (app f p))))
+     (app apply-fn car (cons 5 ()))))
+
 (define sample-tests
   (list (cons "Test 1: Simple arithmetic" test1)
         (cons "Test 2: Lambda application" test2)
@@ -440,7 +453,9 @@
         (cons "Test 42: Caller roots survive allocating direct calls" test42)
         (cons "Test 43: Caller roots survive allocating closure calls" test43)
         (cons "Test 44: Forced GC cycle with transient allocations" test44)
-        (cons "Test 45: Eight-parameter lambda application" test45)))
+        (cons "Test 45: Eight-parameter lambda application" test45)
+        (cons "Test 46: car/cdr/cons after builtin canonicalization" test46)
+        (cons "Test 47: car as first-class value" test47)))
 
 (define named-tests
   ;; These are runnable end-to-end regression cases. test6 and test7 stay as
@@ -486,7 +501,9 @@
           (cons 'test42 test42)
           (cons 'test43 test43)
           (cons 'test44 test44)
-          (cons 'test45 test45)))
+          (cons 'test45 test45)
+          (cons 'test46 test46)
+          (cons 'test47 test47)))
 
 (define (lookup-named-test name)
   (let ((binding (assoc name named-tests)))

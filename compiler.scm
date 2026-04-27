@@ -408,6 +408,83 @@
   (uniquify-expr expr '()))
 
 ;;; ============================================================================
+;;; Pass 1.5: Builtin Canonicalization
+;;; Rewrites user-facing list primitives (car, cdr, cons, pair?, null?) into
+;;; uniform (primop op ...) form. Runs immediately after uniquify, which means
+;;; bound identifiers are already renamed to name.N form, so builtin-head
+;;; detection is purely syntactic with no scope tracking needed.
+;;;
+;;; A bare builtin name in value position (e.g. passed as a first-class
+;;; argument) is wrapped as a fresh lambda so it remains a legal value.
+;;;
+;;; box/unbox/set-box! are intentionally excluded: they are internal compiler
+;;; forms produced by desugar-letrec and must remain as special syntax.
+;;; Arithmetic primops (+, -, *, =, <) already appear as (primop op ...) in
+;;; source and are left unchanged.
+;;;
+;;; INPUT GRAMMAR:  Uniquified (Pass 1 output).
+;;; OUTPUT GRAMMAR: Same, except car/cdr/cons/pair?/null? as operation heads
+;;;                 are replaced by (primop op ...) and bare builtin symbols
+;;;                 in value position become lambda wrappers.
+;;; ============================================================================
+
+(define builtin-primop-arities
+  '((car . 1) (cdr . 1) (pair? . 1) (null? . 1) (cons . 2)))
+
+(define (builtin-primop? name)
+  (assq name builtin-primop-arities))
+
+(define (builtin-primop-arity name)
+  (cdr (assq name builtin-primop-arities)))
+
+(define (canonicalize-builtins expr)
+  (define wrap-counter 0)
+  (define (fresh-wrap-name)
+    (set! wrap-counter (+ wrap-counter 1))
+    (string->symbol (string-append "wrap." (number->string wrap-counter))))
+  (define (make-wrap-lambda name arity)
+    (let loop ((i 0) (params '()))
+      (if (= i arity)
+          (let ((ps (reverse params)))
+            `(lambda ,ps (primop ,name ,@ps)))
+          (loop (+ i 1) (cons (fresh-wrap-name) params)))))
+  (define (canon expr)
+    (cond
+      ((symbol? expr)
+       (if (builtin-primop? expr)
+           (make-wrap-lambda expr (builtin-primop-arity expr))
+           expr))
+      ((literal-expr? expr) expr)
+      ((pair? expr)
+       (let ((entry (and (symbol? (car expr)) (builtin-primop? (car expr)))))
+         (if entry
+             `(primop ,(car expr) ,@(map canon (cdr expr)))
+             (case (car expr)
+               ((begin)    `(begin ,@(map canon (cdr expr))))
+               ((primop)   `(primop ,(cadr expr) ,@(map canon (cddr expr))))
+               ((if)       `(if ,(canon (cadr expr))
+                                ,(canon (caddr expr))
+                                ,(canon (cadddr expr))))
+               ((let)
+                (let* ((binding (caadr expr))
+                       (var (car binding))
+                       (val (cadr binding)))
+                  `(let ((,var ,(canon val))) ,@(map canon (cddr expr)))))
+               ((lambda)   `(lambda ,(cadr expr) ,@(map canon (cddr expr))))
+               ((letrec)
+                `(letrec ,(map (lambda (b) `(,(car b) ,(canon (cadr b)))) (cadr expr))
+                   ,@(map canon (cddr expr))))
+               ((app)      `(app ,(canon (cadr expr)) ,@(map canon (cddr expr))))
+               ((box)      `(box ,(canon (cadr expr))))
+               ((unbox)    `(unbox ,(canon (cadr expr))))
+               ((set-box!) `(set-box! ,(canon (cadr expr)) ,(canon (caddr expr))))
+               ((global)   expr)
+               ((set-global!) `(set-global! ,(cadr expr) ,(canon (caddr expr))))
+               (else (error "Unknown expression in canonicalize-builtins" (car expr)))))))
+      (else (error "Invalid expression in canonicalize-builtins" expr))))
+  (canon expr))
+
+;;; ============================================================================
 ;;; Pass 2: Letrec Desugaring
 ;;; Rewrites lambda-only letrec groups into explicit allocation and
 ;;; initialization. Recursive bindings become boxes containing closures.
@@ -590,12 +667,15 @@
            ((app)
             (append-map (lambda (e) (collect e bound)) (cdr expr)))
            
-           ((cons set-box!)
+           ((set-box!)
             (append (collect (cadr expr) bound)
                     (collect (caddr expr) bound)))
 
-            ((box unbox car cdr pair? null?)
+            ((box unbox)
              (collect (cadr expr) bound))
+
+            ((primop)
+             (append-map (lambda (e) (collect e bound)) (cddr expr)))
 
             ((global)
              '())
@@ -666,11 +746,11 @@
                                   (tail-call-targets arg group-names #f))
                                 args))))
          
-          ((cons set-box!)
+          ((set-box!)
            (append (tail-call-targets (cadr expr) group-names #f)
                    (tail-call-targets (caddr expr) group-names #f)))
 
-           ((box unbox car cdr pair? null?)
+           ((box unbox)
             (tail-call-targets (cadr expr) group-names #f))
 
            ((global)
@@ -752,13 +832,11 @@
                      #t
                      (group-entry-safe? rator group-names))
                  (all (lambda (arg) (group-entry-safe? arg group-names)) args))))
-         ((cons set-box!)
+         ((set-box!)
           (and (group-entry-safe? (cadr expr) group-names)
                (group-entry-safe? (caddr expr) group-names)))
-         ((box)
+         ((box unbox)
           (group-entry-safe? (cadr expr) group-names))
-          ((unbox car cdr pair? null?)
-           (group-entry-safe? (cadr expr) group-names))
           ((global)
            #t)
           ((set-global!)
@@ -875,8 +953,7 @@
                        ,@(map (lambda (e) (rewrite e env current-group #f)) args)))))
 
           ((cons)
-           `(cons ,(rewrite (cadr expr) env current-group #f)
-                  ,(rewrite (caddr expr) env current-group #f)))
+           (error "cons in desugar-letrec: should have been canonicalized" expr))
           
           ((box)
            `(box ,(rewrite (cadr expr) env current-group #f)))
@@ -885,16 +962,16 @@
            `(unbox ,(rewrite (cadr expr) env current-group #f)))
 
           ((car)
-           `(car ,(rewrite (cadr expr) env current-group #f)))
+           (error "car in desugar-letrec: should have been canonicalized" expr))
 
           ((cdr)
-           `(cdr ,(rewrite (cadr expr) env current-group #f)))
+           (error "cdr in desugar-letrec: should have been canonicalized" expr))
 
           ((pair?)
-           `(pair? ,(rewrite (cadr expr) env current-group #f)))
+           (error "pair? in desugar-letrec: should have been canonicalized" expr))
 
           ((null?)
-           `(null? ,(rewrite (cadr expr) env current-group #f)))
+           (error "null? in desugar-letrec: should have been canonicalized" expr))
           
            ((set-box!)
             (let ((target (cadr expr)))
@@ -1013,7 +1090,7 @@
           ((group-tail-call)
            (append-map (lambda (e) (collect e bound)) (cddr expr)))
            
-           ((box unbox car cdr pair? null?)
+           ((box unbox)
             (collect (cadr expr) bound))
 
            ((global)
@@ -1022,7 +1099,7 @@
            ((set-global!)
             (collect (caddr expr) bound))
 
-           ((cons set-box!)
+           ((set-box!)
             (append (collect (cadr expr) bound)
                     (collect (caddr expr) bound)))
           
@@ -1074,7 +1151,7 @@
          ((group-tail-call)
           (cons (cadr expr)
                 (append-map collect-group-tail-targets (cddr expr))))
-         ((begin app set-box! cons)
+         ((begin app set-box!)
           (append-map collect-group-tail-targets (cdr expr)))
          ((primop)
           (append-map collect-group-tail-targets (cddr expr)))
@@ -1087,7 +1164,7 @@
                   (append-map collect-group-tail-targets (cddr expr))))
          ((lambda)
           (collect-group-tail-targets (body->expr (cddr expr))))
-         ((box unbox car cdr pair? null?)
+         ((box unbox)
            (collect-group-tail-targets (cadr expr)))
          ((global)
           '())
@@ -1102,7 +1179,7 @@
       ((literal-expr? expr) #f)
       ((pair? expr)
        (case (car expr)
-         ((begin app primop set-box! cons)
+         ((begin app primop set-box!)
           (any (lambda (e) (mentions-box-var? e box-vars)) (cdr expr)))
          ((if)
           (or (mentions-box-var? (cadr expr) box-vars)
@@ -1113,7 +1190,7 @@
               (any (lambda (e) (mentions-box-var? e box-vars)) (cddr expr))))
          ((lambda)
           (mentions-box-var? (body->expr (cddr expr)) box-vars))
-          ((box unbox car cdr pair? null?)
+          ((box unbox)
             (mentions-box-var? (cadr expr) box-vars))
           ((global)
            #f)
@@ -1152,11 +1229,10 @@
                 (and (safe-group-body? rator box-vars)
                      (all (lambda (arg) (safe-group-body? arg box-vars)) args)))))
          ((cons)
-          (and (safe-group-body? (cadr expr) box-vars)
-               (safe-group-body? (caddr expr) box-vars)))
+          (error "cons in safe-group-body?: should have been canonicalized" expr))
          ((box)
            (safe-group-body? (cadr expr) box-vars))
-         ((unbox car cdr pair? null?)
+         ((unbox)
            (let ((target (cadr expr)))
              (if (and (symbol? target) (memq target box-vars))
                  #f
@@ -1340,8 +1416,7 @@
             `(closure-call ,(convert rator env self-tail-prefix)
                            ,@(map (lambda (e) (convert e env self-tail-prefix)) rands))))
          ((cons)
-          `(cons ,(convert (cadr expr) env self-tail-prefix)
-                 ,(convert (caddr expr) env self-tail-prefix)))
+          (error "cons in closure-convert: should have been canonicalized" expr))
          ((self-tail-call)
           `(self-tail-call
             ,@self-tail-prefix
@@ -1357,13 +1432,13 @@
          ((unbox)
           `(unbox ,(convert (cadr expr) env self-tail-prefix)))
          ((car)
-          `(car ,(convert (cadr expr) env self-tail-prefix)))
+          (error "car in closure-convert: should have been canonicalized" expr))
          ((cdr)
-          `(cdr ,(convert (cadr expr) env self-tail-prefix)))
+          (error "cdr in closure-convert: should have been canonicalized" expr))
          ((pair?)
-          `(pair? ,(convert (cadr expr) env self-tail-prefix)))
+          (error "pair? in closure-convert: should have been canonicalized" expr))
          ((null?)
-          `(null? ,(convert (cadr expr) env self-tail-prefix)))
+          (error "null? in closure-convert: should have been canonicalized" expr))
          ((set-box!)
           `(set-box! ,(convert (cadr expr) env self-tail-prefix)
                      ,(convert (caddr expr) env self-tail-prefix)))
@@ -1535,11 +1610,11 @@
                     (list (car capture-spec)
                           (normalize (cadr capture-spec))))
                   (caddr expr))))
-         ((cons set-box!)
-           `(,(car expr)
-             ,(normalize (cadr expr))
-             ,(normalize (caddr expr))))
-          ((box unbox car cdr pair? null?)
+         ((cons)
+           (error "cons in normalize-for-cfa: should have been canonicalized" expr))
+          ((set-box!)
+           `(set-box! ,(normalize (cadr expr)) ,(normalize (caddr expr))))
+          ((box unbox)
            `(,(car expr) ,(normalize (cadr expr))))
           ((set-global!)
            `(set-global! ,(cadr expr) ,(normalize (caddr expr))))
@@ -1678,7 +1753,7 @@
            (for-each (lambda (capture-spec)
                        (collect-procedures (cadr capture-spec)))
                      (caddr expr)))
-          ((box unbox car cdr pair? null?)
+          ((box unbox)
            (collect-procedures (cadr expr)))
           ((set-global!)
            (collect-procedures (caddr expr)))
@@ -1706,7 +1781,7 @@
                 last
                 (loop (cdr rest)
                       (analyze-expr (car rest) current-proc)))))
-         ((primop cons car cdr pair? null?)
+         ((primop)
           (begin
             (for-each (lambda (subexpr)
                         (analyze-expr subexpr current-proc))
@@ -2593,13 +2668,22 @@
                         arg-procedures)))))
          
           ((cons)
-           (convert-binary-value-op 'cons (cadr expr) (caddr expr)))
+           (error "cons in expr->tac: should have been canonicalized" expr))
 
           ((box)
            (convert-unary-value-op 'box (cadr expr)))
            
-          ((unbox car cdr pair? null?)
-           (convert-unary-value-op (car expr) (cadr expr)))
+          ((unbox)
+           (convert-unary-value-op 'unbox (cadr expr)))
+
+          ((car)
+           (error "car in expr->tac: should have been canonicalized" expr))
+          ((cdr)
+           (error "cdr in expr->tac: should have been canonicalized" expr))
+          ((pair?)
+           (error "pair? in expr->tac: should have been canonicalized" expr))
+          ((null?)
+           (error "null? in expr->tac: should have been canonicalized" expr))
          
           ((if)
            (let* ((then-label (fresh-temp))
@@ -3066,21 +3150,27 @@
       ((or (symbol? rhs) (literal-expr? rhs))
        (list `(move ,dst ,rhs)))
       ((and (pair? rhs) (eq? (car rhs) 'primop))
-       (list `(binop ,(cadr rhs) ,dst ,@(cddr rhs))))
+       (case (cadr rhs)
+         ((car)  (list `(load-car  ,dst ,(caddr rhs))))
+         ((cdr)  (list `(load-cdr  ,dst ,(caddr rhs))))
+         ((pair?) (list `(is-pair   ,dst ,(caddr rhs))))
+         ((null?) (list `(is-null   ,dst ,(caddr rhs))))
+         ((cons) (list `(alloc-pair ,dst ,(caddr rhs) ,(cadddr rhs))))
+         (else   (list `(binop ,(cadr rhs) ,dst ,@(cddr rhs))))))
       ((and (pair? rhs) (eq? (car rhs) 'cons))
-       (list `(alloc-pair ,dst ,(cadr rhs) ,(caddr rhs))))
+       (error "cons in instruction selection: should have been canonicalized" rhs))
       ((and (pair? rhs) (eq? (car rhs) 'box))
        (list `(alloc-box ,dst ,(cadr rhs))))
       ((and (pair? rhs) (eq? (car rhs) 'unbox))
        (list `(load-box ,dst ,(cadr rhs))))
       ((and (pair? rhs) (eq? (car rhs) 'car))
-       (list `(load-car ,dst ,(cadr rhs))))
+       (error "car in instruction selection: should have been canonicalized" rhs))
       ((and (pair? rhs) (eq? (car rhs) 'cdr))
-       (list `(load-cdr ,dst ,(cadr rhs))))
+       (error "cdr in instruction selection: should have been canonicalized" rhs))
       ((and (pair? rhs) (eq? (car rhs) 'pair?))
-       (list `(is-pair ,dst ,(cadr rhs))))
+       (error "pair? in instruction selection: should have been canonicalized" rhs))
       ((and (pair? rhs) (eq? (car rhs) 'null?))
-       (list `(is-null ,dst ,(cadr rhs))))
+       (error "null? in instruction selection: should have been canonicalized" rhs))
       ((and (pair? rhs) (eq? (car rhs) 'global))
        (list `(load-global ,dst ,(cadr rhs))))
       ((and (pair? rhs) (eq? (car rhs) 'closure-env-ref))
@@ -4578,7 +4668,8 @@
   ;; about one uniform internal program shape.
   (let-values (((lowered-program global-count) (lower-source-program expr)))
     (let* ((uniquified (uniquify lowered-program))
-           (desugared (desugar-letrec uniquified))
+           (canonicalized (canonicalize-builtins uniquified))
+           (desugared (desugar-letrec canonicalized))
            (closure-converted (closure-convert desugared))
            (cfa-normalized (normalize-for-cfa closure-converted))
            (cfa-analysis (run-0cfa cfa-normalized))
@@ -4587,6 +4678,7 @@
         (values lowered-program
                 global-count
                 uniquified
+                canonicalized
                 desugared
                 closure-converted
                 cfa-normalized
@@ -4598,7 +4690,7 @@
                      procedures))))))
 
 (define (compile-to-backend expr)
-  (let-values (((lowered-program global-count uniquified desugared closure-converted cfa-normalized
+  (let-values (((lowered-program global-count uniquified canonicalized desugared closure-converted cfa-normalized
                              cfa-rewritten entry-cfg procedures)
                  (compile-to-cfg expr)))
     (let ((entry-machine
@@ -4613,6 +4705,7 @@
       (values lowered-program
               global-count
               uniquified
+              canonicalized
               desugared
               closure-converted
               cfa-normalized
@@ -4623,7 +4716,7 @@
               procedure-machines))))
 
 (define (write-aarch64-program expr path)
-  (let-values (((lowered-program global-count uniquified desugared closure-converted cfa-normalized
+  (let-values (((lowered-program global-count uniquified canonicalized desugared closure-converted cfa-normalized
                               cfa-rewritten entry-cfg procedures
                                entry-machine procedure-machines)
                   (compile-to-backend expr)))
@@ -4654,7 +4747,7 @@
   (write expr) (newline)
   
   (display "\n=== After Program Lowering ===\n")
-  (let-values (((lowered-program global-count uniquified desugared closure-converted cfa-normalized
+  (let-values (((lowered-program global-count uniquified canonicalized desugared closure-converted cfa-normalized
                               cfa-rewritten entry-cfg procedures
                                entry-machine procedure-machines)
                  (compile-to-backend expr)))
@@ -4665,7 +4758,10 @@
     
     (display "\n=== After Uniquify ===\n")
     (write uniquified) (newline)
-    
+
+    (display "\n=== After Builtin Canonicalization ===\n")
+    (write canonicalized) (newline)
+
     (display "\n=== After letrec Desugaring ===\n")
     (write desugared) (newline)
     
