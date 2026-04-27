@@ -429,7 +429,13 @@
 ;;; ============================================================================
 
 (define builtin-primop-arities
-  '((car . 1) (cdr . 1) (pair? . 1) (null? . 1) (cons . 2)))
+  '((car . 1)
+    (cdr . 1)
+    (unsafe-car . 1)
+    (unsafe-cdr . 1)
+    (pair? . 1)
+    (null? . 1)
+    (cons . 2)))
 
 (define (builtin-primop? name)
   (assq name builtin-primop-arities))
@@ -3004,6 +3010,209 @@
      (find-successors blocks)))
 
 ;;; ============================================================================
+;;; Pass 5.5: Pair-Proven Unsafe car/cdr Rewrite
+;;; Runs on CFG TAC and rewrites `(primop car x)` / `(primop cdr x)` into
+;;; `(primop unsafe-car x)` / `(primop unsafe-cdr x)` when a forward must
+;;; analysis proves `x` is definitely a pair at that program point.
+;;;
+;;; Facts tracked:
+;;;   - definitely-pair(var): var must contain a pair on all incoming paths.
+;;;
+;;; Conservative rules:
+;;;   - Source of certainty:
+;;;       * `(assign v (primop cons ...))`
+;;;       * then-edge of an `if` whose condition is immediately preceded by
+;;;         `(assign t (primop pair? x))` and branches on `t`.
+;;;       * simple move propagation `(assign v u)` when `u` is definitely pair.
+;;;   - No certainty gained from globals/boxes/unbox/set-global!/set-box!.
+;;;   - Join uses intersection (must semantics).
+;;; ============================================================================
+
+(define (optimize-unsafe-car-cdr-cfg cfg)
+  (define block-count (length cfg))
+
+  (define (set-add set var)
+    (if (memq var set) set (cons var set)))
+
+  (define (set-remove set var)
+    (let loop ((rest set) (result '()))
+      (cond
+        ((null? rest) (reverse result))
+        ((eq? (car rest) var)
+         (loop (cdr rest) result))
+        (else
+         (loop (cdr rest) (cons (car rest) result))))))
+
+  (define (set-intersection xs ys)
+    (let loop ((rest xs) (result '()))
+      (if (null? rest)
+          (reverse result)
+          (loop (cdr rest)
+                (if (memq (car rest) ys)
+                    (cons (car rest) result)
+                    result)))))
+
+  (define (set-equal? xs ys)
+    (and (null? (set-difference xs ys))
+         (null? (set-difference ys xs))))
+
+  (define (vector-set-set-equal?! vec index new-set)
+    (let ((old-set (vector-ref vec index)))
+      (if (set-equal? old-set new-set)
+          #f
+          (begin
+            (vector-set! vec index new-set)
+            #t))))
+
+  (define (transfer-instruction facts instr)
+    (if (and (pair? instr) (eq? (car instr) 'assign))
+        (let ((dst (cadr instr))
+              (rhs (caddr instr)))
+          (cond
+            ((and (pair? rhs)
+                  (eq? (car rhs) 'primop)
+                  (eq? (cadr rhs) 'cons))
+             (set-add facts dst))
+            ((symbol? rhs)
+             (if (memq rhs facts)
+                 (set-add facts dst)
+                 (set-remove facts dst)))
+            (else
+             (set-remove facts dst))))
+        facts))
+
+  (define (transfer-block in-facts block)
+    (let loop ((rest (basic-block-instructions block))
+               (facts in-facts))
+      (if (null? rest)
+          facts
+          (loop (cdr rest) (transfer-instruction facts (car rest))))))
+
+  (define (then-branch-pair-subject block)
+    ;; Recognize the common TAC pattern:
+    ;;   ...
+    ;;   (assign t (primop pair? x))
+    ;;   (if t Lthen Lelse)
+    ;; If found, return x for then-edge refinement; otherwise #f.
+    (let ((instrs (basic-block-instructions block)))
+      (if (< (length instrs) 2)
+          #f
+          (let* ((terminator (list-ref instrs (- (length instrs) 1)))
+                 (pre (list-ref instrs (- (length instrs) 2))))
+            (if (and (pair? terminator)
+                     (eq? (car terminator) 'if)
+                     (pair? pre)
+                     (eq? (car pre) 'assign)
+                     (eq? (cadr pre) (cadr terminator))
+                     (pair? (caddr pre))
+                     (eq? (car (caddr pre)) 'primop)
+                     (eq? (cadr (caddr pre)) 'pair?)
+                     (symbol? (caddr (caddr pre))))
+                (caddr (caddr pre))
+                #f)))))
+
+  (define (edge-facts pred-index succ-index pred-out)
+    (let* ((pred-block (list-ref cfg pred-index))
+           (successors (basic-block-successors pred-block))
+           (then-subject (then-branch-pair-subject pred-block)))
+      (if (and then-subject
+               (pair? successors)
+               (eqv? (car successors) succ-index))
+          (set-add pred-out then-subject)
+          pred-out)))
+
+  (define predecessors (make-vector block-count '()))
+  (let loop-preds ((i 0))
+    (if (= i block-count)
+        'done
+        (begin
+          (for-each
+           (lambda (succ)
+             (vector-set! predecessors
+                          succ
+                          (cons i (vector-ref predecessors succ))))
+           (basic-block-successors (list-ref cfg i)))
+          (loop-preds (+ i 1)))))
+
+  (define in-facts (make-vector block-count '()))
+  (define out-facts (make-vector block-count '()))
+
+  (let fixed-point ((changed #t))
+    (if (not changed)
+        'done
+        (let ((any-changed #f))
+          (let loop-blocks ((i 0))
+            (if (= i block-count)
+                (fixed-point any-changed)
+                (let* ((block (list-ref cfg i))
+                       (preds (vector-ref predecessors i))
+                       (new-in
+                        (if (= i 0)
+                            '()
+                            (if (null? preds)
+                                '()
+                                (let ((first-set
+                                       (edge-facts (car preds)
+                                                   i
+                                                   (vector-ref out-facts (car preds)))))
+                                  (let loop-pred-merge ((rest (cdr preds))
+                                                        (acc first-set))
+                                    (if (null? rest)
+                                        acc
+                                        (loop-pred-merge
+                                         (cdr rest)
+                                         (set-intersection
+                                          acc
+                                          (edge-facts (car rest)
+                                                      i
+                                                      (vector-ref out-facts (car rest)))))))))))
+                       (new-out (transfer-block new-in block)))
+                  (when (vector-set-set-equal?! in-facts i new-in)
+                    (set! any-changed #t))
+                  (when (vector-set-set-equal?! out-facts i new-out)
+                    (set! any-changed #t))
+                  (loop-blocks (+ i 1))))))))
+
+  (define (rewrite-block block initial-facts)
+    (let loop ((rest (basic-block-instructions block))
+               (facts initial-facts)
+               (result '()))
+      (if (null? rest)
+          (let ((rewritten (make-basic-block (basic-block-label block)
+                                             (reverse result))))
+            (set-basic-block-successors! rewritten (basic-block-successors block))
+            rewritten)
+          (let* ((instr (car rest))
+                 (rewritten-instr
+                  (if (and (pair? instr)
+                           (eq? (car instr) 'assign)
+                           (pair? (caddr instr))
+                           (eq? (car (caddr instr)) 'primop)
+                           (memq (cadr (caddr instr)) '(car cdr))
+                           (symbol? (caddr (caddr instr)))
+                           (memq (caddr (caddr instr)) facts))
+                      (let* ((dst (cadr instr))
+                             (rhs (caddr instr))
+                             (op (cadr rhs))
+                             (arg (caddr rhs)))
+                        `(assign ,dst
+                                 (primop ,(if (eq? op 'car) 'unsafe-car 'unsafe-cdr)
+                                         ,arg)))
+                      instr))
+                 (next-facts (transfer-instruction facts rewritten-instr)))
+            (loop (cdr rest)
+                  next-facts
+                  (cons rewritten-instr result))))))
+
+  (let rewrite-loop ((i 0) (result '()))
+    (if (= i block-count)
+        (reverse result)
+        (rewrite-loop (+ i 1)
+                      (cons (rewrite-block (list-ref cfg i)
+                                           (vector-ref in-facts i))
+                            result)))))
+
+;;; ============================================================================
 ;;; Backend: instruction selection and linear-scan allocation
 ;;; The backend proceeds in three conceptual steps:
 ;;;
@@ -3153,6 +3362,8 @@
        (case (cadr rhs)
          ((car)  (list `(load-car  ,dst ,(caddr rhs))))
          ((cdr)  (list `(load-cdr  ,dst ,(caddr rhs))))
+         ((unsafe-car) (list `(unsafe-load-car ,dst ,(caddr rhs))))
+         ((unsafe-cdr) (list `(unsafe-load-cdr ,dst ,(caddr rhs))))
          ((pair?) (list `(is-pair   ,dst ,(caddr rhs))))
          ((null?) (list `(is-null   ,dst ,(caddr rhs))))
          ((cons) (list `(alloc-pair ,dst ,(caddr rhs) ,(cadddr rhs))))
@@ -3254,6 +3465,8 @@
              (if (symbol? (car (cddddr instr))) (list (car (cddddr instr))) '())))
     ((alloc-box load-box load-car load-cdr is-pair is-null load-closure-env)
         (if (symbol? (caddr instr)) (list (caddr instr)) '()))
+    ((unsafe-load-car unsafe-load-cdr)
+     (if (symbol? (caddr instr)) (list (caddr instr)) '()))
     ((load-global) '())
     ((alloc-pair)
      (append (if (symbol? (caddr instr)) (list (caddr instr)) '())
@@ -3317,7 +3530,8 @@
 (define (machine-instr-defs instr)
   (case (car instr)
     ((move-in move alloc-pair alloc-box load-box load-car load-cdr
-              is-pair is-null load-closure-env load-global alloc-closure call call-known)
+            unsafe-load-car unsafe-load-cdr is-pair is-null
+            load-closure-env load-global alloc-closure call call-known)
       (list (cadr instr)))
     ((binop)
       (list (caddr instr)))
@@ -3696,6 +3910,12 @@
     ((load-cdr)
      `(load-cdr ,(lookup-home homes (cadr instr))
                 ,(lookup-home homes (caddr instr))))
+    ((unsafe-load-car)
+     `(unsafe-load-car ,(lookup-home homes (cadr instr))
+               ,(lookup-home homes (caddr instr))))
+    ((unsafe-load-cdr)
+     `(unsafe-load-cdr ,(lookup-home homes (cadr instr))
+               ,(lookup-home homes (caddr instr))))
     ((is-pair)
      `(is-pair ,(lookup-home homes (cadr instr))
                ,(lookup-home homes (caddr instr))))
@@ -4153,6 +4373,10 @@
 (define false-immediate 36)
 (define true-immediate 52)
 (define uninitialized-immediate 68)
+;; Toggle for unsafe pair loads:
+;;   'fast         => unchecked field access
+;;   'debug-assert => use checked runtime helper for easier debugging
+(define unsafe-pair-load-mode 'fast)
 
 (define (encode-immediate value)
   (cond
@@ -4260,6 +4484,20 @@
   (emit-asm-line port
                  (string-append "    sub x9, x9, #"
                                 (number->string closure-tag))))
+
+(define (emit-unsafe-pair-load port dst operand offset checked-helper proc)
+  (if (eq? unsafe-pair-load-mode 'debug-assert)
+      (emit-runtime-unary-call port checked-helper dst operand proc)
+      (begin
+        (emit-load-operand port "x9" operand proc)
+        (emit-asm-line port
+                       (string-append "    sub x9, x9, #"
+                                      (number->string pair-tag)))
+        (emit-asm-line port
+                       (string-append "    ldr x10, [x9, #"
+                                      (number->string offset)
+                                      "]"))
+        (emit-store-operand port "x10" dst proc))))
 
 (define (emit-runtime-unary-call port helper dst operand proc)
   ;; The calling convention here reflects the GC invariant:
@@ -4489,6 +4727,10 @@
       (emit-runtime-unary-call port "_hop_car" (cadr instr) (caddr instr) proc))
     ((load-cdr)
       (emit-runtime-unary-call port "_hop_cdr" (cadr instr) (caddr instr) proc))
+    ((unsafe-load-car)
+      (emit-unsafe-pair-load port (cadr instr) (caddr instr) 8 "_hop_car" proc))
+    ((unsafe-load-cdr)
+      (emit-unsafe-pair-load port (cadr instr) (caddr instr) 16 "_hop_cdr" proc))
     ((is-pair)
       (emit-load-operand port "x9" (caddr instr) proc)
       (emit-asm-line port
@@ -4675,19 +4917,28 @@
            (cfa-analysis (run-0cfa cfa-normalized))
            (cfa-rewritten (rewrite-known-calls cfa-normalized cfa-analysis)))
       (let-values (((tac-instrs procedures) (expr->tac cfa-rewritten)))
-        (values lowered-program
-                global-count
-                uniquified
-                canonicalized
-                desugared
-                closure-converted
-                cfa-normalized
-                cfa-rewritten
-                (build-cfg tac-instrs)
-                (map (lambda (procedure)
-                       (cons procedure
-                             (build-cfg (procedure-instructions procedure))))
-                     procedures))))))
+          (let* ((entry-cfg (build-cfg tac-instrs))
+                 (procedure-cfgs
+            (map (lambda (procedure)
+                   (cons procedure
+                   (build-cfg (procedure-instructions procedure))))
+                 procedures))
+                 (optimized-entry-cfg (optimize-unsafe-car-cdr-cfg entry-cfg))
+                 (optimized-procedure-cfgs
+            (map (lambda (procedure+cfg)
+                   (cons (car procedure+cfg)
+                   (optimize-unsafe-car-cdr-cfg (cdr procedure+cfg))))
+                 procedure-cfgs)))
+            (values lowered-program
+              global-count
+              uniquified
+              canonicalized
+              desugared
+              closure-converted
+              cfa-normalized
+              cfa-rewritten
+              optimized-entry-cfg
+              optimized-procedure-cfgs))))))
 
 (define (compile-to-backend expr)
   (let-values (((lowered-program global-count uniquified canonicalized desugared closure-converted cfa-normalized
@@ -4773,8 +5024,8 @@
 
     (display "\n=== After 0CFA Call Rewriting ===\n")
     (write cfa-rewritten) (newline)
-    
-    (display "\n=== Entry CFG ===\n")
+
+    (display "\n=== After Pair-Proven Unsafe car/cdr Rewrite (CFG) ===\n")
     (display-cfg entry-cfg)
     (display "Entry CFG built with ")
     (display (length entry-cfg))

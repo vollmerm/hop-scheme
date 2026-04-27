@@ -409,6 +409,24 @@
   '(let ((apply-fn (lambda (f p) (app f p))))
      (app apply-fn car (cons 5 ()))))
 
+;; Direct pair allocation should allow rewriting car to unsafe-car.
+(define test48
+  '(car (cons 11 ())))
+
+;; pair? then-branch should establish pair-ness for guarded value.
+(define test49
+  '(let ((x (cons 6 ())))
+     (if (pair? x)
+         (car x)
+         0)))
+
+;; Join-point value remains conservative even if both branches build pairs.
+(define test50
+  '(let ((x (if (primop = 0 0)
+                (cons 9 ())
+                0)))
+     (car x)))
+
 (define sample-tests
   (list (cons "Test 1: Simple arithmetic" test1)
         (cons "Test 2: Lambda application" test2)
@@ -455,7 +473,10 @@
         (cons "Test 44: Forced GC cycle with transient allocations" test44)
         (cons "Test 45: Eight-parameter lambda application" test45)
         (cons "Test 46: car/cdr/cons after builtin canonicalization" test46)
-        (cons "Test 47: car as first-class value" test47)))
+        (cons "Test 47: car as first-class value" test47)
+        (cons "Test 48: direct car rewrite to unsafe-car" test48)
+        (cons "Test 49: pair?-guarded car rewrite" test49)
+        (cons "Test 50: conservative join keeps safe car" test50)))
 
 (define named-tests
   ;; These are runnable end-to-end regression cases. test6 and test7 stay as
@@ -503,7 +524,10 @@
           (cons 'test44 test44)
           (cons 'test45 test45)
           (cons 'test46 test46)
-          (cons 'test47 test47)))
+          (cons 'test47 test47)
+          (cons 'test48 test48)
+          (cons 'test49 test49)
+          (cons 'test50 test50)))
 
 (define (lookup-named-test name)
   (let ((binding (assoc name named-tests)))

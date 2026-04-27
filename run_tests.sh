@@ -151,6 +151,9 @@ runtime_cases=(
   "test45|36"
   "test46|2"
   "test47|5"
+  "test48|11"
+  "test49|6"
+  "test50|9"
 )
 
 for case in "${runtime_cases[@]}"; do
@@ -167,6 +170,9 @@ assert_asm_contains "test28" 'b(l)? _cfa\.proc\.[0-9]+' 'nested direct closure c
 assert_asm_not_contains "test28" '_hop_(tail_)?call_[0-9]+' 'generic call helper'
 
 assert_asm_contains "test33" '_hop_(tail_)?call_[0-9]+' 'polymorphic captured closure helper'
+assert_asm_not_contains "test48" '_hop_car' 'safe car helper for direct pair allocation'
+assert_asm_not_contains "test49" '_hop_car' 'safe car helper for pair?-guarded then branch'
+assert_asm_contains "test50" '_hop_car' 'safe car helper for conservative join'
 assert_asm_contains "test5" '\bx(19|20|21|22|23|24|25|26|27|28)\b' 'callee-saved register allocation'
 assert_asm_not_contains "test16" '\bx23\b' 'uncoalesced temporary register in recursive loop'
 assert_asm_not_contains "test5" 'str x9, \[sp, #(24|32|40)\]' 'eager root shadow writes without safepoints'
