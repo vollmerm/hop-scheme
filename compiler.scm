@@ -3249,6 +3249,435 @@
                             result)))))
 
 ;;; ============================================================================
+;;; Pass 5.6: Constant Folding on CFG
+;;; Runs a forward must-analysis to discover variables whose value is
+;;; unconditionally a known compile-time constant (a literal: number, boolean,
+;;; or null) on every path to a given program point.  Where a primop
+;;; application can be evaluated at compile time (all argument variables carry
+;;; known constant values), the assign is rewritten to a literal assignment.
+;;; Conditional branches on known-constant conditions are rewritten to
+;;; unconditional gotos and their block successor lists updated.
+;;;
+;;; Facts tracked:
+;;;   definitely-constant(var, val): var holds the literal val on all
+;;;   incoming paths.
+;;;
+;;; Sources of certainty:
+;;;   - `(assign v lit)`             → v = lit.
+;;;   - `(assign v u)`               → v = facts[u]  when u is known constant.
+;;;   - `(assign v (primop op …))`   → v = fold(op, …) when all arg variables
+;;;                                    carry known constants and the op folds.
+;;;   - Inline literals in primop arg positions (TAC allows mixed Var/Lit args).
+;;;
+;;; Join uses intersection (must semantics): a variable is known constant at a
+;;; join only if every predecessor path agrees on the same value.
+;;; ============================================================================
+
+(define (constant-fold-cfg cfg)
+  (define block-count (length cfg))
+
+  ;; --- facts-map helpers -------------------------------------------
+  ;; A facts map is an association list  ((var . literal) …).
+  ;; We wrap looked-up values as (list val) so that boolean #f is
+  ;; distinguishable from "not found".
+
+  (define (facts-lookup facts var)
+    (let ((entry (assq var facts)))
+      (if entry (list (cdr entry)) #f)))
+
+  (define (facts-bind facts var val)
+    (cons (cons var val)
+          (let loop ((rest facts) (acc '()))
+            (cond ((null? rest)           (reverse acc))
+                  ((eq? (caar rest) var)  (loop (cdr rest) acc))
+                  (else                   (loop (cdr rest) (cons (car rest) acc)))))))
+
+  (define (facts-unbind facts var)
+    (let loop ((rest facts) (acc '()))
+      (cond ((null? rest)           (reverse acc))
+            ((eq? (caar rest) var)  (loop (cdr rest) acc))
+            (else                   (loop (cdr rest) (cons (car rest) acc))))))
+
+  (define (facts-intersect f1 f2)
+    ;; Keep only bindings present in both maps with identical values.
+    (let loop ((rest f1) (acc '()))
+      (if (null? rest)
+          (reverse acc)
+          (let* ((entry  (car rest))
+                 (var    (car entry))
+                 (val    (cdr entry))
+                 (f2-e   (assq var f2)))
+            (loop (cdr rest)
+                  (if (and f2-e (equal? (cdr f2-e) val))
+                      (cons entry acc)
+                      acc))))))
+
+  (define (facts-equal? f1 f2)
+    (and (= (length f1) (length f2))
+         (let loop ((rest f1))
+           (or (null? rest)
+               (let* ((entry (car rest))
+                      (var   (car entry))
+                      (val   (cdr entry))
+                      (f2-e  (assq var f2)))
+                 (and f2-e
+                      (equal? (cdr f2-e) val)
+                      (loop (cdr rest))))))))
+
+  ;; --- primop constant folding -------------------------------------
+  ;; Returns (list result-literal) on success, #f if not foldable.
+  ;; Wrapping avoids ambiguity when the result is boolean #f.
+
+  (define (fold-primop op arg-vals)
+    (define (fold2 pred? op2)
+      (and (= (length arg-vals) 2)
+           (pred? (car arg-vals))
+           (pred? (cadr arg-vals))
+           (list (op2 (car arg-vals) (cadr arg-vals)))))
+    (define (fold1 op1)
+      (and (= (length arg-vals) 1)
+           (list (op1 (car arg-vals)))))
+    (case op
+      ((+)     (fold2 number? +))
+      ((-)     (fold2 number? -))
+      ((*)     (fold2 number? *))
+      ((=)     (fold2 number? =))
+      ((<)     (fold2 number? <))
+      ((>)     (fold2 number? >))
+      ((null?) (fold1 null?))
+      ((pair?) (fold1 pair?))
+      (else #f)))
+
+  ;; --- transfer function -------------------------------------------
+
+  (define (lookup-arg facts v)
+    ;; Return (list val) if v is a known constant (inline literal or
+    ;; variable with a fact), else #f.
+    (if (literal-expr? v) (list v) (facts-lookup facts v)))
+
+  (define (transfer-instr facts instr)
+    (if (not (and (pair? instr) (eq? (car instr) 'assign)))
+        facts
+        (let ((dst (cadr instr))
+              (rhs (caddr instr)))
+          (cond
+            ((literal-expr? rhs)
+             (facts-bind facts dst rhs))
+            ((symbol? rhs)
+             (let ((vb (facts-lookup facts rhs)))
+               (if vb
+                   (facts-bind facts dst (car vb))
+                   (facts-unbind facts dst))))
+            ((and (pair? rhs) (eq? (car rhs) 'primop))
+             (let* ((op        (cadr rhs))
+                    (arg-boxes (map (lambda (v) (lookup-arg facts v)) (cddr rhs))))
+               (if (all (lambda (b) b) arg-boxes)
+                   (let ((folded (fold-primop op (map car arg-boxes))))
+                     (if folded
+                         (facts-bind facts dst (car folded))
+                         (facts-unbind facts dst)))
+                   (facts-unbind facts dst))))
+            (else
+             (facts-unbind facts dst))))))
+
+  (define (transfer-block in-facts block)
+    (let loop ((rest (basic-block-instructions block)) (facts in-facts))
+      (if (null? rest)
+          facts
+          (loop (cdr rest) (transfer-instr facts (car rest))))))
+
+  ;; --- predecessor map ---------------------------------------------
+
+  (define predecessors (make-vector block-count '()))
+  (let build-preds ((i 0))
+    (when (< i block-count)
+      (for-each
+       (lambda (succ)
+         (vector-set! predecessors succ (cons i (vector-ref predecessors succ))))
+       (basic-block-successors (list-ref cfg i)))
+      (build-preds (+ i 1))))
+
+  ;; --- forward fixed-point -----------------------------------------
+
+  (define in-facts  (make-vector block-count '()))
+  (define out-facts (make-vector block-count '()))
+
+  (let fixed-point ((changed #t))
+    (if (not changed)
+        'done
+        (let ((any-changed #f))
+          (do ((i 0 (+ i 1)))
+              ((= i block-count))
+            (let* ((preds   (vector-ref predecessors i))
+                   (new-in
+                    (if (= i 0)
+                        '()
+                        (if (null? preds)
+                            '()
+                            (let ((first-out (vector-ref out-facts (car preds))))
+                              (let merge ((rest (cdr preds)) (acc first-out))
+                                (if (null? rest)
+                                    acc
+                                    (merge (cdr rest)
+                                           (facts-intersect
+                                            acc
+                                            (vector-ref out-facts (car rest))))))))))
+                   (new-out (transfer-block new-in (list-ref cfg i))))
+              (unless (facts-equal? new-in (vector-ref in-facts i))
+                (vector-set! in-facts i new-in)
+                (set! any-changed #t))
+              (unless (facts-equal? new-out (vector-ref out-facts i))
+                (vector-set! out-facts i new-out)
+                (set! any-changed #t))))
+          (fixed-point any-changed))))
+
+  ;; --- rewrite pass ------------------------------------------------
+
+  (define (rewrite-block block initial-facts)
+    (let loop ((rest       (basic-block-instructions block))
+               (facts      initial-facts)
+               (result     '())
+               (new-succs  (basic-block-successors block)))
+      (if (null? rest)
+          (let ((rewritten (make-basic-block (basic-block-label block)
+                                             (reverse result))))
+            (set-basic-block-successors! rewritten new-succs)
+            rewritten)
+          (let* ((instr (car rest))
+                 (rw
+                  (cond
+                    ;; Fold a pure primop assignment when all args are constants.
+                    ((and (pair? instr)
+                          (eq? (car instr) 'assign)
+                          (pair? (caddr instr))
+                          (eq? (car (caddr instr)) 'primop))
+                     (let* ((dst       (cadr instr))
+                            (rhs       (caddr instr))
+                            (op        (cadr rhs))
+                            (arg-boxes (map (lambda (v) (lookup-arg facts v))
+                                            (cddr rhs))))
+                       (if (all (lambda (b) b) arg-boxes)
+                           (let ((folded (fold-primop op (map car arg-boxes))))
+                             (if folded
+                                 (list `(assign ,dst ,(car folded)) new-succs)
+                                 (list instr new-succs)))
+                           (list instr new-succs))))
+                    ;; Copy propagation: replace a variable copy with its constant.
+                    ((and (pair? instr)
+                          (eq? (car instr) 'assign)
+                          (symbol? (caddr instr)))
+                     (let ((vb (facts-lookup facts (caddr instr))))
+                       (if vb
+                           (list `(assign ,(cadr instr) ,(car vb)) new-succs)
+                           (list instr new-succs))))
+                    ;; Constant branch: fold (if known-cond L1 L2) to a goto.
+                    ((and (pair? instr) (eq? (car instr) 'if))
+                     (let* ((cond-expr (cadr instr))
+                            (val-box   (if (literal-expr? cond-expr)
+                                           (list cond-expr)
+                                           (facts-lookup facts cond-expr))))
+                       (if val-box
+                           (let ((cond-val   (car val-box))
+                                 (then-succ  (car new-succs))
+                                 (else-succ  (cadr new-succs))
+                                 (then-label (caddr instr))
+                                 (else-label (cadddr instr)))
+                             (if cond-val
+                                 (list `(goto ,then-label) (list then-succ))
+                                 (list `(goto ,else-label) (list else-succ))))
+                           (list instr new-succs))))
+                    (else
+                     (list instr new-succs))))
+                 (new-instr     (car rw))
+                 (updated-succs (cadr rw))
+                 (next-facts    (transfer-instr facts new-instr)))
+            (loop (cdr rest)
+                  next-facts
+                  (cons new-instr result)
+                  updated-succs)))))
+
+  (let rewrite-loop ((i 0) (result '()))
+    (if (= i block-count)
+        (reverse result)
+        (rewrite-loop (+ i 1)
+                      (cons (rewrite-block (list-ref cfg i)
+                                           (vector-ref in-facts i))
+                            result)))))
+
+;;; ============================================================================
+;;; Pass 5.7: Dead Write Elimination on CFG
+;;; Runs a standard backward liveness analysis on the TAC CFG. An assignment
+;;; `(assign v rhs)` is removed when v is not live after the instruction and
+;;; rhs is pure (no observable side effects).
+;;;
+;;; Pure RHS forms (safe to discard):
+;;;   literals, variable copies, (primop op …) for arithmetic /comparison /safe
+;;;   predicates (+ - * = < > null? pair? unsafe-car unsafe-cdr),
+;;;   (global N), (closure-env-ref v N), (unbox v).
+;;;
+;;; Non-pure RHS forms (never eliminated):
+;;;   (cons …), (box …), (make-closure …),
+;;;   (closure-call …), (direct-call …),
+;;;   (primop car …), (primop cdr …)  — these carry a type-check side effect.
+;;; ============================================================================
+
+(define (eliminate-dead-writes-cfg cfg)
+  (define block-count (length cfg))
+
+  ;; --- TAC variable use / def helpers ------------------------------
+
+  (define (sym-list lst)
+    (let loop ((rest lst) (acc '()))
+      (if (null? rest)
+          (reverse acc)
+          (loop (cdr rest)
+                (if (symbol? (car rest)) (cons (car rest) acc) acc)))))
+
+  (define (tac-rhs-uses rhs)
+    (cond
+      ((literal-expr? rhs)  '())
+      ((symbol? rhs)        (list rhs))
+      ((and (pair? rhs) (eq? (car rhs) 'primop))
+       (sym-list (cddr rhs)))
+      ((and (pair? rhs) (memq (car rhs) '(cons box unbox car cdr pair? null?)))
+       (if (symbol? (cadr rhs)) (list (cadr rhs)) '()))
+      ((and (pair? rhs) (eq? (car rhs) 'global))
+       '())
+      ((and (pair? rhs) (eq? (car rhs) 'closure-env-ref))
+       (if (symbol? (cadr rhs)) (list (cadr rhs)) '()))
+      ((and (pair? rhs) (eq? (car rhs) 'make-closure))
+       (sym-list (cddr rhs)))
+      ((and (pair? rhs) (memq (car rhs) '(closure-call direct-call)))
+       (sym-list (cdr rhs)))
+      (else '())))
+
+  (define (tac-instr-uses instr)
+    (cond
+      ((and (pair? instr) (eq? (car instr) 'assign))
+       (tac-rhs-uses (caddr instr)))
+      ((and (pair? instr) (eq? (car instr) 'if))
+       (if (symbol? (cadr instr)) (list (cadr instr)) '()))
+      ((and (pair? instr) (eq? (car instr) 'return))
+       (if (symbol? (cadr instr)) (list (cadr instr)) '()))
+      ((and (pair? instr) (eq? (car instr) 'tail-call))
+       (sym-list (cdr instr)))
+      ((and (pair? instr) (eq? (car instr) 'direct-tail-call))
+       (sym-list (cddr instr)))
+      ((and (pair? instr) (eq? (car instr) 'set-box!))
+       (sym-list (cdr instr)))
+      ((and (pair? instr) (eq? (car instr) 'set-global!))
+       (if (symbol? (caddr instr)) (list (caddr instr)) '()))
+      (else '())))
+
+  (define (tac-instr-defs instr)
+    (if (and (pair? instr) (eq? (car instr) 'assign))
+        (list (cadr instr))
+        '()))
+
+  (define (tac-rhs-pure? rhs)
+    ;; #t when evaluating rhs produces no observable side effects and may be
+    ;; safely discarded if its result is never used.
+    (cond
+      ((literal-expr? rhs) #t)
+      ((symbol? rhs)       #t)
+      ((and (pair? rhs) (eq? (car rhs) 'primop))
+       (and (memq (cadr rhs) '(+ - * = < > null? pair? unsafe-car unsafe-cdr))
+            #t))
+      ((and (pair? rhs) (eq? (car rhs) 'global))          #t)
+      ((and (pair? rhs) (eq? (car rhs) 'closure-env-ref)) #t)
+      ((and (pair? rhs) (eq? (car rhs) 'unbox))           #t)
+      (else #f)))
+
+  ;; --- block-level use / def for liveness --------------------------
+
+  (define (tac-block-use block)
+    (let loop ((instrs (basic-block-instructions block))
+               (defs   '())
+               (uses   '()))
+      (if (null? instrs)
+          uses
+          (let* ((instr      (car instrs))
+                 (instr-uses (set-difference (tac-instr-uses instr) defs))
+                 (instr-defs (tac-instr-defs instr)))
+            (loop (cdr instrs)
+                  (set-union defs instr-defs)
+                  (set-union uses instr-uses))))))
+
+  (define (tac-block-def block)
+    (let loop ((instrs (basic-block-instructions block)) (defs '()))
+      (if (null? instrs)
+          defs
+          (loop (cdr instrs)
+                (set-union defs (tac-instr-defs (car instrs)))))))
+
+  ;; --- backward fixed-point liveness -------------------------------
+
+  (let* ((use-vec (list->vector (map tac-block-use cfg)))
+         (def-vec (list->vector (map tac-block-def cfg)))
+         (in-vec  (make-vector block-count '()))
+         (out-vec (make-vector block-count '())))
+
+    (let fixed-point ()
+      (let ((changed #f))
+        (do ((i (- block-count 1) (- i 1)))
+            ((< i 0))
+          (let* ((block   (list-ref cfg i))
+                 (succs   (basic-block-successors block))
+                 (new-out (let s-loop ((rest succs) (acc '()))
+                            (if (null? rest)
+                                acc
+                                (s-loop (cdr rest)
+                                        (set-union acc
+                                                   (vector-ref in-vec (car rest)))))))
+                 (new-in  (set-union (vector-ref use-vec i)
+                                     (set-difference new-out
+                                                     (vector-ref def-vec i)))))
+            (when (not (set-equal? new-out (vector-ref out-vec i)))
+              (vector-set! out-vec i new-out)
+              (set! changed #t))
+            (when (not (set-equal? new-in (vector-ref in-vec i)))
+              (vector-set! in-vec i new-in)
+              (set! changed #t))))
+        (when changed (fixed-point))))
+
+    ;; --- rewrite: remove dead pure assignments -------------------
+
+    (define (rewrite-block block out-live)
+      ;; Walk instructions backwards, maintaining the live set, and collect
+      ;; the surviving instructions in forward order.
+      (let loop ((instrs  (reverse (basic-block-instructions block)))
+                 (live    out-live)
+                 (result  '()))
+        (if (null? instrs)
+            (let ((rewritten (make-basic-block (basic-block-label block)
+                                               result)))
+              (set-basic-block-successors! rewritten (basic-block-successors block))
+              rewritten)
+            (let* ((instr   (car instrs))
+                   (dead?   (and (pair? instr)
+                                 (eq? (car instr) 'assign)
+                                 (not (memq (cadr instr) live))
+                                 (tac-rhs-pure? (caddr instr))))
+                   (new-live
+                    (if dead?
+                        ;; Removed instruction: liveness is unchanged.
+                        live
+                        ;; Kept instruction: propagate liveness backwards.
+                        (set-union (set-difference live (tac-instr-defs instr))
+                                   (tac-instr-uses instr)))))
+              (loop (cdr instrs)
+                    new-live
+                    (if dead? result (cons instr result)))))))
+
+    (let rewrite-loop ((i 0) (result '()))
+      (if (= i block-count)
+          (reverse result)
+          (rewrite-loop (+ i 1)
+                        (cons (rewrite-block (list-ref cfg i)
+                                             (vector-ref out-vec i))
+                              result))))))
+
+;;; ============================================================================
 ;;; Backend: instruction selection and linear-scan allocation
 ;;; The backend proceeds in three conceptual steps:
 ;;;
@@ -4959,11 +5388,16 @@
                    (cons procedure
                    (build-cfg (procedure-instructions procedure))))
                  procedures))
-                 (optimized-entry-cfg (optimize-unsafe-car-cdr-cfg entry-cfg))
+                 (optimized-entry-cfg
+                   (eliminate-dead-writes-cfg
+                     (constant-fold-cfg
+                       (optimize-unsafe-car-cdr-cfg entry-cfg))))
                  (optimized-procedure-cfgs
             (map (lambda (procedure+cfg)
                    (cons (car procedure+cfg)
-                   (optimize-unsafe-car-cdr-cfg (cdr procedure+cfg))))
+                   (eliminate-dead-writes-cfg
+                     (constant-fold-cfg
+                       (optimize-unsafe-car-cdr-cfg (cdr procedure+cfg))))))
                  procedure-cfgs)))
             (values lowered-program
               global-count

@@ -156,6 +156,8 @@ runtime_cases=(
   "test50|9"
   "test51|6"
   "test52|6"
+  "test53|9"
+  "test54|5"
 )
 
 for case in "${runtime_cases[@]}"; do
@@ -182,6 +184,11 @@ assert_asm_not_contains "test52" '_hop_cdr' 'all cdr operations in A are proven 
 assert_asm_contains "test5" '\bx(19|20|21|22|23|24|25|26|27|28)\b' 'callee-saved register allocation'
 assert_asm_not_contains "test16" '\bx23\b' 'uncoalesced temporary register in recursive loop'
 assert_asm_not_contains "test5" 'str x9, \[sp, #(24|32|40)\]' 'eager root shadow writes without safepoints'
+
+# constant folding: x*x with x=3 must collapse to an immediate load, no multiply
+assert_asm_not_contains "test53" '\bmul\b' 'constant-folded multiplication eliminated'
+# dead write elimination: the unused (+ x 1) in the lambda must not emit an add
+assert_asm_not_contains "test54" '\badd x[0-9]+, x[0-9]+, x[0-9]+\b' 'dead-write add instruction eliminated'
 
 assert_file_output \
   "file-test1" \

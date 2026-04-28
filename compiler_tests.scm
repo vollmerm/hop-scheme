@@ -467,6 +467,21 @@
                  (app A (cons (car item) ()) acc))))
      (app outer 3 0)))
 
+;; test53: constant folding — let-bound constant, foldable primop application.
+;; `(let ((x 3)) (* x x))` → after folding, the multiplication becomes the
+;; literal 9 and the assignment to x becomes dead.  Assembly must not contain
+;; a mul instruction.
+(define test53
+  '(let ((x 3))
+     (primop * x x)))
+
+;; test54: dead write elimination — pure computation whose result is unused.
+;; The `dead` binding computes `(+ x 1)` but x is immediately returned;
+;; dead write elimination removes the add because `dead` is never live.
+(define test54
+  '(let ((f (lambda (x) (let ((dead (primop + x 1))) x))))
+     (app f 5)))
+
 (define sample-tests
   (list (cons "Test 1: Simple arithmetic" test1)
         (cons "Test 2: Lambda application" test2)
@@ -518,7 +533,9 @@
         (cons "Test 49: pair?-guarded car rewrite" test49)
         (cons "Test 50: conservative join keeps safe car" test50)
         (cons "Test 51: internal-only step enables back-edge unsafe-car" test51)
-        (cons "Test 52: three-way mutual recursion requires two analysis iterations" test52)))
+        (cons "Test 52: three-way mutual recursion requires two analysis iterations" test52)
+        (cons "Test 53: constant folding eliminates mul" test53)
+        (cons "Test 54: dead write elimination removes unused add" test54)))
 
 (define named-tests
   ;; These are runnable end-to-end regression cases. test6 and test7 stay as
@@ -571,7 +588,9 @@
           (cons 'test49 test49)
           (cons 'test50 test50)
           (cons 'test51 test51)
-          (cons 'test52 test52)))
+          (cons 'test52 test52)
+          (cons 'test53 test53)
+          (cons 'test54 test54)))
 
 (define (lookup-named-test name)
   (let ((binding (assoc name named-tests)))
