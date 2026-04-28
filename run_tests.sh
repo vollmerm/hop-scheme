@@ -154,6 +154,8 @@ runtime_cases=(
   "test48|11"
   "test49|6"
   "test50|9"
+  "test51|6"
+  "test52|6"
 )
 
 for case in "${runtime_cases[@]}"; do
@@ -173,6 +175,10 @@ assert_asm_contains "test33" '_hop_(tail_)?call_[0-9]+' 'polymorphic captured cl
 assert_asm_not_contains "test48" '_hop_car' 'safe car helper for direct pair allocation'
 assert_asm_not_contains "test49" '_hop_car' 'safe car helper for pair?-guarded then branch'
 assert_asm_contains "test50" '_hop_car' 'safe car helper for conservative join'
+assert_asm_not_contains "test51" '_hop_car' 'safe car after back-edge pair propagation via internal-only step'
+assert_asm_not_contains "test51" '_hop_cdr' 'safe cdr after back-edge pair propagation via internal-only step'
+assert_asm_contains "test52" '_hop_car' "B's car is conservatively preserved (only A's car is proven safe)"
+assert_asm_not_contains "test52" '_hop_cdr' 'all cdr operations in A are proven safe after two iterations'
 assert_asm_contains "test5" '\bx(19|20|21|22|23|24|25|26|27|28)\b' 'callee-saved register allocation'
 assert_asm_not_contains "test16" '\bx23\b' 'uncoalesced temporary register in recursive loop'
 assert_asm_not_contains "test5" 'str x9, \[sp, #(24|32|40)\]' 'eager root shadow writes without safepoints'

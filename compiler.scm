@@ -2346,6 +2346,18 @@
                (loop (cdr rest) (append members (list member)))
                (finish members rest)))))))
 
+  ;; Collect all names n such that (local n) appears anywhere in the expression tree.
+  (define (local-refs-in-expr expr)
+    (cond
+      ((not (pair? expr)) '())
+      ((and (eq? (car expr) 'local)
+            (pair? (cdr expr))
+            (null? (cddr expr))
+            (symbol? (cadr expr)))
+       (list (cadr expr)))
+      (else
+       (append-map local-refs-in-expr expr))))
+
   (define (build-dispatch-instructions entry-tag dispatch-label member-labels)
     (let loop ((rest member-labels)
                (index 0)
@@ -2389,6 +2401,27 @@
               (capture-value-exprs (map cadr capture-specs)))
         (let-values (((capture-instrs capture-vars capture-procedures)
                       (convert-list capture-value-exprs)))
+          ;; Determine which members are "external": their box-var appears in
+          ;; remaining-exprs as a (local name) reference, meaning they are called
+          ;; from outside the cluster.  Internal-only members skip closure
+          ;; allocation and the dispatch; they are reachable only via a
+          ;; group-tail-call goto from other members.
+          (let* ((all-local-refs (append-map local-refs-in-expr remaining-exprs))
+                 (box-vars (map car members))
+                 (external-box-names (filter (lambda (n) (memq n box-vars)) all-local-refs))
+                 (is-external?
+                  ;; If no (local name) refs are found, fall back to treating all as external.
+                  (if (null? external-box-names)
+                      (lambda (m) #t)
+                      (lambda (m) (memq (car m) external-box-names))))
+                 (dispatch-member-labels
+                  (let loop ((ms members) (ls member-labels) (result '()))
+                    (if (null? ms)
+                        (reverse result)
+                        (loop (cdr ms) (cdr ls)
+                              (if (is-external? (car ms))
+                                  (cons (car ls) result)
+                                  result))))))
           ;; A tail-recursive cluster becomes one procedure with an entry tag.
           ;; Entering the cluster chooses a member label; jumping between
           ;; members becomes a plain goto after rewriting the shared parameters.
@@ -2396,19 +2429,22 @@
                  (let loop ((rest members) (index 0) (instrs capture-instrs))
                    (if (null? rest)
                        instrs
-                       (let ((closure-temp (fresh-temp))
-                             (box-name (car (car rest))))
-                         (loop (cdr rest)
-                               (+ index 1)
-                               (append instrs
-                                       (list `(assign ,closure-temp
-                                                      (make-closure ,cluster-proc ,index ,@capture-vars))
-                                             `(set-box! ,box-name ,closure-temp)))))))))
+                       (let ((box-name (car (car rest))))
+                         (if (is-external? (car rest))
+                             (let ((closure-temp (fresh-temp)))
+                               (loop (cdr rest)
+                                     (+ index 1)
+                                     (append instrs
+                                             (list `(assign ,closure-temp
+                                                            (make-closure ,cluster-proc ,index ,@capture-vars))
+                                                   `(set-box! ,box-name ,closure-temp)))))
+                             ;; Internal-only member: no closure allocation, no dispatch entry.
+                             (loop (cdr rest) index instrs)))))))
             (let loop ((rest members)
                        (labels member-labels)
                        (instrs (build-dispatch-instructions entry-tag
                                                            dispatch-label
-                                                           member-labels))
+                                                           dispatch-member-labels))
                        (procedures capture-procedures))
               (if (null? rest)
                   (values init-instrs
@@ -2438,7 +2474,7 @@
                                          params
                                          shared-params)
                                     body-instrs)
-                            (append procedures body-procedures))))))))))
+                            (append procedures body-procedures)))))))))))
     (let ((explicit (and (pair? exprs) (match-group-closures (car exprs)))))
       (if explicit
           (lower-cluster (car explicit) (cadr explicit) (cdr exprs))

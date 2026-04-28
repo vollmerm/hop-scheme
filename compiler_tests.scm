@@ -427,6 +427,46 @@
                 0)))
      (car x)))
 
+;; Mutually recursive sum/step: step is internal-only (not referenced in the
+;; letrec body), so its entry block has no dispatch predecessor.  Pair-facts
+;; from sum's pair?-guarded then-branch propagate across the back-edge into
+;; step's entry block, enabling unsafe-car and unsafe-cdr in step's body.
+(define test51
+  '(letrec ((sum (lambda (xs acc)
+                   (if (pair? xs)
+                       (app step xs acc)
+                       acc)))
+            (step (lambda (xs acc)
+                    (app sum (cdr xs) (primop + acc (car xs))))))
+     (app sum (cons 1 (cons 2 (cons 3 ()))) 0)))
+
+;; Three-way mutual recursion (outer/A/B): outer is the only external member.
+;; A and B are internal-only, so their entry blocks have no dispatch predecessor.
+;; entry.A has TWO predecessors: outer's work block (which allocates a fresh cons
+;; for the shared param) and entry.B (which also allocates a fresh cons).  In
+;; iteration 1 entry.B has not been processed when entry.A is first visited, so
+;; in[entry.A] = {} and car/cdr are left safe.  In iteration 2 both predecessors
+;; carry pair evidence for the shared first param, giving in[entry.A] = {t4} and
+;; enabling unsafe-car and unsafe-cdr in A.  B's own car is deliberately NOT
+;; rewritten: the value B receives for item is the cdr of A's item, which is
+;; known to be a pair only by the pair? edge-refinement (stored in a different
+;; temp), so no pair evidence propagates into B's item param.
+(define test52
+  '(letrec ((outer (lambda (n acc)
+                     (if (primop = n 0)
+                         acc
+                         (app A (cons n (cons (primop - n 1) ())) acc))))
+            (A (lambda (item acc)
+                 (let ((val (car item)))
+                   (if (primop = val 0)
+                       acc
+                       (if (pair? (cdr item))
+                           (app B (cdr item) (primop + acc val))
+                           (app outer (primop - val 1) (primop + acc val)))))))
+            (B (lambda (item acc)
+                 (app A (cons (car item) ()) acc))))
+     (app outer 3 0)))
+
 (define sample-tests
   (list (cons "Test 1: Simple arithmetic" test1)
         (cons "Test 2: Lambda application" test2)
@@ -476,7 +516,9 @@
         (cons "Test 47: car as first-class value" test47)
         (cons "Test 48: direct car rewrite to unsafe-car" test48)
         (cons "Test 49: pair?-guarded car rewrite" test49)
-        (cons "Test 50: conservative join keeps safe car" test50)))
+        (cons "Test 50: conservative join keeps safe car" test50)
+        (cons "Test 51: internal-only step enables back-edge unsafe-car" test51)
+        (cons "Test 52: three-way mutual recursion requires two analysis iterations" test52)))
 
 (define named-tests
   ;; These are runnable end-to-end regression cases. test6 and test7 stay as
@@ -527,7 +569,9 @@
           (cons 'test47 test47)
           (cons 'test48 test48)
           (cons 'test49 test49)
-          (cons 'test50 test50)))
+          (cons 'test50 test50)
+          (cons 'test51 test51)
+          (cons 'test52 test52)))
 
 (define (lookup-named-test name)
   (let ((binding (assoc name named-tests)))
