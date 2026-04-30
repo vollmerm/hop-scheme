@@ -343,6 +343,45 @@ hop_value hop_cdr(hop_value pair_value) {
     return pair[2];
 }
 
+hop_value hop_safe_add(hop_value a, hop_value b) {
+    if (!hop_is_fixnum(a) || !hop_is_fixnum(b))
+        hop_panic("safe-+: expected fixnums");
+    return a + b;
+}
+
+hop_value hop_safe_sub(hop_value a, hop_value b) {
+    if (!hop_is_fixnum(a) || !hop_is_fixnum(b))
+        hop_panic("safe--: expected fixnums");
+    return a - b;
+}
+
+hop_value hop_safe_mul(hop_value a, hop_value b) {
+    if (!hop_is_fixnum(a) || !hop_is_fixnum(b))
+        hop_panic("safe-*: expected fixnums");
+    /* Both values are shifted left by HOP_FIXNUM_SHIFT. Multiplying them
+       produces a result shifted by 2*shift, so we undo one shift to restore
+       the correct fixnum encoding: result = val_a * val_b << shift. */
+    return (a >> HOP_FIXNUM_SHIFT) * b;
+}
+
+hop_value hop_safe_eq(hop_value a, hop_value b) {
+    if (!hop_is_fixnum(a) || !hop_is_fixnum(b))
+        hop_panic("safe-=: expected fixnums");
+    return (a == b) ? HOP_TRUE : HOP_FALSE;
+}
+
+hop_value hop_safe_lt(hop_value a, hop_value b) {
+    if (!hop_is_fixnum(a) || !hop_is_fixnum(b))
+        hop_panic("safe-<: expected fixnums");
+    return (a < b) ? HOP_TRUE : HOP_FALSE;
+}
+
+hop_value hop_safe_gt(hop_value a, hop_value b) {
+    if (!hop_is_fixnum(a) || !hop_is_fixnum(b))
+        hop_panic("safe->: expected fixnums");
+    return (a > b) ? HOP_TRUE : HOP_FALSE;
+}
+
 static hop_value *hop_alloc_closure_raw(void *code, int64_t env_count) {
     hop_value *closure = hop_alloc_words(2 + (size_t)env_count, NULL, 0);
     closure[0] = (hop_value)hop_make_header(HOP_OBJ_CLOSURE, (hop_word)env_count);

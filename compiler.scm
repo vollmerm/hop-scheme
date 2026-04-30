@@ -253,6 +253,9 @@
        ((cons)
         `(cons ,(resolve-globals (cadr expr) local-env global-env)
                ,(resolve-globals (caddr expr) local-env global-env)))
+       ((+ - * = < >)
+        `(,(car expr) ,(resolve-globals (cadr expr) local-env global-env)
+                      ,(resolve-globals (caddr expr) local-env global-env)))
        ((box unbox car cdr pair? null?)
         `(,(car expr) ,(resolve-globals (cadr expr) local-env global-env)))
        ((set-box!)
@@ -386,6 +389,10 @@
           ((cons)
            `(cons ,(uniquify-expr (cadr expr) env)
                   ,(uniquify-expr (caddr expr) env)))
+
+          ((+ - * = < >)
+           `(,(car expr) ,(uniquify-expr (cadr expr) env)
+                         ,(uniquify-expr (caddr expr) env)))
           
           ((box unbox car cdr pair? null?)
            `(,(car expr) ,(uniquify-expr (cadr expr) env)))
@@ -435,13 +442,30 @@
     (unsafe-cdr . 1)
     (pair? . 1)
     (null? . 1)
-    (cons . 2)))
+    (cons . 2)
+    (+ . 2)
+    (- . 2)
+    (* . 2)
+    (= . 2)
+    (< . 2)
+    (> . 2)))
 
 (define (builtin-primop? name)
   (assq name builtin-primop-arities))
 
 (define (builtin-primop-arity name)
   (cdr (assq name builtin-primop-arities)))
+
+;; Source-level arithmetic operators canonicalize to safe-checked primop forms.
+;; The safe-OP runtime helpers verify that both operands are fixnums before
+;; performing the operation, mirroring how (car x) → (primop car x) → possibly
+;; (primop unsafe-car x) after the pair analysis proves x is definitely a pair.
+(define builtin-safe-arith-rename
+  '((+ . safe-+) (- . safe--) (* . safe-*) (= . safe-=) (< . safe-<) (> . safe->)))
+
+(define (builtin-primop-canonical-name name)
+  (let ((entry (assq name builtin-safe-arith-rename)))
+    (if entry (cdr entry) name)))
 
 (define (canonicalize-builtins expr)
   (define wrap-counter 0)
@@ -452,7 +476,7 @@
     (let loop ((i 0) (params '()))
       (if (= i arity)
           (let ((ps (reverse params)))
-            `(lambda ,ps (primop ,name ,@ps)))
+            `(lambda ,ps (primop ,(builtin-primop-canonical-name name) ,@ps)))
           (loop (+ i 1) (cons (fresh-wrap-name) params)))))
   (define (canon expr)
     (cond
@@ -464,7 +488,7 @@
       ((pair? expr)
        (let ((entry (and (symbol? (car expr)) (builtin-primop? (car expr)))))
          (if entry
-             `(primop ,(car expr) ,@(map canon (cdr expr)))
+             `(primop ,(builtin-primop-canonical-name (car expr)) ,@(map canon (cdr expr)))
              (case (car expr)
                ((begin)    `(begin ,@(map canon (cdr expr))))
                ((primop)   `(primop ,(cadr expr) ,@(map canon (cddr expr))))
@@ -3249,6 +3273,190 @@
                             result)))))
 
 ;;; ============================================================================
+;;; Pass 5.5b: Fixnum Must-Analysis on CFG
+;;; Forward must-analysis that tracks which variables are definitely fixnums on
+;;; every incoming path.  Where both operands of a safe-checked arithmetic
+;;; primop (safe-+, safe--, etc.) are proven fixnums, the instruction is
+;;; rewritten to the unchecked variant (+, -, etc.), eliminating the runtime
+;;; type-check call.  This mirrors the definitely-pair analysis in Pass 5.5.
+;;;
+;;; Facts tracked:
+;;;   definitely-fixnum(var): var holds a fixnum on every incoming path.
+;;;
+;;; Transfer rules:
+;;;   assign v = literal    →  add v
+;;;   assign v = copy of u where u ∈ fixnum  →  add v
+;;;   assign v = (primop OP …) where OP ∈ {+ - * safe-+ safe-- safe-*}  →  add v
+;;;   anything else assigning v  →  remove v
+;;;   non-assign  →  no change
+;;; Join: intersection (must semantics).
+;;; ============================================================================
+
+(define (optimize-unsafe-arith-cfg cfg)
+  (define block-count (length cfg))
+
+  (define (set-add set var)
+    (if (memq var set) set (cons var set)))
+
+  (define (set-remove set var)
+    (let loop ((rest set) (result '()))
+      (cond
+        ((null? rest) (reverse result))
+        ((eq? (car rest) var) (loop (cdr rest) result))
+        (else (loop (cdr rest) (cons (car rest) result))))))
+
+  (define (set-intersection xs ys)
+    (let loop ((rest xs) (result '()))
+      (if (null? rest)
+          (reverse result)
+          (loop (cdr rest)
+                (if (memq (car rest) ys)
+                    (cons (car rest) result)
+                    result)))))
+
+  (define (set-equal? xs ys)
+    (and (null? (set-difference xs ys))
+         (null? (set-difference ys xs))))
+
+  (define (vector-set-set-equal?! vec index new-set)
+    (let ((old-set (vector-ref vec index)))
+      (if (set-equal? old-set new-set)
+          #f
+          (begin
+            (vector-set! vec index new-set)
+            #t))))
+
+  ;; Arithmetic primops whose result is always a fixnum (when they return).
+  ;; Comparison ops (= < >) return booleans, not fixnums.
+  (define (arith-result-op? op)
+    (memq op '(+ - * safe-+ safe-- safe-*)))
+
+  (define (transfer-instruction facts instr)
+    (if (not (and (pair? instr) (eq? (car instr) 'assign)))
+        facts
+        (let ((dst (cadr instr))
+              (rhs (caddr instr)))
+          (cond
+            ((number? rhs)
+             (set-add facts dst))
+            ((symbol? rhs)
+             (if (memq rhs facts)
+                 (set-add facts dst)
+                 (set-remove facts dst)))
+            ((and (pair? rhs)
+                  (eq? (car rhs) 'primop)
+                  (arith-result-op? (cadr rhs)))
+             (set-add facts dst))
+            (else
+             (set-remove facts dst))))))
+
+  (define (transfer-block in-facts block)
+    (let loop ((rest (basic-block-instructions block))
+               (facts in-facts))
+      (if (null? rest)
+          facts
+          (loop (cdr rest) (transfer-instruction facts (car rest))))))
+
+  (define predecessors (make-vector block-count '()))
+  (let loop-preds ((i 0))
+    (if (= i block-count)
+        'done
+        (begin
+          (for-each
+           (lambda (succ)
+             (vector-set! predecessors
+                          succ
+                          (cons i (vector-ref predecessors succ))))
+           (basic-block-successors (list-ref cfg i)))
+          (loop-preds (+ i 1)))))
+
+  (define in-facts (make-vector block-count '()))
+  (define out-facts (make-vector block-count '()))
+
+  (let fixed-point ((changed #t))
+    (if (not changed)
+        'done
+        (let ((any-changed #f))
+          (let loop-blocks ((i 0))
+            (if (= i block-count)
+                (fixed-point any-changed)
+                (let* ((block (list-ref cfg i))
+                       (preds (vector-ref predecessors i))
+                       (new-in
+                        (if (= i 0)
+                            '()
+                            (if (null? preds)
+                                '()
+                                (let ((first-set (vector-ref out-facts (car preds))))
+                                  (let loop-merge ((rest (cdr preds)) (acc first-set))
+                                    (if (null? rest)
+                                        acc
+                                        (loop-merge
+                                         (cdr rest)
+                                         (set-intersection
+                                          acc
+                                          (vector-ref out-facts (car rest))))))))))
+                       (new-out (transfer-block new-in block)))
+                  (when (vector-set-set-equal?! in-facts i new-in)
+                    (set! any-changed #t))
+                  (when (vector-set-set-equal?! out-facts i new-out)
+                    (set! any-changed #t))
+                  (loop-blocks (+ i 1))))))))
+
+  (define (safe->unsafe op)
+    (case op
+      ((safe-+) '+)
+      ((safe--) '-)
+      ((safe-*) '*)
+      ((safe-=) '=)
+      ((safe-<) '<)
+      ((safe->) '>)
+      (else #f)))
+
+  (define (fixnum-operand? v facts)
+    (or (number? v) (and (symbol? v) (memq v facts))))
+
+  (define (rewrite-block block initial-facts)
+    (let loop ((rest (basic-block-instructions block))
+               (facts initial-facts)
+               (result '()))
+      (if (null? rest)
+          (let ((rewritten (make-basic-block (basic-block-label block)
+                                             (reverse result))))
+            (set-basic-block-successors! rewritten (basic-block-successors block))
+            rewritten)
+          (let* ((instr (car rest))
+                 (rewritten-instr
+                  (if (and (pair? instr)
+                           (eq? (car instr) 'assign)
+                           (pair? (caddr instr))
+                           (eq? (car (caddr instr)) 'primop)
+                           (safe->unsafe (cadr (caddr instr))))
+                      (let* ((dst (cadr instr))
+                             (rhs (caddr instr))
+                             (op (cadr rhs))
+                             (a (caddr rhs))
+                             (b (cadddr rhs))
+                             (unsafe-op (safe->unsafe op)))
+                        (if (and (fixnum-operand? a facts)
+                                 (fixnum-operand? b facts))
+                            `(assign ,dst (primop ,unsafe-op ,a ,b))
+                            instr))
+                      instr))
+                 (next-facts (transfer-instruction facts rewritten-instr)))
+            (loop (cdr rest)
+                  next-facts
+                  (cons rewritten-instr result))))))
+
+  (let rewrite-loop ((i 0) (result '()))
+    (if (= i block-count)
+        (reverse result)
+        (rewrite-loop (+ i 1)
+                      (cons (rewrite-block (list-ref cfg i)
+                                           (vector-ref in-facts i))
+                            result)))))
+
+;;; ============================================================================
 ;;; Pass 5.6: Constant Folding on CFG
 ;;; Runs a forward must-analysis to discover variables whose value is
 ;;; unconditionally a known compile-time constant (a literal: number, boolean,
@@ -3832,6 +4040,8 @@
          ((pair?) (list `(is-pair   ,dst ,(caddr rhs))))
          ((null?) (list `(is-null   ,dst ,(caddr rhs))))
          ((cons) (list `(alloc-pair ,dst ,(caddr rhs) ,(cadddr rhs))))
+         ((safe-+ safe-- safe-* safe-= safe-< safe->)
+          (list `(safe-binop ,(cadr rhs) ,dst ,(caddr rhs) ,(cadddr rhs))))
          (else   (list `(binop ,(cadr rhs) ,dst ,@(cddr rhs))))))
       ((and (pair? rhs) (eq? (car rhs) 'cons))
        (error "cons in instruction selection: should have been canonicalized" rhs))
@@ -3925,7 +4135,7 @@
   (case (car instr)
     ((move-in) '())
     ((move) (if (symbol? (caddr instr)) (list (caddr instr)) '()))
-    ((binop)
+    ((binop safe-binop)
      (append (if (symbol? (cadddr instr)) (list (cadddr instr)) '())
              (if (symbol? (car (cddddr instr))) (list (car (cddddr instr))) '())))
     ((alloc-box load-box load-car load-cdr is-pair is-null load-closure-env)
@@ -3998,7 +4208,7 @@
             unsafe-load-car unsafe-load-cdr is-pair is-null
             load-closure-env load-global alloc-closure call call-known)
       (list (cadr instr)))
-    ((binop)
+    ((binop safe-binop)
       (list (caddr instr)))
     ((store-box store-global branch-if jump ret tail-call tail-call-known) '())
     (else (error "Unknown machine instruction in def analysis" instr))))
@@ -4352,6 +4562,11 @@
              ,(lookup-home homes (caddr instr))
              ,(lookup-home homes (cadddr instr))
              ,(lookup-home homes (car (cddddr instr)))))
+    ((safe-binop)
+     `(safe-binop ,(cadr instr)
+                  ,(lookup-home homes (caddr instr))
+                  ,(lookup-home homes (cadddr instr))
+                  ,(lookup-home homes (car (cddddr instr)))))
     ((alloc-box)
      `(alloc-box ,(lookup-home homes (cadr instr))
                  ,(lookup-home homes (caddr instr))))
@@ -4977,6 +5192,21 @@
   (emit-asm-line port (string-append "    bl " helper))
   (emit-store-operand port "x0" dst proc))
 
+(define (emit-safe-binop port op dst a b proc)
+  ;; Safe arithmetic helpers are NOT GC safepoints (they don't allocate), so
+  ;; live values in callee-saved registers survive the call unchanged.
+  (emit-load-operand port "x0" a proc)
+  (emit-load-operand port "x1" b proc)
+  (case op
+    ((safe-+) (emit-asm-line port "    bl _hop_safe_add"))
+    ((safe--) (emit-asm-line port "    bl _hop_safe_sub"))
+    ((safe-*) (emit-asm-line port "    bl _hop_safe_mul"))
+    ((safe-=) (emit-asm-line port "    bl _hop_safe_eq"))
+    ((safe-<) (emit-asm-line port "    bl _hop_safe_lt"))
+    ((safe->) (emit-asm-line port "    bl _hop_safe_gt"))
+    (else (error "Unknown safe binop op" op)))
+  (emit-store-operand port "x0" dst proc))
+
 (define (emit-runtime-global-read port dst slot proc)
   (emit-asm-line port
                  (string-append "    mov x0, #"
@@ -5165,6 +5395,13 @@
                  (cadddr instr)
                  (car (cddddr instr))
                  proc))
+    ((safe-binop)
+     (emit-safe-binop port
+                      (cadr instr)
+                      (caddr instr)
+                      (cadddr instr)
+                      (car (cddddr instr))
+                      proc))
     ((alloc-box)
       (emit-runtime-unary-call port "_hop_alloc_box" (cadr instr) (caddr instr) proc))
     ((alloc-pair)
@@ -5391,13 +5628,15 @@
                  (optimized-entry-cfg
                    (eliminate-dead-writes-cfg
                      (constant-fold-cfg
-                       (optimize-unsafe-car-cdr-cfg entry-cfg))))
+                       (optimize-unsafe-arith-cfg
+                         (optimize-unsafe-car-cdr-cfg entry-cfg)))))
                  (optimized-procedure-cfgs
             (map (lambda (procedure+cfg)
                    (cons (car procedure+cfg)
                    (eliminate-dead-writes-cfg
                      (constant-fold-cfg
-                       (optimize-unsafe-car-cdr-cfg (cdr procedure+cfg))))))
+                       (optimize-unsafe-arith-cfg
+                         (optimize-unsafe-car-cdr-cfg (cdr procedure+cfg)))))))
                  procedure-cfgs)))
             (values lowered-program
               global-count

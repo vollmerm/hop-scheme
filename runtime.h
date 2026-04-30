@@ -106,4 +106,11 @@ hop_value hop_tail_call_8(hop_value arg0, hop_value arg1, hop_value arg2, hop_va
 hop_value hop_global_ref(uint64_t index);
 hop_value hop_global_set(uint64_t index, hop_value value);
 
+hop_value hop_safe_add(hop_value a, hop_value b);
+hop_value hop_safe_sub(hop_value a, hop_value b);
+hop_value hop_safe_mul(hop_value a, hop_value b);
+hop_value hop_safe_eq (hop_value a, hop_value b);
+hop_value hop_safe_lt (hop_value a, hop_value b);
+hop_value hop_safe_gt (hop_value a, hop_value b);
+
 #endif

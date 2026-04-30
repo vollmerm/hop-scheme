@@ -158,6 +158,10 @@ runtime_cases=(
   "test52|6"
   "test53|9"
   "test54|5"
+  "test55|7"
+  "test56|7"
+  "test57|3"
+  "test58|8"
 )
 
 for case in "${runtime_cases[@]}"; do
@@ -189,6 +193,14 @@ assert_asm_not_contains "test5" 'str x9, \[sp, #(24|32|40)\]' 'eager root shadow
 assert_asm_not_contains "test53" '\bmul\b' 'constant-folded multiplication eliminated'
 # dead write elimination: the unused (+ x 1) in the lambda must not emit an add
 assert_asm_not_contains "test54" '\badd x[0-9]+, x[0-9]+, x[0-9]+\b' 'dead-write add instruction eliminated'
+
+# safe arithmetic: literal-operand cases are optimized away entirely
+assert_asm_not_contains "test55" '_hop_safe_add' 'safe-+ of literals optimized to inline add'
+assert_asm_not_contains "test56" '_hop_safe_add' 'safe-+ with let-bound literal optimized'
+# car result is not proven fixnum, so the runtime check must remain
+assert_asm_contains "test57" '_hop_safe_add' 'safe-+ preserved when operand is car result'
+# result of safe arith is proven fixnum, so outer safe-+ is also optimized
+assert_asm_not_contains "test58" '_hop_safe_add' 'safe-+ of safe-arith result optimized'
 
 assert_file_output \
   "file-test1" \

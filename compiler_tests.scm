@@ -482,6 +482,30 @@
   '(let ((f (lambda (x) (let ((dead (primop + x 1))) x))))
      (app f 5)))
 
+;; test55: safe addition of two literals — the fixnum analysis proves both
+;; operands are fixnums and rewrites to unchecked +; constant folding then
+;; reduces the entire expression to 7.
+(define test55
+  '(+ 3 4))
+
+;; test56: safe addition with a let-bound literal — the fixnum analysis
+;; propagates the literal's fixnum status through the copy and rewrites the
+;; safe-+ to +; constant folding subsequently collapses it to 7.
+(define test56
+  '(let ((x 3)) (+ x 4)))
+
+;; test57: safe addition where one operand is a car result — car is not proven
+;; fixnum by the analysis (it could return any tagged value), so the safe-+
+;; call is preserved and emits a runtime type-checking helper.
+(define test57
+  '(let ((xs (cons 1 ()))) (+ (car xs) 2)))
+
+;; test58: safe addition of the result of a previous safe addition — the
+;; fixnum analysis recognises that any arithmetic result is fixnum, so the
+;; outer safe-+ is also rewritten; constant folding removes both operations.
+(define test58
+  '(let ((x (+ 3 4))) (+ x 1)))
+
 (define sample-tests
   (list (cons "Test 1: Simple arithmetic" test1)
         (cons "Test 2: Lambda application" test2)
@@ -535,7 +559,11 @@
         (cons "Test 51: internal-only step enables back-edge unsafe-car" test51)
         (cons "Test 52: three-way mutual recursion requires two analysis iterations" test52)
         (cons "Test 53: constant folding eliminates mul" test53)
-        (cons "Test 54: dead write elimination removes unused add" test54)))
+        (cons "Test 54: dead write elimination removes unused add" test54)
+        (cons "Test 55: safe arithmetic optimized for literal fixnums" test55)
+        (cons "Test 56: safe arithmetic optimized via let-bound literal" test56)
+        (cons "Test 57: safe arithmetic preserved for car result" test57)
+        (cons "Test 58: safe arithmetic of safe arithmetic result optimized" test58)))
 
 (define named-tests
   ;; These are runnable end-to-end regression cases. test6 and test7 stay as
@@ -590,7 +618,11 @@
           (cons 'test51 test51)
           (cons 'test52 test52)
           (cons 'test53 test53)
-          (cons 'test54 test54)))
+          (cons 'test54 test54)
+          (cons 'test55 test55)
+          (cons 'test56 test56)
+          (cons 'test57 test57)
+          (cons 'test58 test58)))
 
 (define (lookup-named-test name)
   (let ((binding (assoc name named-tests)))
