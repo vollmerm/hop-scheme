@@ -3070,391 +3070,215 @@
      (find-successors blocks)))
 
 ;;; ============================================================================
-;;; Pass 5.5: Pair-Proven Unsafe car/cdr Rewrite
-;;; Runs on CFG TAC and rewrites `(primop car x)` / `(primop cdr x)` into
-;;; `(primop unsafe-car x)` / `(primop unsafe-cdr x)` when a forward must
-;;; analysis proves `x` is definitely a pair at that program point.
+;;; Shared infrastructure for Passes 5.5 and 5.5b: Forward Must-Analysis
 ;;;
-;;; Facts tracked:
-;;;   - definitely-pair(var): var must contain a pair on all incoming paths.
+;;; A "must set" is an unordered list of variable symbols representing facts
+;;; that hold on EVERY path to the current point (intersection join).
 ;;;
-;;; Conservative rules:
-;;;   - Source of certainty:
-;;;       * `(assign v (primop cons ...))`
-;;;       * then-edge of an `if` whose condition is immediately preceded by
-;;;         `(assign t (primop pair? x))` and branches on `t`.
-;;;       * simple move propagation `(assign v u)` when `u` is definitely pair.
-;;;   - No certainty gained from globals/boxes/unbox/set-global!/set-box!.
-;;;   - Join uses intersection (must semantics).
+;;; Generic driver: `rewrite-cfg-with-must-analysis`
+;;;   cfg           — list of basic-blocks
+;;;   transfer-instr — (facts instr) → facts': update the must-set after instr
+;;;   edge-facts     — (pred-block succ-index pred-out) → facts': optional
+;;;                    conditional refinement on a CFG edge (e.g. then-branch
+;;;                    of a type-test).  Pass the identity for no refinement.
+;;;   rewrite-instr  — (instr facts) → instr': rewrite one instruction using
+;;;                    the current must-set; return instr unchanged if no rewrite.
+;;;
+;;; Returns a new CFG list with rewrites applied.
 ;;; ============================================================================
 
-(define (optimize-unsafe-car-cdr-cfg cfg)
+(define (set-add set var) (if (memq var set) set (cons var set)))
+
+(define (set-remove set var)
+  (let loop ((rest set) (acc '()))
+    (cond ((null? rest)          (reverse acc))
+          ((eq? (car rest) var)  (loop (cdr rest) acc))
+          (else                  (loop (cdr rest) (cons (car rest) acc))))))
+
+(define (set-intersection xs ys)
+  (let loop ((rest xs) (acc '()))
+    (if (null? rest)
+        (reverse acc)
+        (loop (cdr rest) (if (memq (car rest) ys) (cons (car rest) acc) acc)))))
+
+(define (rewrite-cfg-with-must-analysis cfg transfer-instr edge-facts rewrite-instr)
   (define block-count (length cfg))
 
-  (define (set-add set var)
-    (if (memq var set) set (cons var set)))
-
-  (define (set-remove set var)
-    (let loop ((rest set) (result '()))
-      (cond
-        ((null? rest) (reverse result))
-        ((eq? (car rest) var)
-         (loop (cdr rest) result))
-        (else
-         (loop (cdr rest) (cons (car rest) result))))))
-
-  (define (set-intersection xs ys)
-    (let loop ((rest xs) (result '()))
-      (if (null? rest)
-          (reverse result)
-          (loop (cdr rest)
-                (if (memq (car rest) ys)
-                    (cons (car rest) result)
-                    result)))))
-
   (define (set-equal? xs ys)
-    (and (null? (set-difference xs ys))
-         (null? (set-difference ys xs))))
+    (and (null? (set-difference xs ys)) (null? (set-difference ys xs))))
 
-  (define (vector-set-set-equal?! vec index new-set)
-    (let ((old-set (vector-ref vec index)))
-      (if (set-equal? old-set new-set)
-          #f
-          (begin
-            (vector-set! vec index new-set)
-            #t))))
+  (define (transfer-block facts block)
+    (let loop ((rest (basic-block-instructions block)) (f facts))
+      (if (null? rest) f (loop (cdr rest) (transfer-instr f (car rest))))))
 
-  (define (transfer-instruction facts instr)
-    (if (and (pair? instr) (eq? (car instr) 'assign))
-        (let ((dst (cadr instr))
-              (rhs (caddr instr)))
-          (cond
-            ((and (pair? rhs)
-                  (eq? (car rhs) 'primop)
-                  (eq? (cadr rhs) 'cons))
-             (set-add facts dst))
-            ((symbol? rhs)
-             (if (memq rhs facts)
-                 (set-add facts dst)
-                 (set-remove facts dst)))
-            (else
-             (set-remove facts dst))))
-        facts))
-
-  (define (transfer-block in-facts block)
-    (let loop ((rest (basic-block-instructions block))
-               (facts in-facts))
-      (if (null? rest)
-          facts
-          (loop (cdr rest) (transfer-instruction facts (car rest))))))
-
-  (define (then-branch-pair-subject block)
-    ;; Recognize the common TAC pattern:
-    ;;   ...
-    ;;   (assign t (primop pair? x))
-    ;;   (if t Lthen Lelse)
-    ;; If found, return x for then-edge refinement; otherwise #f.
-    (let ((instrs (basic-block-instructions block)))
-      (if (< (length instrs) 2)
-          #f
-          (let* ((terminator (list-ref instrs (- (length instrs) 1)))
-                 (pre (list-ref instrs (- (length instrs) 2))))
-            (if (and (pair? terminator)
-                     (eq? (car terminator) 'if)
-                     (pair? pre)
-                     (eq? (car pre) 'assign)
-                     (eq? (cadr pre) (cadr terminator))
-                     (pair? (caddr pre))
-                     (eq? (car (caddr pre)) 'primop)
-                     (eq? (cadr (caddr pre)) 'pair?)
-                     (symbol? (caddr (caddr pre))))
-                (caddr (caddr pre))
-                #f)))))
-
-  (define (edge-facts pred-index succ-index pred-out)
-    (let* ((pred-block (list-ref cfg pred-index))
-           (successors (basic-block-successors pred-block))
-           (then-subject (then-branch-pair-subject pred-block)))
-      (if (and then-subject
-               (pair? successors)
-               (eqv? (car successors) succ-index))
-          (set-add pred-out then-subject)
-          pred-out)))
-
+  ;; Build predecessor map.
   (define predecessors (make-vector block-count '()))
-  (let loop-preds ((i 0))
-    (if (= i block-count)
-        'done
-        (begin
-          (for-each
-           (lambda (succ)
-             (vector-set! predecessors
-                          succ
-                          (cons i (vector-ref predecessors succ))))
-           (basic-block-successors (list-ref cfg i)))
-          (loop-preds (+ i 1)))))
+  (let loop ((i 0))
+    (when (< i block-count)
+      (for-each (lambda (succ)
+                  (vector-set! predecessors succ (cons i (vector-ref predecessors succ))))
+                (basic-block-successors (list-ref cfg i)))
+      (loop (+ i 1))))
 
-  (define in-facts (make-vector block-count '()))
+  ;; Forward fixed-point iteration (intersection join = must semantics).
+  (define in-facts  (make-vector block-count '()))
   (define out-facts (make-vector block-count '()))
 
   (let fixed-point ((changed #t))
-    (if (not changed)
-        'done
-        (let ((any-changed #f))
-          (let loop-blocks ((i 0))
-            (if (= i block-count)
-                (fixed-point any-changed)
-                (let* ((block (list-ref cfg i))
-                       (preds (vector-ref predecessors i))
-                       (new-in
-                        (if (= i 0)
-                            '()
-                            (if (null? preds)
+    (when changed
+      (let ((any-changed #f))
+        (let loop ((i 0))
+          (when (< i block-count)
+            (let* ((block   (list-ref cfg i))
+                   (preds   (vector-ref predecessors i))
+                   (new-in  (if (or (= i 0) (null? preds))
                                 '()
-                                (let ((first-set
-                                       (edge-facts (car preds)
-                                                   i
-                                                   (vector-ref out-facts (car preds)))))
-                                  (let loop-pred-merge ((rest (cdr preds))
-                                                        (acc first-set))
-                                    (if (null? rest)
-                                        acc
-                                        (loop-pred-merge
-                                         (cdr rest)
-                                         (set-intersection
-                                          acc
-                                          (edge-facts (car rest)
-                                                      i
-                                                      (vector-ref out-facts (car rest)))))))))))
-                       (new-out (transfer-block new-in block)))
-                  (when (vector-set-set-equal?! in-facts i new-in)
-                    (set! any-changed #t))
-                  (when (vector-set-set-equal?! out-facts i new-out)
-                    (set! any-changed #t))
-                  (loop-blocks (+ i 1))))))))
-
-  (define (rewrite-block block initial-facts)
-    (let loop ((rest (basic-block-instructions block))
-               (facts initial-facts)
-               (result '()))
-      (if (null? rest)
-          (let ((rewritten (make-basic-block (basic-block-label block)
-                                             (reverse result))))
-            (set-basic-block-successors! rewritten (basic-block-successors block))
-            rewritten)
-          (let* ((instr (car rest))
-                 (rewritten-instr
-                  (if (and (pair? instr)
-                           (eq? (car instr) 'assign)
-                           (pair? (caddr instr))
-                           (eq? (car (caddr instr)) 'primop)
-                           (memq (cadr (caddr instr)) '(car cdr))
-                           (symbol? (caddr (caddr instr)))
-                           (memq (caddr (caddr instr)) facts))
-                      (let* ((dst (cadr instr))
-                             (rhs (caddr instr))
-                             (op (cadr rhs))
-                             (arg (caddr rhs)))
-                        `(assign ,dst
-                                 (primop ,(if (eq? op 'car) 'unsafe-car 'unsafe-cdr)
-                                         ,arg)))
-                      instr))
-                 (next-facts (transfer-instruction facts rewritten-instr)))
-            (loop (cdr rest)
-                  next-facts
-                  (cons rewritten-instr result))))))
-
-  (let rewrite-loop ((i 0) (result '()))
-    (if (= i block-count)
-        (reverse result)
-        (rewrite-loop (+ i 1)
-                      (cons (rewrite-block (list-ref cfg i)
-                                           (vector-ref in-facts i))
-                            result)))))
-
-;;; ============================================================================
-;;; Pass 5.5b: Fixnum Must-Analysis on CFG
-;;; Forward must-analysis that tracks which variables are definitely fixnums on
-;;; every incoming path.  Where both operands of a safe-checked arithmetic
-;;; primop (safe-+, safe--, etc.) are proven fixnums, the instruction is
-;;; rewritten to the unchecked variant (+, -, etc.), eliminating the runtime
-;;; type-check call.  This mirrors the definitely-pair analysis in Pass 5.5.
-;;;
-;;; Facts tracked:
-;;;   definitely-fixnum(var): var holds a fixnum on every incoming path.
-;;;
-;;; Transfer rules:
-;;;   assign v = literal    →  add v
-;;;   assign v = copy of u where u ∈ fixnum  →  add v
-;;;   assign v = (primop OP …) where OP ∈ {+ - * safe-+ safe-- safe-*}  →  add v
-;;;   anything else assigning v  →  remove v
-;;;   non-assign  →  no change
-;;; Join: intersection (must semantics).
-;;; ============================================================================
-
-(define (optimize-unsafe-arith-cfg cfg)
-  (define block-count (length cfg))
-
-  (define (set-add set var)
-    (if (memq var set) set (cons var set)))
-
-  (define (set-remove set var)
-    (let loop ((rest set) (result '()))
-      (cond
-        ((null? rest) (reverse result))
-        ((eq? (car rest) var) (loop (cdr rest) result))
-        (else (loop (cdr rest) (cons (car rest) result))))))
-
-  (define (set-intersection xs ys)
-    (let loop ((rest xs) (result '()))
-      (if (null? rest)
-          (reverse result)
-          (loop (cdr rest)
-                (if (memq (car rest) ys)
-                    (cons (car rest) result)
-                    result)))))
-
-  (define (set-equal? xs ys)
-    (and (null? (set-difference xs ys))
-         (null? (set-difference ys xs))))
-
-  (define (vector-set-set-equal?! vec index new-set)
-    (let ((old-set (vector-ref vec index)))
-      (if (set-equal? old-set new-set)
-          #f
-          (begin
-            (vector-set! vec index new-set)
-            #t))))
-
-  ;; Arithmetic primops whose result is always a fixnum (when they return).
-  ;; Comparison ops (= < >) return booleans, not fixnums.
-  (define (arith-result-op? op)
-    (memq op '(+ - * safe-+ safe-- safe-*)))
-
-  (define (transfer-instruction facts instr)
-    (if (not (and (pair? instr) (eq? (car instr) 'assign)))
-        facts
-        (let ((dst (cadr instr))
-              (rhs (caddr instr)))
-          (cond
-            ((number? rhs)
-             (set-add facts dst))
-            ((symbol? rhs)
-             (if (memq rhs facts)
-                 (set-add facts dst)
-                 (set-remove facts dst)))
-            ((and (pair? rhs)
-                  (eq? (car rhs) 'primop)
-                  (arith-result-op? (cadr rhs)))
-             (set-add facts dst))
-            (else
-             (set-remove facts dst))))))
-
-  (define (transfer-block in-facts block)
-    (let loop ((rest (basic-block-instructions block))
-               (facts in-facts))
-      (if (null? rest)
-          facts
-          (loop (cdr rest) (transfer-instruction facts (car rest))))))
-
-  (define predecessors (make-vector block-count '()))
-  (let loop-preds ((i 0))
-    (if (= i block-count)
-        'done
-        (begin
-          (for-each
-           (lambda (succ)
-             (vector-set! predecessors
-                          succ
-                          (cons i (vector-ref predecessors succ))))
-           (basic-block-successors (list-ref cfg i)))
-          (loop-preds (+ i 1)))))
-
-  (define in-facts (make-vector block-count '()))
-  (define out-facts (make-vector block-count '()))
-
-  (let fixed-point ((changed #t))
-    (if (not changed)
-        'done
-        (let ((any-changed #f))
-          (let loop-blocks ((i 0))
-            (if (= i block-count)
-                (fixed-point any-changed)
-                (let* ((block (list-ref cfg i))
-                       (preds (vector-ref predecessors i))
-                       (new-in
-                        (if (= i 0)
-                            '()
-                            (if (null? preds)
-                                '()
-                                (let ((first-set (vector-ref out-facts (car preds))))
-                                  (let loop-merge ((rest (cdr preds)) (acc first-set))
+                                (let ((first (edge-facts (list-ref cfg (car preds)) i
+                                                         (vector-ref out-facts (car preds)))))
+                                  (let loop-merge ((rest (cdr preds)) (acc first))
                                     (if (null? rest)
                                         acc
                                         (loop-merge
                                          (cdr rest)
                                          (set-intersection
                                           acc
-                                          (vector-ref out-facts (car rest))))))))))
-                       (new-out (transfer-block new-in block)))
-                  (when (vector-set-set-equal?! in-facts i new-in)
-                    (set! any-changed #t))
-                  (when (vector-set-set-equal?! out-facts i new-out)
-                    (set! any-changed #t))
-                  (loop-blocks (+ i 1))))))))
+                                          (edge-facts (list-ref cfg (car rest)) i
+                                                      (vector-ref out-facts (car rest))))))))))
+                   (new-out (transfer-block new-in block)))
+              (unless (set-equal? (vector-ref in-facts i) new-in)
+                (vector-set! in-facts i new-in)
+                (set! any-changed #t))
+              (unless (set-equal? (vector-ref out-facts i) new-out)
+                (vector-set! out-facts i new-out)
+                (set! any-changed #t))
+              (loop (+ i 1)))))
+        (fixed-point any-changed))))
+
+  ;; Rewrite each block using its computed entry facts.
+  (let loop ((i 0) (result '()))
+    (if (= i block-count)
+        (reverse result)
+        (let* ((block (list-ref cfg i))
+               (rewritten-instrs
+                (let inner ((rest (basic-block-instructions block))
+                            (facts (vector-ref in-facts i))
+                            (acc '()))
+                  (if (null? rest)
+                      (reverse acc)
+                      (let* ((instr      (car rest))
+                             (new-instr  (rewrite-instr instr facts))
+                             (next-facts (transfer-instr facts new-instr)))
+                        (inner (cdr rest) next-facts (cons new-instr acc))))))
+               (new-block (make-basic-block (basic-block-label block) rewritten-instrs)))
+          (set-basic-block-successors! new-block (basic-block-successors block))
+          (loop (+ i 1) (cons new-block result))))))
+
+;;; ============================================================================
+;;; Pass 5.5: Pair Must-Analysis — unsafe car/cdr rewrite
+;;; Facts: definitely-pair(var) — var holds a pair on every incoming path.
+;;; Sources: (primop cons …), then-edge of (if (primop pair? x) …), copy of pair.
+;;; Join: intersection.  Rewrites (primop car/cdr x) → unsafe-car/cdr when proven.
+;;; ============================================================================
+
+(define (optimize-unsafe-car-cdr-cfg cfg)
+  (define (transfer-instr facts instr)
+    (if (not (and (pair? instr) (eq? (car instr) 'assign)))
+        facts
+        (let ((dst (cadr instr)) (rhs (caddr instr)))
+          (cond
+            ((and (pair? rhs) (eq? (car rhs) 'primop) (eq? (cadr rhs) 'cons))
+             (set-add facts dst))
+            ((symbol? rhs)
+             (if (memq rhs facts) (set-add facts dst) (set-remove facts dst)))
+            (else
+             (set-remove facts dst))))))
+
+  (define (pair-test-subject block)
+    ;; If block ends with  (assign t (primop pair? x)) / (if t …), return x.
+    (let ((instrs (basic-block-instructions block)))
+      (and (>= (length instrs) 2)
+           (let* ((term (list-ref instrs (- (length instrs) 1)))
+                  (pre  (list-ref instrs (- (length instrs) 2))))
+             (and (pair? term) (eq? (car term) 'if)
+                  (pair? pre)  (eq? (car pre)  'assign)
+                  (eq? (cadr pre) (cadr term))
+                  (pair? (caddr pre)) (eq? (car (caddr pre)) 'primop)
+                  (eq? (cadr (caddr pre)) 'pair?)
+                  (symbol? (caddr (caddr pre)))
+                  (caddr (caddr pre)))))))
+
+  (define (edge-facts pred-block succ-index pred-out)
+    (let ((successors   (basic-block-successors pred-block))
+          (then-subject (pair-test-subject pred-block)))
+      (if (and then-subject (pair? successors) (eqv? (car successors) succ-index))
+          (set-add pred-out then-subject)
+          pred-out)))
+
+  (define (rewrite-instr instr facts)
+    (if (and (pair? instr)         (eq? (car instr) 'assign)
+             (pair? (caddr instr)) (eq? (car (caddr instr)) 'primop)
+             (memq (cadr (caddr instr)) '(car cdr))
+             (symbol? (caddr (caddr instr)))
+             (memq (caddr (caddr instr)) facts))
+        (let* ((dst (cadr instr)) (rhs (caddr instr))
+               (op  (cadr rhs))  (arg (caddr rhs)))
+          `(assign ,dst (primop ,(if (eq? op 'car) 'unsafe-car 'unsafe-cdr) ,arg)))
+        instr))
+
+  (rewrite-cfg-with-must-analysis cfg transfer-instr edge-facts rewrite-instr))
+
+;;; ============================================================================
+;;; Pass 5.5b: Fixnum Must-Analysis — unsafe arithmetic rewrite
+;;; Facts: definitely-fixnum(var) — var holds a fixnum on every incoming path.
+;;; Sources: numeric literals, arithmetic primops (+/-/* and safe variants), copy.
+;;; Comparison ops (= < >) yield booleans, not fixnums — excluded from sources.
+;;; Join: intersection.  Rewrites (primop safe-OP a b) → (primop OP a b) when both
+;;; operands are proven fixnums, eliminating the runtime type-check call.
+;;; ============================================================================
+
+(define (optimize-unsafe-arith-cfg cfg)
+  (define (arith-result-op? op) (memq op '(+ - * safe-+ safe-- safe-*)))
+
+  (define (transfer-instr facts instr)
+    (if (not (and (pair? instr) (eq? (car instr) 'assign)))
+        facts
+        (let ((dst (cadr instr)) (rhs (caddr instr)))
+          (cond
+            ((number? rhs)
+             (set-add facts dst))
+            ((symbol? rhs)
+             (if (memq rhs facts) (set-add facts dst) (set-remove facts dst)))
+            ((and (pair? rhs) (eq? (car rhs) 'primop) (arith-result-op? (cadr rhs)))
+             (set-add facts dst))
+            (else
+             (set-remove facts dst))))))
 
   (define (safe->unsafe op)
     (case op
-      ((safe-+) '+)
-      ((safe--) '-)
-      ((safe-*) '*)
-      ((safe-=) '=)
-      ((safe-<) '<)
-      ((safe->) '>)
+      ((safe-+) '+) ((safe--) '-) ((safe-*) '*)
+      ((safe-=) '=) ((safe-<) '<) ((safe->) '>)
       (else #f)))
 
-  (define (fixnum-operand? v facts)
-    (or (number? v) (and (symbol? v) (memq v facts))))
+  (define (fixnum-operand? v facts) (or (number? v) (and (symbol? v) (memq v facts))))
 
-  (define (rewrite-block block initial-facts)
-    (let loop ((rest (basic-block-instructions block))
-               (facts initial-facts)
-               (result '()))
-      (if (null? rest)
-          (let ((rewritten (make-basic-block (basic-block-label block)
-                                             (reverse result))))
-            (set-basic-block-successors! rewritten (basic-block-successors block))
-            rewritten)
-          (let* ((instr (car rest))
-                 (rewritten-instr
-                  (if (and (pair? instr)
-                           (eq? (car instr) 'assign)
-                           (pair? (caddr instr))
-                           (eq? (car (caddr instr)) 'primop)
-                           (safe->unsafe (cadr (caddr instr))))
-                      (let* ((dst (cadr instr))
-                             (rhs (caddr instr))
-                             (op (cadr rhs))
-                             (a (caddr rhs))
-                             (b (cadddr rhs))
-                             (unsafe-op (safe->unsafe op)))
-                        (if (and (fixnum-operand? a facts)
-                                 (fixnum-operand? b facts))
-                            `(assign ,dst (primop ,unsafe-op ,a ,b))
-                            instr))
-                      instr))
-                 (next-facts (transfer-instruction facts rewritten-instr)))
-            (loop (cdr rest)
-                  next-facts
-                  (cons rewritten-instr result))))))
+  (define (rewrite-instr instr facts)
+    (if (and (pair? instr)         (eq? (car instr) 'assign)
+             (pair? (caddr instr)) (eq? (car (caddr instr)) 'primop)
+             (safe->unsafe (cadr (caddr instr))))
+        (let* ((dst       (cadr instr))
+               (rhs       (caddr instr))
+               (op        (cadr rhs))
+               (a         (caddr rhs))
+               (b         (cadddr rhs))
+               (unsafe-op (safe->unsafe op)))
+          (if (and (fixnum-operand? a facts) (fixnum-operand? b facts))
+              `(assign ,dst (primop ,unsafe-op ,a ,b))
+              instr))
+        instr))
 
-  (let rewrite-loop ((i 0) (result '()))
-    (if (= i block-count)
-        (reverse result)
-        (rewrite-loop (+ i 1)
-                      (cons (rewrite-block (list-ref cfg i)
-                                           (vector-ref in-facts i))
-                            result)))))
+  (define (no-edge-facts pred-block succ-index pred-out) pred-out)
+
+  (rewrite-cfg-with-must-analysis cfg transfer-instr no-edge-facts rewrite-instr))
 
 ;;; ============================================================================
 ;;; Pass 5.6: Constant Folding on CFG
