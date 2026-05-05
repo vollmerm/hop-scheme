@@ -21,6 +21,7 @@ typedef struct {
  *   ptr......001  pair pointer
  *   ptr......010  box pointer
  *   ptr......011  closure pointer
+ *   ptr......100  vector pointer
  *
  * Fixnums are stored by shifting the signed integer left by
  * HOP_FIXNUM_SHIFT. Heap objects are allocated at aligned addresses, so their
@@ -42,6 +43,7 @@ typedef struct {
 #define HOP_PAIR_TAG 1
 #define HOP_BOX_TAG 2
 #define HOP_CLOSURE_TAG 3
+#define HOP_VECTOR_TAG 4
 
 #define HOP_NULL 20
 #define HOP_FALSE 36
@@ -80,6 +82,10 @@ hop_value hop_alloc_box(hop_value value);
 hop_value hop_alloc_pair(hop_value car, hop_value cdr);
 hop_value hop_car(hop_value pair_value);
 hop_value hop_cdr(hop_value pair_value);
+hop_value hop_alloc_vector(hop_value length, hop_value fill);
+hop_value hop_vector_length(hop_value vec_value);
+hop_value hop_vector_ref(hop_value vec_value, hop_value index);
+hop_value hop_vector_set(hop_value vec_value, hop_value index, hop_value new_value);
 hop_value hop_alloc_closure_0(void *code);
 hop_value hop_alloc_closure_1(void *code, hop_value env0);
 hop_value hop_alloc_closure_2(void *code, hop_value env0, hop_value env1);

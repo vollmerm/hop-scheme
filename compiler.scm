@@ -118,6 +118,10 @@
 ;;;             | (box Expr)
 ;;;             | (unbox Expr)
 ;;;             | (set-box! Expr Expr)
+;;;             | (make-vector Expr Expr)
+;;;             | (vector-length Expr)
+;;;             | (vector-ref Expr Expr)
+;;;             | (vector-set! Expr Expr Expr)
 ;;;
 ;;;   PrimOp  ::= + | - | * | = | <
 ;;;   Literal ::= Integer | #t | #f | ()
@@ -143,6 +147,10 @@
 ;;;             | (box Expr)
 ;;;             | (unbox Expr)
 ;;;             | (set-box! Expr Expr)
+;;;             | (make-vector Expr Expr)
+;;;             | (vector-length Expr)
+;;;             | (vector-ref Expr Expr)
+;;;             | (vector-set! Expr Expr Expr)
 ;;;
 ;;; Changes: top-level `(define Var E)` → `(set-global! N E)`;
 ;;;          free references to defined names → `(global N)`.
@@ -250,17 +258,21 @@
         `(app ,(resolve-globals (cadr expr) local-env global-env)
               ,@(map (lambda (e) (resolve-globals e local-env global-env))
                      (cddr expr))))
-       ((cons)
-        `(cons ,(resolve-globals (cadr expr) local-env global-env)
-               ,(resolve-globals (caddr expr) local-env global-env)))
-       ((+ - * = < >)
-        `(,(car expr) ,(resolve-globals (cadr expr) local-env global-env)
-                      ,(resolve-globals (caddr expr) local-env global-env)))
-       ((box unbox car cdr pair? null?)
-        `(,(car expr) ,(resolve-globals (cadr expr) local-env global-env)))
-       ((set-box!)
-        `(set-box! ,(resolve-globals (cadr expr) local-env global-env)
-                   ,(resolve-globals (caddr expr) local-env global-env)))
+        ((cons make-vector vector-ref)
+         `(,(car expr) ,(resolve-globals (cadr expr) local-env global-env)
+                       ,(resolve-globals (caddr expr) local-env global-env)))
+        ((+ - * = < >)
+         `(,(car expr) ,(resolve-globals (cadr expr) local-env global-env)
+                       ,(resolve-globals (caddr expr) local-env global-env)))
+        ((box unbox car cdr pair? null? vector-length vector?)
+         `(,(car expr) ,(resolve-globals (cadr expr) local-env global-env)))
+        ((set-box!)
+         `(set-box! ,(resolve-globals (cadr expr) local-env global-env)
+                    ,(resolve-globals (caddr expr) local-env global-env)))
+        ((vector-set!)
+         `(vector-set! ,(resolve-globals (cadr expr) local-env global-env)
+                       ,(resolve-globals (caddr expr) local-env global-env)
+                       ,(resolve-globals (cadddr expr) local-env global-env)))
        ((define)
         (error "Internal define is not supported" expr))
        (else
@@ -386,9 +398,21 @@
            `(app ,(uniquify-expr (cadr expr) env)
                  ,@(map (lambda (e) (uniquify-expr e env)) (cddr expr))))
 
-          ((cons)
-           `(cons ,(uniquify-expr (cadr expr) env)
-                  ,(uniquify-expr (caddr expr) env)))
+          ((cons make-vector vector-ref)
+           `(,(car expr) ,(uniquify-expr (cadr expr) env)
+                         ,(uniquify-expr (caddr expr) env)))
+          ((+ - * = < >)
+           `(,(car expr) ,(uniquify-expr (cadr expr) env)
+                         ,(uniquify-expr (caddr expr) env)))
+          ((box unbox car cdr pair? null? vector-length vector?)
+           `(,(car expr) ,(uniquify-expr (cadr expr) env)))
+          ((set-box!)
+           `(set-box! ,(uniquify-expr (cadr expr) env) 
+                      ,(uniquify-expr (caddr expr) env)))
+          ((vector-set!)
+           `(vector-set! ,(uniquify-expr (cadr expr) env)
+                         ,(uniquify-expr (caddr expr) env)
+                         ,(uniquify-expr (cadddr expr) env)))
 
           ((+ - * = < >)
            `(,(car expr) ,(uniquify-expr (cadr expr) env)
@@ -416,10 +440,11 @@
 
 ;;; ============================================================================
 ;;; Pass 1.5: Builtin Canonicalization
-;;; Rewrites user-facing list primitives (car, cdr, cons, pair?, null?) into
-;;; uniform (primop op ...) form. Runs immediately after uniquify, which means
-;;; bound identifiers are already renamed to name.N form, so builtin-head
-;;; detection is purely syntactic with no scope tracking needed.
+;;; Rewrites user-facing list and vector primitives (car, cdr, cons, pair?,
+;;; null?, make-vector, vector-length, vector-ref, vector-set!) into uniform
+;;; (primop op ...) form. Runs immediately after uniquify, which means bound
+;;; identifiers are already renamed to name.N form, so builtin-head detection
+;;; is purely syntactic with no scope tracking needed.
 ;;;
 ;;; A bare builtin name in value position (e.g. passed as a first-class
 ;;; argument) is wrapped as a fresh lambda so it remains a legal value.
@@ -430,7 +455,8 @@
 ;;; source and are left unchanged.
 ;;;
 ;;; INPUT GRAMMAR:  Uniquified (Pass 1 output).
-;;; OUTPUT GRAMMAR: Same, except car/cdr/cons/pair?/null? as operation heads
+;;; OUTPUT GRAMMAR: Same, except car/cdr/cons/pair?/null?/make-vector/
+;;;                 vector-length/vector-ref/vector-set! as operation heads
 ;;;                 are replaced by (primop op ...) and bare builtin symbols
 ;;;                 in value position become lambda wrappers.
 ;;; ============================================================================
@@ -442,7 +468,12 @@
     (unsafe-cdr . 1)
     (pair? . 1)
     (null? . 1)
+    (vector? . 1)
     (cons . 2)
+    (make-vector . 2)
+    (vector-length . 1)
+    (vector-ref . 2)
+    (vector-set! . 3)
     (+ . 2)
     (- . 2)
     (* . 2)
@@ -1002,7 +1033,15 @@
 
           ((null?)
            (error "null? in desugar-letrec: should have been canonicalized" expr))
-          
+          ((make-vector)
+           (error "make-vector in desugar-letrec: should have been canonicalized" expr))
+          ((vector-length)
+           (error "vector-length in desugar-letrec: should have been canonicalized" expr))
+          ((vector-ref)
+           (error "vector-ref in desugar-letrec: should have been canonicalized" expr))
+          ((vector-set!)
+           (error "vector-set! in desugar-letrec: should have been canonicalized" expr))
+           
            ((set-box!)
             (let ((target (cadr expr)))
              (when (and (symbol? target) (assoc target env))
@@ -1258,8 +1297,8 @@
                 (all (lambda (arg) (safe-group-body? arg box-vars)) args)
                 (and (safe-group-body? rator box-vars)
                      (all (lambda (arg) (safe-group-body? arg box-vars)) args)))))
-         ((cons)
-          (error "cons in safe-group-body?: should have been canonicalized" expr))
+          ((cons make-vector vector-length vector-ref vector-set! vector?)
+           (error "vector or list op in safe-group-body?: should have been canonicalized" expr))
          ((box)
            (safe-group-body? (cadr expr) box-vars))
          ((unbox)
@@ -1467,9 +1506,17 @@
           (error "cdr in closure-convert: should have been canonicalized" expr))
          ((pair?)
           (error "pair? in closure-convert: should have been canonicalized" expr))
-         ((null?)
-          (error "null? in closure-convert: should have been canonicalized" expr))
-         ((set-box!)
+          ((null?)
+           (error "null? in closure-convert: should have been canonicalized" expr))
+          ((make-vector)
+           (error "make-vector in closure-convert: should have been canonicalized" expr))
+          ((vector-length)
+           (error "vector-length in closure-convert: should have been canonicalized" expr))
+          ((vector-ref)
+           (error "vector-ref in closure-convert: should have been canonicalized" expr))
+          ((vector-set!)
+           (error "vector-set! in closure-convert: should have been canonicalized" expr))
+          ((set-box!)
           `(set-box! ,(convert (cadr expr) env self-tail-prefix)
                      ,(convert (caddr expr) env self-tail-prefix)))
          ((set-global!)
@@ -1640,9 +1687,17 @@
                     (list (car capture-spec)
                           (normalize (cadr capture-spec))))
                   (caddr expr))))
-         ((cons)
-           (error "cons in normalize-for-cfa: should have been canonicalized" expr))
-          ((set-box!)
+          ((cons)
+            (error "cons in normalize-for-cfa: should have been canonicalized" expr))
+          ((make-vector)
+            (error "make-vector in normalize-for-cfa: should have been canonicalized" expr))
+          ((vector-length)
+            (error "vector-length in normalize-for-cfa: should have been canonicalized" expr))
+          ((vector-ref)
+            (error "vector-ref in normalize-for-cfa: should have been canonicalized" expr))
+          ((vector-set!)
+            (error "vector-set! in normalize-for-cfa: should have been canonicalized" expr))
+           ((set-box!)
            `(set-box! ,(normalize (cadr expr)) ,(normalize (caddr expr))))
           ((box unbox)
            `(,(car expr) ,(normalize (cadr expr))))
@@ -2056,12 +2111,12 @@
                       (list (car capture-spec)
                             (rewrite (cadr capture-spec))))
                     (caddr expr))))
-           ((cons set-box!)
-            `(,(car expr) ,(rewrite (cadr expr)) ,(rewrite (caddr expr))))
+            ((cons set-box! make-vector vector-ref vector-set!)
+             `(,(car expr) ,(rewrite (cadr expr)) ,(rewrite (caddr expr))))
            ((set-global!)
             `(set-global! ,(cadr expr) ,(rewrite (caddr expr))))
-            ((box unbox car cdr pair? null? local closure global)
-             `(,(car expr) ,(rewrite (cadr expr))))
+             ((box unbox car cdr pair? null? vector-length vector? local closure global)
+              `(,(car expr) ,(rewrite (cadr expr))))
             (else
              (error "Unknown expression in known-call rewrite" (car expr)))))
         (else
@@ -2100,7 +2155,8 @@
 ;;;             | (cons Var Var)
 ;;;             | (box Var)
 ;;;             | (unbox Var) | (car Var) | (cdr Var)
-;;;             | (pair? Var) | (null? Var)
+;;;             | (pair? Var) | (null? Var) | (vector? Var)
+;;;             | (vector-length Var)
 ;;;             | (global N)
 ;;;             | (closure-env-ref Var N)     ; load env slot N from closure Var
 ;;;             | (make-closure ProcName Var*) ; allocate closure over free vars
@@ -2285,10 +2341,10 @@
                 (all (lambda (e) (cluster-body-compatible? e names))
                      (cddr expr))))
           ((self-tail-call) #f)
-          ((app closure-call known-call set-box! cons)
-           (all (lambda (e) (cluster-body-compatible? e names)) (cdr expr)))
-          ((box unbox car cdr pair? null?)
-            (cluster-body-compatible? (cadr expr) names))
+           ((app closure-call known-call set-box! cons make-vector vector-ref vector-set!)
+            (all (lambda (e) (cluster-body-compatible? e names)) (cdr expr)))
+           ((box unbox car cdr pair? null? vector-length vector?)
+             (cluster-body-compatible? (cadr expr) names))
           ((global local closure) #t)
           ((set-global!)
            (cluster-body-compatible? (caddr expr) names))
@@ -2303,8 +2359,8 @@
           ((group-tail-call)
            (cons (cadr expr)
                  (append-map collect-group-tail-targets (cddr expr))))
-          ((begin app closure-call known-call set-box! cons)
-           (append-map collect-group-tail-targets (cdr expr)))
+           ((begin app closure-call known-call set-box! cons make-vector vector-ref vector-set!)
+            (append-map collect-group-tail-targets (cdr expr)))
          ((primop)
           (append-map collect-group-tail-targets (cddr expr)))
          ((if)
@@ -2316,8 +2372,8 @@
                   (append-map collect-group-tail-targets (cddr expr))))
          ((lambda)
            (collect-group-tail-targets (body->expr (cddr expr))))
-           ((box unbox car cdr pair? null?)
-            (collect-group-tail-targets (cadr expr)))
+            ((box unbox car cdr pair? null? vector-length vector?)
+             (collect-group-tail-targets (cadr expr)))
            ((global)
             '())
            ((set-global!)
@@ -2733,8 +2789,18 @@
                         result-var
                         arg-procedures)))))
          
-          ((cons)
-           (error "cons in expr->tac: should have been canonicalized" expr))
+           ((cons)
+            (error "cons in expr->tac: should have been canonicalized" expr))
+          ((make-vector)
+            (error "make-vector in expr->tac: should have been canonicalized" expr))
+          ((vector-length)
+            (error "vector-length in expr->tac: should have been canonicalized" expr))
+          ((vector-ref)
+            (error "vector-ref in expr->tac: should have been canonicalized" expr))
+          ((vector-set!)
+            (error "vector-set! in expr->tac: should have been canonicalized" expr))
+          ((vector?)
+            (error "vector? in expr->tac: should have been canonicalized" expr))
 
           ((box)
            (convert-unary-value-op 'box (cadr expr)))
@@ -3547,10 +3613,16 @@
 ;;;   predicates (+ - * = < > null? pair? unsafe-car unsafe-cdr),
 ;;;   (global N), (closure-env-ref v N), (unbox v).
 ;;;
+;;; The vector-length, vector-ref, make-vector, vector-set! primops are
+;;;   impure: they carry runtime checks (tag/dispatch) that may trap.
+;;;   The vector? predicate is pure---it is an inline tag-only check.
+;;;
 ;;; Non-pure RHS forms (never eliminated):
-;;;   (cons …), (box …), (make-closure …),
+;;;   (cons …), (box …), (make-closure …), (make-vector …),
 ;;;   (closure-call …), (direct-call …),
-;;;   (primop car …), (primop cdr …)  — these carry a type-check side effect.
+;;;   (primop car …), (primop cdr …),
+;;;   (primop vector-length …), (primop vector-ref …), (primop vector-set! …)
+;;;   — these carry a type-check side effect or allocate.
 ;;; ============================================================================
 
 (define (eliminate-dead-writes-cfg cfg)
@@ -3571,8 +3643,8 @@
       ((symbol? rhs)        (list rhs))
       ((and (pair? rhs) (eq? (car rhs) 'primop))
        (sym-list (cddr rhs)))
-      ((and (pair? rhs) (memq (car rhs) '(cons box unbox car cdr pair? null?)))
-       (if (symbol? (cadr rhs)) (list (cadr rhs)) '()))
+      ((and (pair? rhs) (memq (car rhs) '(cons box unbox car cdr pair? null? make-vector vector-length vector-ref vector-set! vector?)))
+       (sym-list (cdr rhs)))
       ((and (pair? rhs) (eq? (car rhs) 'global))
        '())
       ((and (pair? rhs) (eq? (car rhs) 'closure-env-ref))
@@ -3613,7 +3685,7 @@
       ((literal-expr? rhs) #t)
       ((symbol? rhs)       #t)
       ((and (pair? rhs) (eq? (car rhs) 'primop))
-       (and (memq (cadr rhs) '(+ - * = < > null? pair? unsafe-car unsafe-cdr))
+       (and (memq (cadr rhs) '(+ - * = < > null? pair? vector? unsafe-car unsafe-cdr))
             #t))
       ((and (pair? rhs) (eq? (car rhs) 'global))          #t)
       ((and (pair? rhs) (eq? (car rhs) 'closure-env-ref)) #t)
@@ -3863,7 +3935,12 @@
          ((unsafe-cdr) (list `(unsafe-load-cdr ,dst ,(caddr rhs))))
          ((pair?) (list `(is-pair   ,dst ,(caddr rhs))))
          ((null?) (list `(is-null   ,dst ,(caddr rhs))))
-         ((cons) (list `(alloc-pair ,dst ,(caddr rhs) ,(cadddr rhs))))
+          ((make-vector) (list `(alloc-vector ,dst ,(caddr rhs) ,(cadddr rhs))))
+          ((vector-length) (list `(vector-length ,dst ,(caddr rhs))))
+          ((vector-ref) (list `(vector-ref ,dst ,(caddr rhs) ,(cadddr rhs))))
+          ((vector-set!) (list `(vector-set! ,dst ,(caddr rhs) ,(cadddr rhs) ,(cadddr (cdr rhs)))))
+          ((vector?) (list `(is-vector ,dst ,(caddr rhs))))
+          ((cons) (list `(alloc-pair ,dst ,(caddr rhs) ,(cadddr rhs))))
          ((safe-+ safe-- safe-* safe-= safe-< safe->)
           (list `(safe-binop ,(cadr rhs) ,dst ,(caddr rhs) ,(cadddr rhs))))
          (else   (list `(binop ,(cadr rhs) ,dst ,@(cddr rhs))))))
@@ -3962,14 +4039,18 @@
     ((binop safe-binop)
      (append (if (symbol? (cadddr instr)) (list (cadddr instr)) '())
              (if (symbol? (car (cddddr instr))) (list (car (cddddr instr))) '())))
-    ((alloc-box load-box load-car load-cdr is-pair is-null load-closure-env)
-        (if (symbol? (caddr instr)) (list (caddr instr)) '()))
+    ((alloc-box load-box load-car load-cdr is-pair is-null is-vector vector-length load-closure-env)
+         (if (symbol? (caddr instr)) (list (caddr instr)) '()))
     ((unsafe-load-car unsafe-load-cdr)
      (if (symbol? (caddr instr)) (list (caddr instr)) '()))
     ((load-global) '())
-    ((alloc-pair)
+    ((alloc-pair alloc-vector vector-ref)
+      (append (if (symbol? (caddr instr)) (list (caddr instr)) '())
+              (if (symbol? (cadddr instr)) (list (cadddr instr)) '())))
+    ((vector-set!)
      (append (if (symbol? (caddr instr)) (list (caddr instr)) '())
-             (if (symbol? (cadddr instr)) (list (cadddr instr)) '())))
+             (if (symbol? (cadddr instr)) (list (cadddr instr)) '())
+             (if (symbol? (cadddr (cdr instr))) (list (cadddr (cdr instr))) '())))
     ((store-box)
       (append (if (symbol? (cadr instr)) (list (cadr instr)) '())
               (if (symbol? (caddr instr)) (list (caddr instr)) '())))
@@ -4028,9 +4109,10 @@
 
 (define (machine-instr-defs instr)
   (case (car instr)
-    ((move-in move alloc-pair alloc-box load-box load-car load-cdr
-            unsafe-load-car unsafe-load-cdr is-pair is-null
-            load-closure-env load-global alloc-closure call call-known)
+    ((move-in move alloc-pair alloc-vector alloc-box load-box load-car load-cdr
+             unsafe-load-car unsafe-load-cdr is-pair is-null is-vector
+             vector-length vector-ref vector-set!
+             load-closure-env load-global alloc-closure call call-known)
       (list (cadr instr)))
     ((binop safe-binop)
       (list (caddr instr)))
@@ -4426,6 +4508,25 @@
     ((is-null)
      `(is-null ,(lookup-home homes (cadr instr))
                ,(lookup-home homes (caddr instr))))
+    ((is-vector)
+     `(is-vector ,(lookup-home homes (cadr instr))
+                 ,(lookup-home homes (caddr instr))))
+    ((alloc-vector)
+     `(alloc-vector ,(lookup-home homes (cadr instr))
+                    ,(lookup-home homes (caddr instr))
+                    ,(lookup-home homes (cadddr instr))))
+    ((vector-length)
+     `(vector-length ,(lookup-home homes (cadr instr))
+                     ,(lookup-home homes (caddr instr))))
+    ((vector-ref)
+     `(vector-ref ,(lookup-home homes (cadr instr))
+                  ,(lookup-home homes (caddr instr))
+                  ,(lookup-home homes (cadddr instr))))
+    ((vector-set!)
+     `(vector-set! ,(lookup-home homes (cadr instr))
+                   ,(lookup-home homes (caddr instr))
+                   ,(lookup-home homes (cadddr instr))
+                   ,(lookup-home homes (cadddr (cdr instr)))))
     ((store-box)
       `(store-box ,(lookup-home homes (cadr instr))
                   ,(lookup-home homes (caddr instr))))
@@ -4466,7 +4567,7 @@
       (error "Unknown machine instruction during allocation" instr))))
 
 (define (safepoint-machine-instruction? instr)
-  (memq (car instr) '(alloc-box alloc-pair alloc-closure call call-known)))
+  (memq (car instr) '(alloc-box alloc-pair alloc-vector alloc-closure call call-known)))
 
 (define (live-root-syncs live-before homes root-homes)
   (append-map
@@ -4873,6 +4974,7 @@
 (define pair-tag 1)
 (define box-tag 2)
 (define closure-tag 3)
+(define vector-tag 4)
 (define null-immediate 20)
 (define false-immediate 36)
 (define true-immediate 52)
@@ -5236,6 +5338,33 @@
       (emit-load-operand port "x1" (cadddr instr) proc)
       (emit-asm-line port "    bl _hop_alloc_pair")
       (emit-store-operand port "x0" (cadr instr) proc))
+    ((alloc-vector)
+      (emit-load-operand port "x0" (caddr instr) proc)
+      (emit-load-operand port "x1" (cadddr instr) proc)
+      (emit-asm-line port "    bl _hop_alloc_vector")
+      (emit-store-operand port "x0" (cadr instr) proc))
+    ((vector-length)
+      (emit-runtime-unary-call port "_hop_vector_length" (cadr instr) (caddr instr) proc))
+    ((vector-ref)
+      (emit-load-operand port "x0" (caddr instr) proc)
+      (emit-load-operand port "x1" (cadddr instr) proc)
+      (emit-asm-line port "    bl _hop_vector_ref")
+      (emit-store-operand port "x0" (cadr instr) proc))
+    ((vector-set!)
+      (emit-load-operand port "x0" (caddr instr) proc)
+      (emit-load-operand port "x1" (cadddr instr) proc)
+      (emit-load-operand port "x2" (cadddr (cdr instr)) proc)
+      (emit-asm-line port "    bl _hop_vector_set")
+      (emit-store-operand port "x0" (cadr instr) proc))
+    ((is-vector)
+      (emit-load-operand port "x9" (caddr instr) proc)
+      (emit-asm-line port
+                     (string-append "    and x10, x9, #"
+                                    (number->string tag-mask)))
+      (emit-asm-line port
+                     (string-append "    cmp x10, #"
+                                     (number->string vector-tag)))
+      (emit-bool-result port "eq" (cadr instr) proc))
     ((load-box)
        (emit-load-box-address port (caddr instr) proc)
        (emit-asm-line port "    ldr x10, [x9, #8]")

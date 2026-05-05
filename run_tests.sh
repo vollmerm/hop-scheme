@@ -162,6 +162,13 @@ runtime_cases=(
   "test56|7"
   "test57|3"
   "test58|8"
+  "test59|0"
+  "test60|42"
+  "test61|5"
+  "test62|2"
+  "test63|7"
+  "test64|5"
+  "test65|42|2048"
 )
 
 for case in "${runtime_cases[@]}"; do

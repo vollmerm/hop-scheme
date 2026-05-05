@@ -22,6 +22,8 @@ static void hop_format_value(char *buffer, size_t size, hop_value value) {
         snprintf(buffer, size, "#<box>");
     } else if (hop_has_tag(value, HOP_CLOSURE_TAG)) {
         snprintf(buffer, size, "#<closure>");
+    } else if (hop_has_tag(value, HOP_VECTOR_TAG)) {
+        snprintf(buffer, size, "#<vector>");
     } else {
         snprintf(buffer, size, "#<value:%lld>", (long long)value);
     }

@@ -30,7 +30,8 @@ enum {
     HOP_OBJ_FORWARD = 0,
     HOP_OBJ_BOX = 1,
     HOP_OBJ_PAIR = 2,
-    HOP_OBJ_CLOSURE = 3
+    HOP_OBJ_CLOSURE = 3,
+    HOP_OBJ_VECTOR = 4
 };
 
 #define HOP_HEADER_TYPE_MASK ((hop_word)0xff)
@@ -130,6 +131,8 @@ static size_t hop_object_words(hop_value *object) {
         return 3;
     case HOP_OBJ_CLOSURE:
         return 2 + (size_t)hop_header_aux(header);
+    case HOP_OBJ_VECTOR:
+        return 1 + (size_t)hop_header_aux(header);
     case HOP_OBJ_FORWARD:
         return 2;
     default:
@@ -153,7 +156,8 @@ static hop_value hop_copy_value(hop_value value) {
 
     if (!hop_has_tag(value, HOP_PAIR_TAG) &&
         !hop_has_tag(value, HOP_BOX_TAG) &&
-        !hop_has_tag(value, HOP_CLOSURE_TAG)) {
+        !hop_has_tag(value, HOP_CLOSURE_TAG) &&
+        !hop_has_tag(value, HOP_VECTOR_TAG)) {
         return value;
     }
 
@@ -260,6 +264,11 @@ static void hop_scan_copied_objects(void) {
                 object[2 + index] = hop_copy_value(object[2 + index]);
             }
             break;
+        case HOP_OBJ_VECTOR:
+            for (index = 0; index < (size_t)hop_header_aux(header); index += 1) {
+                object[1 + index] = hop_copy_value(object[1 + index]);
+            }
+            break;
         default:
             hop_panic("unexpected copied object type");
         }
@@ -341,6 +350,69 @@ hop_value hop_cdr(hop_value pair_value) {
     hop_value *pair = hop_expect_pointer_tag(pair_value, HOP_PAIR_TAG, "cdr expected pair");
     hop_expect_object_type(pair, HOP_OBJ_PAIR, "cdr expected pair");
     return pair[2];
+}
+
+hop_value hop_alloc_vector(hop_value length_val, hop_value fill) {
+    hop_value roots[2];
+    hop_value *vector;
+    int64_t length;
+    size_t i;
+
+    if (!hop_is_fixnum(length_val))
+        hop_panic("make-vector: expected fixnum length");
+    length = hop_decode_fixnum(length_val);
+    if (length < 0)
+        hop_panic("make-vector: negative length");
+
+    roots[0] = length_val;
+    roots[1] = fill;
+    vector = hop_alloc_words((size_t)(1 + length), roots, 2);
+    vector[0] = (hop_value)hop_make_header(HOP_OBJ_VECTOR, (hop_word)length);
+    for (i = 0; i < (size_t)length; i += 1) {
+        vector[1 + i] = roots[1];
+    }
+    return hop_tag_pointer(vector, HOP_VECTOR_TAG);
+}
+
+hop_value hop_vector_length(hop_value vec_value) {
+    hop_value *vec = hop_expect_pointer_tag(vec_value, HOP_VECTOR_TAG, "vector-length expected vector");
+    hop_expect_object_type(vec, HOP_OBJ_VECTOR, "vector-length expected vector");
+    return hop_encode_fixnum((int64_t)hop_header_aux((hop_word)vec[0]));
+}
+
+hop_value hop_vector_ref(hop_value vec_value, hop_value index_val) {
+    hop_value *vec;
+    int64_t index, length;
+
+    vec = hop_expect_pointer_tag(vec_value, HOP_VECTOR_TAG, "vector-ref expected vector");
+    hop_expect_object_type(vec, HOP_OBJ_VECTOR, "vector-ref expected vector");
+    length = (int64_t)hop_header_aux((hop_word)vec[0]);
+
+    if (!hop_is_fixnum(index_val))
+        hop_panic("vector-ref: expected fixnum index");
+    index = hop_decode_fixnum(index_val);
+    if (index < 0 || index >= length)
+        hop_panic("vector-ref: index out of range");
+
+    return vec[1 + (size_t)index];
+}
+
+hop_value hop_vector_set(hop_value vec_value, hop_value index_val, hop_value new_value) {
+    hop_value *vec;
+    int64_t index, length;
+
+    vec = hop_expect_pointer_tag(vec_value, HOP_VECTOR_TAG, "vector-set! expected vector");
+    hop_expect_object_type(vec, HOP_OBJ_VECTOR, "vector-set! expected vector");
+    length = (int64_t)hop_header_aux((hop_word)vec[0]);
+
+    if (!hop_is_fixnum(index_val))
+        hop_panic("vector-set!: expected fixnum index");
+    index = hop_decode_fixnum(index_val);
+    if (index < 0 || index >= length)
+        hop_panic("vector-set!: index out of range");
+
+    vec[1 + (size_t)index] = new_value;
+    return new_value;
 }
 
 hop_value hop_safe_add(hop_value a, hop_value b) {

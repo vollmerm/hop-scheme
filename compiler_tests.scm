@@ -506,6 +506,57 @@
 (define test58
   '(let ((x (+ 3 4))) (+ x 1)))
 
+;; test59: basic make-vector + vector-ref — verify allocation and readback.
+(define test59
+  '(let ((v (make-vector 3 0)))
+     (vector-ref v 0)))
+
+;; test60: vector-set! mutation and readback.
+(define test60
+  '(let ((v (make-vector 1 0)))
+     (vector-set! v 0 42)
+     (vector-ref v 0)))
+
+;; test61: vector-length returns the number of elements.
+(define test61
+  '(let ((v (make-vector 5 0)))
+     (vector-length v)))
+
+;; test62: vector? predicate.
+(define test62
+  '(let ((v (make-vector 1 0))
+         (p (cons 0 ())))
+     (if (vector? v)
+         (if (vector? p)
+             1
+             2)
+         3)))
+
+;; test63: nested vectors — vector-ref of a vector-ref.
+(define test63
+  '(let ((inner (make-vector 1 7)))
+     (let ((outer (make-vector 1 0)))
+       (vector-set! outer 0 inner)
+       (vector-ref (vector-ref outer 0) 0))))
+
+;; test64: vector-ref as first-class value passed to higher-order function.
+(define test64
+  '(let ((apply-fn (lambda (f v i) (app f v i))))
+     (app apply-fn vector-ref (make-vector 3 5) 1)))
+
+;; test65: vectors survive GC — fill the heap with transient vectors,
+;; then read back one that is held by a root.
+(define test65
+  '(let ((keep (make-vector 1 42)))
+     (letrec ((fill
+               (lambda (n)
+                 (if (primop = n 0)
+                     0
+                     (let ((junk (make-vector 10 n)))
+                       (app fill (primop - n 1)))))))
+        (app fill 50)
+        (vector-ref keep 0))))
+
 (define sample-tests
   (list (cons "Test 1: Simple arithmetic" test1)
         (cons "Test 2: Lambda application" test2)
@@ -563,7 +614,14 @@
         (cons "Test 55: safe arithmetic optimized for literal fixnums" test55)
         (cons "Test 56: safe arithmetic optimized via let-bound literal" test56)
         (cons "Test 57: safe arithmetic preserved for car result" test57)
-        (cons "Test 58: safe arithmetic of safe arithmetic result optimized" test58)))
+        (cons "Test 58: safe arithmetic of safe arithmetic result optimized" test58)
+        (cons "Test 59: basic make-vector and vector-ref" test59)
+        (cons "Test 60: vector-set! mutation and readback" test60)
+        (cons "Test 61: vector-length returns element count" test61)
+        (cons "Test 62: vector? predicate" test62)
+        (cons "Test 63: nested vectors" test63)
+        (cons "Test 64: vector-ref as first-class value" test64)
+        (cons "Test 65: vector GC stress" test65)))
 
 (define named-tests
   ;; These are runnable end-to-end regression cases. test6 and test7 stay as
@@ -621,8 +679,15 @@
           (cons 'test54 test54)
           (cons 'test55 test55)
           (cons 'test56 test56)
-          (cons 'test57 test57)
-          (cons 'test58 test58)))
+         (cons 'test57 test57)
+         (cons 'test58 test58)
+         (cons 'test59 test59)
+         (cons 'test60 test60)
+         (cons 'test61 test61)
+         (cons 'test62 test62)
+         (cons 'test63 test63)
+         (cons 'test64 test64)
+         (cons 'test65 test65)))
 
 (define (lookup-named-test name)
   (let ((binding (assoc name named-tests)))
