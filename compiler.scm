@@ -6,6 +6,7 @@
 ;;;   source program
 ;;;     -> program lowering
 ;;;     -> uniquify
+;;;     -> letrec simplification
 ;;;     -> letrec desugaring
 ;;;     -> closure conversion
 ;;;     -> three-address code (TAC)
@@ -16,7 +17,7 @@
 ;;;
 ;;; The source language supported here is intentionally small: arithmetic,
 ;;; booleans, null, pairs, conditionals, boxes, lambdas, applications,
-;;; lambda-only letrec, and top-level variable define in multi-form programs.
+;;; general letrec, and top-level variable define in multi-form programs.
 
 (import (scheme base)
         (scheme read)
@@ -106,7 +107,7 @@
 ;;;             | (begin Expr+)
 ;;;             | (if Expr Expr Expr)
 ;;;             | (let ((Var Expr)) Expr+)
-;;;             | (letrec ((Var Expr)+) Expr+)  ; lambda bindings only
+;;;             | (letrec ((Var Expr)+) Expr+)
 ;;;             | (lambda (Var*) Expr+)
 ;;;             | (primop PrimOp Expr*)
 ;;;             | (app Expr Expr*)
@@ -372,25 +373,23 @@
                         body-exprs)))
              `(lambda ,unique-params ,@body-unique)))
           
-          ((letrec)
-           (let* ((bindings (cadr expr))
-                  (vars (map car bindings))
-                  (unique-vars (map fresh-name vars))
-                  (rec-bindings (map (lambda (old new) (list old new))
-                                     vars unique-vars))
-                  (new-env (append rec-bindings env))
-                  (unique-bindings
-                   (map (lambda (binding unique-var)
-                          (let ((value-expr (cadr binding)))
-                            (if (not (lambda-expr? value-expr))
-                                (error "letrec requires lambda bindings" value-expr)
-                                (list unique-var
-                                      (uniquify-expr value-expr new-env)))))
-                        bindings
-                        unique-vars))
-                  (body-unique
-                   (map (lambda (body-expr)
-                          (uniquify-expr body-expr new-env))
+           ((letrec)
+            (let* ((bindings (cadr expr))
+                   (vars (map car bindings))
+                   (unique-vars (map fresh-name vars))
+                   (rec-bindings (map (lambda (old new) (list old new))
+                                      vars unique-vars))
+                   (new-env (append rec-bindings env))
+                   (unique-bindings
+                    (map (lambda (binding unique-var)
+                           (let ((value-expr (cadr binding)))
+                             (list unique-var
+                                   (uniquify-expr value-expr new-env))))
+                         bindings
+                         unique-vars))
+                   (body-unique
+                    (map (lambda (body-expr)
+                           (uniquify-expr body-expr new-env))
                         (cddr expr))))
              `(letrec ,unique-bindings ,@body-unique)))
           
@@ -546,6 +545,215 @@
   (canon expr))
 
 ;;; ============================================================================
+;;; Pass 1.75: Letrec Simplification
+;;; Rewrites general letrec groups into the lambda-only letrec form expected by
+;;; the existing recursive-closure desugaring pass.
+;;;
+;;; Any non-lambda letrec binding becomes an explicit box allocated by `let`.
+;;; References to those bindings are rewritten to `(unbox cell)` so closures see
+;;; the final location instead of a copied initialization value.
+;;;
+;;; For R7RS compatibility, non-lambda init expressions are rejected if they
+;;; directly read a letrec variable while the recursive knot is still being
+;;; initialized. That keeps this pass from accidentally implementing a fixed
+;;; left-to-right `letrec*`.
+;;; ============================================================================
+
+(define (simplify-letrec expr)
+  (define used-names
+    (dedupe-symbols
+     (let collect ((expr expr))
+       (cond
+         ((symbol? expr) (list expr))
+         ((pair? expr) (append-map collect expr))
+         (else '())))))
+
+  (define fresh-counter 0)
+  (define (fresh-internal-name prefix)
+    (let loop ()
+      (set! fresh-counter (+ fresh-counter 1))
+      (let ((name (string->symbol
+                   (string-append prefix (number->string fresh-counter)))))
+        (if (memq name used-names)
+            (loop)
+            (begin
+              (set! used-names (cons name used-names))
+              name)))))
+
+  (define (letrec-init-safe? expr group-names)
+    ;; A lambda is safe because creating it does not evaluate its body. Any
+    ;; direct read of a letrec-bound variable outside such a delay point is an
+    ;; R7RS letrec error.
+    (cond
+      ((symbol? expr)
+       (not (memq expr group-names)))
+      ((literal-expr? expr) #t)
+      ((pair? expr)
+       (case (car expr)
+         ((begin)
+          (all (lambda (e) (letrec-init-safe? e group-names)) (cdr expr)))
+         ((primop app)
+          (all (lambda (e) (letrec-init-safe? e group-names)) (cdr expr)))
+         ((if)
+          (and (letrec-init-safe? (cadr expr) group-names)
+               (letrec-init-safe? (caddr expr) group-names)
+               (letrec-init-safe? (cadddr expr) group-names)))
+         ((let)
+          (and (letrec-init-safe? (cadr (caadr expr)) group-names)
+               (all (lambda (e) (letrec-init-safe? e group-names)) (cddr expr))))
+         ((letrec)
+          (and (all (lambda (binding)
+                      (letrec-init-safe? (cadr binding) group-names))
+                    (cadr expr))
+               (all (lambda (e) (letrec-init-safe? e group-names)) (cddr expr))))
+         ((lambda)
+          #t)
+         ((cons make-vector vector-ref)
+          (and (letrec-init-safe? (cadr expr) group-names)
+               (letrec-init-safe? (caddr expr) group-names)))
+         ((+ - * = < >)
+          (and (letrec-init-safe? (cadr expr) group-names)
+               (letrec-init-safe? (caddr expr) group-names)))
+         ((box unbox car cdr pair? null? vector-length vector?)
+          (letrec-init-safe? (cadr expr) group-names))
+         ((set-box!)
+          (and (letrec-init-safe? (cadr expr) group-names)
+               (letrec-init-safe? (caddr expr) group-names)))
+         ((vector-set!)
+          (and (letrec-init-safe? (cadr expr) group-names)
+               (letrec-init-safe? (caddr expr) group-names)
+               (letrec-init-safe? (cadddr expr) group-names)))
+         ((global)
+          #t)
+         ((set-global!)
+          (letrec-init-safe? (caddr expr) group-names))
+         (else
+          (error "Unknown expression in letrec init safety check" (car expr)))))
+      (else
+       (error "Invalid expression in letrec init safety check" expr))))
+
+  (define (partition-letrec-bindings bindings)
+    (let loop ((rest bindings) (lambda-bindings '()) (value-bindings '()))
+      (if (null? rest)
+          (values (reverse lambda-bindings) (reverse value-bindings))
+          (let ((binding (car rest)))
+            (if (lambda-expr? (cadr binding))
+                (loop (cdr rest) (cons binding lambda-bindings) value-bindings)
+                (loop (cdr rest) lambda-bindings (cons binding value-bindings)))))))
+
+  (define (lookup-cell name cell-env)
+    (let ((binding (assoc name cell-env)))
+      (if binding
+          (cadr binding)
+          (error "Missing letrec cell for binding" name))))
+
+  (define (simplify-letrec-group bindings body-exprs env)
+    (let-values (((lambda-bindings value-bindings)
+                  (partition-letrec-bindings bindings)))
+      (let ((group-names (map car bindings)))
+        (for-each
+         (lambda (binding)
+           (if (not (letrec-init-safe? (cadr binding) group-names))
+               (error "letrec init cannot read recursive bindings during initialization"
+                      (car binding)
+                      (cadr binding))))
+         value-bindings)
+        (let* ((cell-env
+                (map (lambda (binding)
+                       (list (car binding) (fresh-internal-name "letrec.cell.")))
+                     value-bindings))
+               (extended-env (append cell-env env))
+               (simplified-lambda-bindings
+                (map (lambda (binding)
+                       (list (car binding)
+                             (rewrite (cadr binding) extended-env)))
+                     lambda-bindings))
+               (init-exprs
+                (map (lambda (binding)
+                       `(set-box! ,(lookup-cell (car binding) cell-env)
+                                  ,(rewrite (cadr binding) extended-env)))
+                     value-bindings))
+               (simplified-body
+                (map (lambda (body-expr)
+                       (rewrite body-expr extended-env))
+                     body-exprs))
+               (core-expr
+                (if (null? simplified-lambda-bindings)
+                    (body->expr (append init-exprs simplified-body))
+                    `(letrec ,simplified-lambda-bindings
+                       ,@init-exprs
+                       ,@simplified-body)))
+               (box-bindings
+                (map (lambda (binding)
+                       (list (cadr binding) '(box #f)))
+                     cell-env)))
+          (if (null? box-bindings)
+              core-expr
+              (nest-let-bindings box-bindings (list core-expr)))))))
+
+  (define (rewrite expr env)
+    (cond
+      ((symbol? expr)
+       (let ((binding (assoc expr env)))
+         (if binding
+             `(unbox ,(cadr binding))
+             expr)))
+      ((literal-expr? expr) expr)
+      ((pair? expr)
+       (case (car expr)
+         ((begin)
+          `(begin ,@(map (lambda (e) (rewrite e env)) (cdr expr))))
+         ((primop)
+          `(primop ,(cadr expr)
+                   ,@(map (lambda (e) (rewrite e env)) (cddr expr))))
+         ((if)
+          `(if ,(rewrite (cadr expr) env)
+               ,(rewrite (caddr expr) env)
+               ,(rewrite (cadddr expr) env)))
+         ((let)
+          (let* ((binding (caadr expr))
+                 (var (car binding))
+                 (val-expr (rewrite (cadr binding) env))
+                 (body-exprs (map (lambda (body-expr)
+                                    (rewrite body-expr env))
+                                  (cddr expr))))
+            `(let ((,var ,val-expr)) ,@body-exprs)))
+         ((lambda)
+          `(lambda ,(cadr expr)
+             ,@(map (lambda (body-expr) (rewrite body-expr env)) (cddr expr))))
+         ((letrec)
+          (simplify-letrec-group (cadr expr) (cddr expr) env))
+         ((app)
+          `(app ,(rewrite (cadr expr) env)
+                ,@(map (lambda (e) (rewrite e env)) (cddr expr))))
+         ((cons make-vector vector-ref)
+          `(,(car expr) ,(rewrite (cadr expr) env)
+                        ,(rewrite (caddr expr) env)))
+         ((+ - * = < >)
+          `(,(car expr) ,(rewrite (cadr expr) env)
+                        ,(rewrite (caddr expr) env)))
+         ((box unbox car cdr pair? null? vector-length vector?)
+          `(,(car expr) ,(rewrite (cadr expr) env)))
+         ((set-box!)
+          `(set-box! ,(rewrite (cadr expr) env)
+                     ,(rewrite (caddr expr) env)))
+         ((vector-set!)
+          `(vector-set! ,(rewrite (cadr expr) env)
+                        ,(rewrite (caddr expr) env)
+                        ,(rewrite (cadddr expr) env)))
+         ((global)
+          expr)
+         ((set-global!)
+          `(set-global! ,(cadr expr)
+                        ,(rewrite (caddr expr) env)))
+         (else
+          (error "Unknown expression in letrec simplification" (car expr)))))
+      (else
+       (error "Invalid expression in letrec simplification" expr))))
+
+  (rewrite expr '()))
+
+;;; ============================================================================
 ;;; Pass 2: Letrec Desugaring
 ;;; Rewrites lambda-only letrec groups into explicit allocation and
 ;;; initialization. Recursive bindings become boxes containing closures.
@@ -554,7 +762,8 @@
 ;;; to explicit self/group tail-call markers, which later stages can lower into
 ;;; jumps instead of ordinary calls.
 ;;;
-;;; INPUT GRAMMAR: Uniquified (same structure as the Lowered grammar).
+;;; INPUT GRAMMAR: Letrec-simplified (same structure as the Lowered grammar,
+;;;                except every surviving letrec binding is a lambda).
 ;;;
 ;;; OUTPUT GRAMMAR (Desugared)
 ;;;
@@ -5566,7 +5775,8 @@
   (let-values (((lowered-program global-count) (lower-source-program expr)))
     (let* ((uniquified (uniquify lowered-program))
            (canonicalized (canonicalize-builtins uniquified))
-           (desugared (desugar-letrec canonicalized))
+           (letrec-simplified (simplify-letrec canonicalized))
+           (desugared (desugar-letrec letrec-simplified))
            (closure-converted (closure-convert desugared))
            (cfa-normalized (normalize-for-cfa closure-converted))
            (cfa-analysis (run-0cfa cfa-normalized))
@@ -5591,20 +5801,21 @@
                        (optimize-unsafe-arith-cfg
                          (optimize-unsafe-car-cdr-cfg (cdr procedure+cfg)))))))
                  procedure-cfgs)))
-            (values lowered-program
-              global-count
-              uniquified
-              canonicalized
-              desugared
-              closure-converted
-              cfa-normalized
-              cfa-rewritten
+             (values lowered-program
+               global-count
+               uniquified
+               canonicalized
+               letrec-simplified
+               desugared
+               closure-converted
+               cfa-normalized
+               cfa-rewritten
               optimized-entry-cfg
               optimized-procedure-cfgs))))))
 
 (define (compile-to-backend expr)
-  (let-values (((lowered-program global-count uniquified canonicalized desugared closure-converted cfa-normalized
-                             cfa-rewritten entry-cfg procedures)
+  (let-values (((lowered-program global-count uniquified canonicalized letrec-simplified desugared closure-converted cfa-normalized
+                              cfa-rewritten entry-cfg procedures)
                  (compile-to-cfg expr)))
     (let ((entry-machine
            (cfg->allocated-machine-procedure 'scheme_entry '() entry-cfg))
@@ -5619,6 +5830,7 @@
               global-count
               uniquified
               canonicalized
+              letrec-simplified
               desugared
               closure-converted
               cfa-normalized
@@ -5629,10 +5841,10 @@
               procedure-machines))))
 
 (define (write-aarch64-program expr path)
-  (let-values (((lowered-program global-count uniquified canonicalized desugared closure-converted cfa-normalized
-                              cfa-rewritten entry-cfg procedures
-                               entry-machine procedure-machines)
-                  (compile-to-backend expr)))
+  (let-values (((lowered-program global-count uniquified canonicalized letrec-simplified desugared closure-converted cfa-normalized
+                               cfa-rewritten entry-cfg procedures
+                                entry-machine procedure-machines)
+                   (compile-to-backend expr)))
     (call-with-output-file path
       (lambda (port)
         (emit-aarch64-program port entry-machine procedure-machines global-count)))))
@@ -5660,9 +5872,9 @@
   (write expr) (newline)
   
   (display "\n=== After Program Lowering ===\n")
-  (let-values (((lowered-program global-count uniquified canonicalized desugared closure-converted cfa-normalized
-                              cfa-rewritten entry-cfg procedures
-                               entry-machine procedure-machines)
+  (let-values (((lowered-program global-count uniquified canonicalized letrec-simplified desugared closure-converted cfa-normalized
+                               cfa-rewritten entry-cfg procedures
+                                entry-machine procedure-machines)
                  (compile-to-backend expr)))
     (write lowered-program) (newline)
     (display "Global slots: ")
@@ -5674,6 +5886,9 @@
 
     (display "\n=== After Builtin Canonicalization ===\n")
     (write canonicalized) (newline)
+
+    (display "\n=== After letrec Simplification ===\n")
+    (write letrec-simplified) (newline)
 
     (display "\n=== After letrec Desugaring ===\n")
     (write desugared) (newline)

@@ -80,6 +80,29 @@ assert_file_output() {
   printf 'ok %s\n' "$case_name"
 }
 
+assert_compile_error() {
+  local case_name="$1"
+  local expected_pattern="$2"
+  local source_text="$3"
+  local source_path asm_path log_path
+  source_path="$TMPDIR/$case_name.scm"
+  asm_path="$(asm_path_for "$case_name")"
+  log_path="$TMPDIR/$case_name.log"
+  printf '%s\n' "$source_text" >"$source_path"
+  if guile --r7rs -c \
+    "(load \"$ROOT/compiler.scm\") (write-aarch64-program-file \"$source_path\" \"$asm_path\")" \
+    >"$log_path" 2>&1; then
+    printf 'unexpected compile success for %s\n' "$case_name" >&2
+    exit 1
+  fi
+  if ! grep -Eq "$expected_pattern" "$log_path"; then
+    printf 'missing compile error pattern for %s\n' "$case_name" >&2
+    cat "$log_path" >&2
+    exit 1
+  fi
+  printf 'ok %s\n' "$case_name"
+}
+
 assert_asm_contains() {
   local test_name="$1"
   local pattern="$2"
@@ -169,6 +192,9 @@ runtime_cases=(
   "test63|7"
   "test64|5"
   "test65|42|2048"
+  "test66|42"
+  "test67|42"
+  "test68|1"
 )
 
 for case in "${runtime_cases[@]}"; do
@@ -213,5 +239,10 @@ assert_file_output \
   "file-test1" \
   "42" \
   $'(define base 40)\n(begin (define bump (lambda (x) (primop + base x))))\n(app bump 2)'
+
+assert_compile_error \
+  "file-letrec-init-read" \
+  'letrec init cannot read recursive bindings during initialization' \
+  $'(letrec ((x 1)\n          (y x))\n   y)'
 
 echo "compiler tests passed"

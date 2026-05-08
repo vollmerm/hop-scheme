@@ -557,6 +557,30 @@
         (app fill 50)
         (vector-ref keep 0))))
 
+;; test66: letrec with only non-lambda bindings behaves like ordinary recursive
+;; locations when no init touches the group.
+(define test66
+  '(letrec ((x 40)
+            (y 2))
+     (primop + x y)))
+
+;; test67: lambda letrec bindings can capture non-lambda letrec locations.
+(define test67
+  '(letrec ((x 1)
+            (bump
+             (lambda (n)
+               (primop + x n))))
+     (app bump 41)))
+
+;; test68: a syntactically non-lambda letrec init may still produce a closure as
+;; long as evaluating the init does not read the recursive group.
+(define test68
+  '(letrec ((x 1)
+            (f (if #t
+                   (lambda () x)
+                   (lambda () 0))))
+     (app f)))
+
 (define sample-tests
   (list (cons "Test 1: Simple arithmetic" test1)
         (cons "Test 2: Lambda application" test2)
@@ -621,7 +645,10 @@
         (cons "Test 62: vector? predicate" test62)
         (cons "Test 63: nested vectors" test63)
         (cons "Test 64: vector-ref as first-class value" test64)
-        (cons "Test 65: vector GC stress" test65)))
+        (cons "Test 65: vector GC stress" test65)
+        (cons "Test 66: letrec with non-lambda constants" test66)
+        (cons "Test 67: lambda letrec captures non-lambda binding" test67)
+        (cons "Test 68: non-lambda letrec init returns closure" test68)))
 
 (define named-tests
   ;; These are runnable end-to-end regression cases. test6 and test7 stay as
@@ -687,7 +714,10 @@
          (cons 'test62 test62)
          (cons 'test63 test63)
          (cons 'test64 test64)
-         (cons 'test65 test65)))
+         (cons 'test65 test65)
+         (cons 'test66 test66)
+         (cons 'test67 test67)
+         (cons 'test68 test68)))
 
 (define (lookup-named-test name)
   (let ((binding (assoc name named-tests)))
