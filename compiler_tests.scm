@@ -581,6 +581,76 @@
                    (lambda () 0))))
      (app f)))
 
+(define test69
+  '(letrec ((f (lambda (x)
+                 (app g x 1)))
+            (g (lambda (a b)
+                 (if (primop = a 0)
+                     b
+                     (app f (primop - a 1))))))
+     (app f 3)))
+
+(define test70
+  '(let ((x 10)
+         (y 20))
+     (letrec ((f (lambda (n)
+                   (if (primop = n 0)
+                       (primop + x y)
+                       (app g (primop - n 1)))))
+              (g (lambda (m)
+                   (if (primop = m 0)
+                       x
+                       (app f (primop - m 1))))))
+       (app f 3))))
+
+(define test71
+  '(let ((x 10)
+         (y 20))
+     (letrec ((f (lambda (n)
+                   (if (primop = n 0)
+                       (primop + x y)
+                       (app g (primop - n 1)))))
+              (g (lambda (m)
+                   (if (primop = m 0)
+                       x
+                       (app f (primop - m 1))))))
+       (app f 0))))
+
+(define test69
+  '(letrec ((f (lambda (x)
+                 (app g x 1)))
+            (g (lambda (a b)
+                 (if (primop = a 0)
+                     b
+                     (app f (primop - a 1))))))
+     (app f 3)))
+
+(define test70
+  '(let ((x 10)
+         (y 20))
+     (letrec ((f (lambda (n)
+                   (if (primop = n 0)
+                       (primop + x y)
+                       (app g (primop - n 1)))))
+              (g (lambda (m)
+                   (if (primop = m 0)
+                       x
+                       (app f (primop - m 1))))))
+       (app f 3))))
+
+(define test71
+  '(let ((x 10)
+         (y 20))
+     (letrec ((f (lambda (n)
+                   (if (primop = n 0)
+                       (primop + x y)
+                       (app g (primop - n 1)))))
+              (g (lambda (m)
+                   (if (primop = m 0)
+                       x
+                       (app f (primop - m 1))))))
+       (app f 0))))
+
 (define sample-tests
   (list (cons "Test 1: Simple arithmetic" test1)
         (cons "Test 2: Lambda application" test2)
@@ -648,7 +718,10 @@
         (cons "Test 65: vector GC stress" test65)
         (cons "Test 66: letrec with non-lambda constants" test66)
         (cons "Test 67: lambda letrec captures non-lambda binding" test67)
-        (cons "Test 68: non-lambda letrec init returns closure" test68)))
+        (cons "Test 68: non-lambda letrec init returns closure" test68)
+        (cons "Test 69: non-uniform arity cluster" test69)
+        (cons "Test 70: per-member capture subsets (g path)" test70)
+        (cons "Test 71: per-member capture subsets (f base path)" test71)))
 
 (define named-tests
   ;; These are runnable end-to-end regression cases. test6 and test7 stay as
@@ -717,7 +790,10 @@
          (cons 'test65 test65)
          (cons 'test66 test66)
          (cons 'test67 test67)
-         (cons 'test68 test68)))
+         (cons 'test68 test68)
+         (cons 'test69 test69)
+         (cons 'test70 test70)
+         (cons 'test71 test71)))
 
 (define (lookup-named-test name)
   (let ((binding (assoc name named-tests)))
