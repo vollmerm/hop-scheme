@@ -21,7 +21,8 @@
 
 (import (scheme base)
         (scheme read)
-        (scheme write))
+        (scheme write)
+        srfi-69)
 
 ;;; ============================================================================
 ;;; Shared Helpers
@@ -1992,10 +1993,10 @@
   (define changed #f)
 
   (define (table-keys table)
-    (map car (cdr table)))
+    (hash-table-keys table))
 
   (define (flow-ref table key)
-    (let ((value (hash-ref table key)))
+    (let ((value (hash-table-ref/default table key #f)))
       (if value value '())))
 
   (define (add-flow! table key values)
@@ -2006,7 +2007,7 @@
           (if (set-equal? current updated)
               #f
               (begin
-                (hash-set! table key updated)
+                (hash-table-set! table key updated)
                 (set! changed #t)
                 #t)))))
 
@@ -2043,7 +2044,7 @@
           (let ((proc-name (cadr expr))
                 (lambda-expr (caddr expr))
                 (captures (cdddr expr)))
-            (hash-set! procedures
+            (hash-table-set! procedures
                        proc-name
                        (list (length captures)
                              (cadr lambda-expr)
@@ -2109,7 +2110,7 @@
             (analyze-expr (body->expr (cddr expr)) current-proc))
           ((make-closure)
            (let* ((proc-name (cadr expr))
-                  (meta (hash-ref procedures proc-name))
+                  (meta (hash-table-ref/default procedures proc-name #f))
                  (capture-count (car meta))
                  (params (cadr meta))
                  (captures (cdddr expr))
@@ -2141,7 +2142,7 @@
              ;; abstract results that procedure may return.
              (for-each
               (lambda (proc-name)
-                (let* ((meta (hash-ref procedures proc-name))
+                (let* ((meta (hash-table-ref/default procedures proc-name #f))
                       (capture-count (car meta))
                       (params (cadr meta))
                       (actual-params (list-tail params capture-count)))
@@ -2159,7 +2160,7 @@
                         (set-union result
                                    (flow-ref proc-results (car rest))))))))
           ((self-tail-call)
-           (let ((meta (and current-proc (hash-ref procedures current-proc))))
+           (let ((meta (and current-proc (hash-table-ref/default procedures current-proc #f))))
              (if (not meta)
                  '()
                  (let* ((capture-count (car meta))
@@ -2221,7 +2222,7 @@
     (analyze-expr expr #f)
     (for-each
      (lambda (proc-name)
-       (let* ((meta (hash-ref procedures proc-name))
+       (let* ((meta (hash-table-ref/default procedures proc-name #f))
               (body (caddr meta))
               (result-set (analyze-expr body proc-name)))
          (add-flow! proc-results proc-name result-set)))
@@ -2236,7 +2237,7 @@
          (box-flow (caddr analysis))
          (global-flow (cadddr analysis)))
     (define (flow-ref table key)
-      (let ((value (hash-ref table key)))
+      (let ((value (hash-table-ref/default table key #f)))
         (if value value '())))
 
     (define (repr-name expr)
@@ -2310,9 +2311,9 @@
                ;; closure value for its environment but replace the generic
                ;; indirect call with a direct known-call form.
                (if (and (= (length targets) 1)
-                        (hash-ref procedures (car targets)))
+                        (hash-table-ref/default procedures (car targets) #f))
                    (let* ((proc-name (car targets))
-                          (meta (hash-ref procedures proc-name))
+                          (meta (hash-table-ref/default procedures proc-name #f))
                           (capture-count (car meta)))
                     `(known-call ,proc-name ,capture-count ,rator ,@args))
                   `(closure-call ,rator ,@args))))
@@ -3340,7 +3341,7 @@
         (let* ((block (car block-list))
                (label (basic-block-label block)))
           (when label
-            (hash-set! label->block label i))))
+            (hash-table-set! label->block label i))))
       
       ;; Determine successors for each block
       (do ((i 0 (+ i 1)) (block-list blocks (cdr block-list)))
@@ -3358,17 +3359,17 @@
               ;; Conditional branch
               (let ((then-label (caddr last-instr))
                     (else-label (cadddr last-instr)))
-               (set-basic-block-successors! 
-                block 
-                (list (hash-ref label->block then-label)
-                      (hash-ref label->block else-label)))))
+                (set-basic-block-successors! 
+                 block 
+                 (list (hash-table-ref/default label->block then-label #f)
+                       (hash-table-ref/default label->block else-label #f)))))
             
              ((and (pair? last-instr) (eq? (car last-instr) 'goto))
               ;; Unconditional jump
               (let ((target-label (cadr last-instr)))
                 (set-basic-block-successors! 
                  block 
-                 (list (hash-ref label->block target-label)))))
+                 (list (hash-table-ref/default label->block target-label #f)))))
              
               ((and (pair? last-instr) (memq (car last-instr) '(return tail-call direct-tail-call)))
                ;; Function/program exit
@@ -5786,20 +5787,6 @@
               (emit-procedure-descriptor port proc))
             procedures)
   (emit-global-slots port global-count))
-
-;;; ============================================================================
-;;; Simple hash table implementation 
-;;; ============================================================================
-
-(define (make-hash-table) (list 'hash-table))
-(define (hash-set! ht key value)
-  (let ((pair (assoc key (cdr ht))))
-    (if pair
-        (set-cdr! pair value)
-        (set-cdr! ht (cons (cons key value) (cdr ht))))))
-(define (hash-ref ht key)
-  (let ((pair (assoc key (cdr ht))))
-    (if pair (cdr pair) #f)))
 
 ;;; ============================================================================
 ;;; Main Compiler Driver
