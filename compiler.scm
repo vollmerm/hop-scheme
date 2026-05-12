@@ -22,6 +22,7 @@
 (import (scheme base)
         (scheme read)
         (scheme write)
+        srfi-1
         srfi-69)
 
 ;;; ============================================================================
@@ -44,6 +45,13 @@
     (if (null? rest)
         result
         (append result (proc (car rest)) (loop (cdr rest) '())))))
+
+(define (ash n count)
+  (if (negative? count)
+      (floor (/ n (expt 2 (- count))))
+      (* n (expt 2 count))))
+
+
 
 (define (dedupe-symbols lst)
   (let loop ((rest lst) (seen '()) (result '()))
