@@ -8,7 +8,7 @@ trap 'rm -rf "$TMPDIR"' EXIT
 generate() {
   local test_name="$1"
   local asm_path="$2"
-  csi -R r7rs -e \
+  csi -R r7rs -I "$ROOT" -e \
     "(begin (load \"$ROOT/compiler.scm\") (load \"$ROOT/compiler_tests.scm\") (write-named-aarch64-program '$test_name \"$asm_path\"))"
 }
 
@@ -66,7 +66,7 @@ assert_file_output() {
   asm_path="$(asm_path_for "$case_name")"
   exe_path="$(exe_path_for "$case_name")"
   printf '%s\n' "$source_text" >"$source_path"
-  csi -R r7rs -e \
+  csi -R r7rs -I "$ROOT" -e \
     "(begin (load \"$ROOT/compiler.scm\") (write-aarch64-program-file \"$source_path\" \"$asm_path\"))"
   clang -arch arm64 -o "$exe_path" \
     "$asm_path" \
@@ -89,7 +89,7 @@ assert_compile_error() {
   asm_path="$(asm_path_for "$case_name")"
   log_path="$TMPDIR/$case_name.log"
   printf '%s\n' "$source_text" >"$source_path"
-  if csi -R r7rs -e \
+  if csi -R r7rs -I "$ROOT" -e \
     "(begin (load \"$ROOT/compiler.scm\") (write-aarch64-program-file \"$source_path\" \"$asm_path\"))" \
     >"$log_path" 2>&1; then
     printf 'unexpected compile success for %s\n' "$case_name" >&2
