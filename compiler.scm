@@ -14,22 +14,15 @@
 ;;;     -> backend + allocation      (hop backend)
 ;;;     -> AArch64 assembly          (hop backend)
 
-;;; Under Chicken 5 in interpreted (csi) mode, user-defined R7RS libraries are
-;;; not discovered from the include path at import time. We must load each
-;;; .sld file so Chicken registers the module before we import it.
-;;; load-relative resolves paths relative to this file's directory, so
-;;; compiler.scm can be loaded from any working directory.
-(import (chicken load))
-(for-each load-relative
-          '("hop/utils.sld"
-            "hop/pass/lower.sld"
-            "hop/pass/uniquify.sld"
-            "hop/pass/letrec.sld"
-            "hop/pass/closure.sld"
-            "hop/pass/cfa.sld"
-            "hop/pass/tac.sld"
-            "hop/pass/cfg.sld"
-            "hop/backend.sld"))
+(include "hop/utils.sld")
+(include "hop/pass/lower.sld")
+(include "hop/pass/uniquify.sld")
+(include "hop/pass/letrec.sld")
+(include "hop/pass/closure.sld")
+(include "hop/pass/cfa.sld")
+(include "hop/pass/tac.sld")
+(include "hop/pass/cfg.sld")
+(include "hop/backend.sld")
 
 (import (scheme base)
         (scheme read)
