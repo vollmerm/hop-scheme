@@ -688,6 +688,69 @@
                         (primop + 1 (app size (cdr x)))))))
      (app size (quote (a b c)))))
 
+;; test81+ exercise the surface desugaring pass: bare applications, define
+;; sugar, derived conditionals, and binding forms.
+
+(define test81
+  '(let loop ((n 5) (acc 1))
+     (if (= n 0)
+         acc
+         (loop (- n 1) (* acc n)))))
+
+(define test82
+  '(program
+    (define (kind x)
+      (cond ((null? x) 'empty)
+            ((pair? x) 'pair)
+            ((symbol? x) 'symbol)
+            (else 'other)))
+    (kind 'a)))
+
+(define test83
+  '(if (and (not #f) (or #f 7)) 'yes 'no))
+
+(define test84
+  '(program
+    (define (sum-squares a b)
+      (define (square n) (* n n))
+      (+ (square a) (square b)))
+    (sum-squares 3 4)))
+
+(define test85
+  '(let ((classify (lambda (s)
+                     (case s
+                       ((a e i o u) 'vowel)
+                       ((1 2 3) 'digit)
+                       (else 'other)))))
+     (classify 'e)))
+
+(define test86
+  '(let* ((x 2)
+          (y (* x x))
+          (z (* y y)))
+     z))
+
+(define test87
+  '(cond (#f => car)
+         (5 => (lambda (v) (+ v 2)))
+         (else 0)))
+
+(define test88
+  '(if (if #f 1) 2 3))
+
+(define test89
+  '(program
+    (define (assq-ref key table)
+      (cond ((null? table) #f)
+            ((eq? (car (car table)) key) (cdr (car table)))
+            (else (assq-ref key (cdr table)))))
+    (assq-ref 'b '((a . 1) (b . 2) (c . 3)))))
+
+(define test90
+  '(begin
+     (when (eq? 'x 'y) 100)
+     (unless (eq? 'x 'y) 200)))
+
 (define sample-tests
   (list (cons "Test 1: Simple arithmetic" test1)
         (cons "Test 2: Lambda application" test2)
@@ -767,7 +830,17 @@
         (cons "Test 77: pair? and traversal of quoted list" test77)
         (cons "Test 78: quoted list of fixnums" test78)
         (cons "Test 79: quoted structure is constructed once (eq? identity)" test79)
-        (cons "Test 80: recursion over quoted list" test80)))
+        (cons "Test 80: recursion over quoted list" test80)
+        (cons "Test 81: named let loop (surface)" test81)
+        (cons "Test 82: cond dispatch with define sugar (surface)" test82)
+        (cons "Test 83: and/or/not (surface)" test83)
+        (cons "Test 84: internal defines (surface)" test84)
+        (cons "Test 85: case dispatch (surface)" test85)
+        (cons "Test 86: let* sequential bindings (surface)" test86)
+        (cons "Test 87: cond arrow clauses (surface)" test87)
+        (cons "Test 88: two-armed if (surface)" test88)
+        (cons "Test 89: alist lookup over dotted quoted data (surface)" test89)
+        (cons "Test 90: when/unless (surface)" test90)))
 
 (define named-tests
   ;; These are runnable end-to-end regression cases. test6 and test7 stay as
@@ -848,7 +921,17 @@
          (cons 'test77 test77)
          (cons 'test78 test78)
          (cons 'test79 test79)
-         (cons 'test80 test80)))
+         (cons 'test80 test80)
+         (cons 'test81 test81)
+         (cons 'test82 test82)
+         (cons 'test83 test83)
+         (cons 'test84 test84)
+         (cons 'test85 test85)
+         (cons 'test86 test86)
+         (cons 'test87 test87)
+         (cons 'test88 test88)
+         (cons 'test89 test89)
+         (cons 'test90 test90)))
 
 (define (lookup-named-test name)
   (let ((binding (assoc name named-tests)))

@@ -4,6 +4,7 @@
 ;;; library directory and are imported below.
 ;;;
 ;;;   source program
+;;;     -> surface desugaring        (hop pass surface)
 ;;;     -> program lowering          (hop pass lower)
 ;;;     -> uniquify                  (hop pass uniquify)
 ;;;     -> letrec simplification     (hop pass letrec)
@@ -15,6 +16,7 @@
 ;;;     -> AArch64 assembly          (hop backend)
 
 (include "hop/utils.sld")
+(include "hop/pass/surface.sld")
 (include "hop/pass/lower.sld")
 (include "hop/pass/uniquify.sld")
 (include "hop/pass/letrec.sld")
@@ -29,6 +31,7 @@
         (scheme write)
         (scheme file)
         (hop utils)
+        (hop pass surface)
         (hop pass lower)
         (hop pass uniquify)
         (hop pass letrec)
@@ -50,10 +53,11 @@
 ;;; ============================================================================
 
 (define (compile-to-cfg expr)
-  ;; Every public entry point goes through program lowering first, even the
-  ;; original "single expression" path. That keeps the whole compiler talking
-  ;; about one uniform internal program shape.
-  (let-values (((lowered-program global-count) (lower-source-program expr)))
+  ;; Every public entry point goes through surface desugaring and program
+  ;; lowering first, even the original "single expression" path. That keeps
+  ;; the whole compiler talking about one uniform internal program shape.
+  (let ((surface (desugar-surface expr)))
+   (let-values (((lowered-program global-count) (lower-source-program surface)))
     (let* ((uniquified (uniquify lowered-program))
            (canonicalized (canonicalize-builtins uniquified))
            (letrec-simplified (simplify-letrec canonicalized))
@@ -82,7 +86,8 @@
                        (optimize-unsafe-arith-cfg
                          (optimize-unsafe-car-cdr-cfg (cdr procedure+cfg)))))))
                  procedure-cfgs)))
-             (values lowered-program
+             (values surface
+               lowered-program
                global-count
                uniquified
                canonicalized
@@ -92,10 +97,10 @@
                cfa-normalized
                cfa-rewritten
               optimized-entry-cfg
-              optimized-procedure-cfgs))))))
+              optimized-procedure-cfgs)))))))
 
 (define (compile-to-backend expr)
-  (let-values (((lowered-program global-count uniquified canonicalized letrec-simplified desugared closure-converted cfa-normalized
+  (let-values (((surface lowered-program global-count uniquified canonicalized letrec-simplified desugared closure-converted cfa-normalized
                               cfa-rewritten entry-cfg procedures)
                  (compile-to-cfg expr)))
     (let ((entry-machine
@@ -107,7 +112,8 @@
                    (procedure-params (car procedure+cfg))
                    (cdr procedure+cfg)))
                 procedures)))
-      (values lowered-program
+      (values surface
+              lowered-program
               global-count
               uniquified
               canonicalized
@@ -122,7 +128,7 @@
               procedure-machines))))
 
 (define (write-aarch64-program expr path)
-  (let-values (((lowered-program global-count uniquified canonicalized letrec-simplified desugared closure-converted cfa-normalized
+  (let-values (((surface lowered-program global-count uniquified canonicalized letrec-simplified desugared closure-converted cfa-normalized
                                cfa-rewritten entry-cfg procedures
                                 entry-machine procedure-machines)
                    (compile-to-backend expr)))
@@ -152,11 +158,14 @@
   (display "=== Source Program ===\n")
   (write expr) (newline)
 
-  (display "\n=== After Program Lowering ===\n")
-  (let-values (((lowered-program global-count uniquified canonicalized letrec-simplified desugared closure-converted cfa-normalized
+  (let-values (((surface lowered-program global-count uniquified canonicalized letrec-simplified desugared closure-converted cfa-normalized
                                cfa-rewritten entry-cfg procedures
                                 entry-machine procedure-machines)
                  (compile-to-backend expr)))
+    (display "\n=== After Surface Desugaring ===\n")
+    (write surface) (newline)
+
+    (display "\n=== After Program Lowering ===\n")
     (write lowered-program) (newline)
     (display "Global slots: ")
     (write global-count)

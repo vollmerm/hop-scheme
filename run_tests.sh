@@ -207,6 +207,16 @@ runtime_cases=(
   "test78|2"
   "test79|5"
   "test80|3"
+  "test81|120"
+  "test82|symbol"
+  "test83|yes"
+  "test84|25"
+  "test85|vowel"
+  "test86|16"
+  "test87|7"
+  "test88|3"
+  "test89|2"
+  "test90|200"
 )
 
 for case in "${runtime_cases[@]}"; do
@@ -261,6 +271,19 @@ assert_file_output \
   "file-quote2" \
   "y" \
   $'(car (cdr \'(x y)))'
+
+assert_file_output \
+  "file-surface1" \
+  "3" \
+  $'(define (len xs)\n  (if (null? xs) 0 (+ 1 (len (cdr xs)))))\n(len \'(a b c))'
+
+# A miniature tree rewriter in plain surface Scheme: quoted symbol data,
+# eq? dispatch via cond, structural recursion, bare applications. This is the
+# shape of a compiler pass, which is what self-hosting ultimately needs.
+assert_file_output \
+  "file-surface2" \
+  "new" \
+  $'(define (rename-tree x)\n  (cond ((null? x) \'())\n        ((pair? x) (cons (rename-tree (car x)) (rename-tree (cdr x))))\n        ((eq? x \'old) \'new)\n        (else x)))\n(car (rename-tree \'(old other)))'
 
 assert_compile_error \
   "file-letrec-init-read" \
