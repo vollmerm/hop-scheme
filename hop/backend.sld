@@ -99,6 +99,7 @@
         ((unsafe-cdr) (list `(unsafe-load-cdr ,dst ,(caddr rhs))))
         ((pair?) (list `(is-pair   ,dst ,(caddr rhs))))
         ((null?) (list `(is-null   ,dst ,(caddr rhs))))
+        ((symbol?) (list `(is-symbol ,dst ,(caddr rhs))))
         ((make-vector) (list `(alloc-vector ,dst ,(caddr rhs) ,(cadddr rhs))))
         ((vector-length) (list `(vector-length ,dst ,(caddr rhs))))
         ((vector-ref) (list `(vector-ref ,dst ,(caddr rhs) ,(cadddr rhs))))
@@ -202,7 +203,7 @@
     ((binop safe-binop)
      (append (if (symbol? (cadddr instr)) (list (cadddr instr)) '())
              (if (symbol? (car (cddddr instr))) (list (car (cddddr instr))) '())))
-    ((alloc-box load-box load-car load-cdr is-pair is-null is-vector vector-length load-closure-env)
+    ((alloc-box load-box load-car load-cdr is-pair is-null is-symbol is-vector vector-length load-closure-env)
      (if (symbol? (caddr instr)) (list (caddr instr)) '()))
     ((unsafe-load-car unsafe-load-cdr)
      (if (symbol? (caddr instr)) (list (caddr instr)) '()))
@@ -273,7 +274,7 @@
 (define (machine-instr-defs instr)
   (case (car instr)
     ((move-in move alloc-pair alloc-vector alloc-box load-box load-car load-cdr
-             unsafe-load-car unsafe-load-cdr is-pair is-null is-vector
+             unsafe-load-car unsafe-load-cdr is-pair is-null is-symbol is-vector
              vector-length vector-ref vector-set!
              load-closure-env load-global alloc-closure call call-known)
       (list (cadr instr)))
@@ -659,6 +660,9 @@
     ((is-null)
      `(is-null ,(lookup-home homes (cadr instr))
                ,(lookup-home homes (caddr instr))))
+    ((is-symbol)
+     `(is-symbol ,(lookup-home homes (cadr instr))
+                 ,(lookup-home homes (caddr instr))))
     ((is-vector)
      `(is-vector ,(lookup-home homes (cadr instr))
                  ,(lookup-home homes (caddr instr))))
@@ -1071,11 +1075,35 @@
 (define box-tag 2)
 (define closure-tag 3)
 (define vector-tag 4)
+(define symbol-tag 5)
 (define null-immediate 20)
 (define false-immediate 36)
 (define true-immediate 52)
 (define uninitialized-immediate 68)
 (define unsafe-pair-load-mode 'fast)
+
+;;; ── Symbol interning ───────────────────────────────────────────────────────
+;;; Symbols are immediates: (index << fixnum-shift) | symbol-tag. The table
+;;; is filled lazily while code is emitted (every quoted symbol reaches the
+;;; emitter through encode-immediate), and the name table is emitted into the
+;;; data section afterwards so the runtime can print interned symbols. The
+;;; table is per-program state; emit-aarch64-program resets it.
+
+(define interned-symbols '())   ; assq list of (sym . index), most recent first
+(define interned-symbol-count 0)
+
+(define (reset-interned-symbols!)
+  (set! interned-symbols '())
+  (set! interned-symbol-count 0))
+
+(define (intern-symbol! sym)
+  (let ((entry (assq sym interned-symbols)))
+    (if entry
+        (cdr entry)
+        (let ((index interned-symbol-count))
+          (set! interned-symbols (cons (cons sym index) interned-symbols))
+          (set! interned-symbol-count (+ interned-symbol-count 1))
+          index))))
 
 (define (encode-immediate value)
   (cond
@@ -1083,6 +1111,8 @@
     ((eq? value #f) false-immediate)
     ((eq? value #t) true-immediate)
     ((number? value) (ash value fixnum-shift))
+    ((quoted-symbol-expr? value)
+     (+ (ash (intern-symbol! (cadr value)) fixnum-shift) symbol-tag))
     (else (error "Expected immediate value" value))))
 
 (define (immediate->string value)
@@ -1256,6 +1286,11 @@
                                    (number->string fixnum-shift)))
      (emit-store-operand port "x11" dst proc))
     ((eq? op '=)
+      (emit-asm-line port "    cmp x9, x10")
+      (emit-bool-result port "eq" dst proc))
+    ;; eq? compares the full tagged words, so it is valid for any two Scheme
+    ;; values: fixnums, symbols, immediates, and heap pointers alike.
+    ((eq? op 'eq?)
       (emit-asm-line port "    cmp x9, x10")
       (emit-bool-result port "eq" dst proc))
     ((eq? op '<)
@@ -1462,6 +1497,15 @@
     ((is-null)
       (emit-immediate-compare port (caddr instr) null-immediate proc)
       (emit-bool-result port "eq" (cadr instr) proc))
+    ((is-symbol)
+      (emit-load-operand port "x9" (caddr instr) proc)
+      (emit-asm-line port
+                     (string-append "    and x10, x9, #"
+                                    (number->string tag-mask)))
+      (emit-asm-line port
+                     (string-append "    cmp x10, #"
+                                     (number->string symbol-tag)))
+      (emit-bool-result port "eq" (cadr instr) proc))
     ((store-box)
         (emit-load-box-address port (cadr instr) proc)
         (emit-load-operand port "x10" (caddr instr) proc)
@@ -1570,7 +1614,50 @@
                                         (number->string uninitialized-immediate)))
           (loop (+ index 1))))))
 
+(define (asciz-escape text)
+  (let loop ((chars (string->list text)) (result '()))
+    (if (null? chars)
+        (list->string (reverse result))
+        (let ((ch (car chars)))
+          (loop (cdr chars)
+                (if (or (char=? ch #\") (char=? ch #\\))
+                    (cons ch (cons #\\ result))
+                    (cons ch result)))))))
+
+(define (symbol-name-label index)
+  (string-append "Lsymname." (number->string index)))
+
+(define (emit-symbol-table port)
+  ;; Interning order is most-recent-first in the assq list; emit the name
+  ;; pointers in index order so hop_symbol_names[index] lines up with the
+  ;; encoded immediates.
+  (let ((by-index (reverse interned-symbols)))
+    (emit-asm-line port (string-append ".globl " (asm-name 'hop_symbol_count)))
+    (emit-asm-line port ".p2align 3")
+    (emit-asm-line port (string-append (asm-name 'hop_symbol_count) ":"))
+    (emit-asm-line port
+                   (string-append "    .quad "
+                                  (number->string interned-symbol-count)))
+    (emit-asm-line port (string-append ".globl " (asm-name 'hop_symbol_names)))
+    (emit-asm-line port ".p2align 3")
+    (emit-asm-line port (string-append (asm-name 'hop_symbol_names) ":"))
+    (for-each (lambda (entry)
+                (emit-asm-line port
+                               (string-append "    .quad "
+                                              (symbol-name-label (cdr entry)))))
+              by-index)
+    (for-each (lambda (entry)
+                (emit-asm-line port
+                               (string-append (symbol-name-label (cdr entry)) ":"))
+                (emit-asm-line port
+                               (string-append "    .asciz \""
+                                              (asciz-escape
+                                               (symbol->string (car entry)))
+                                              "\"")))
+              by-index)))
+
 (define (emit-aarch64-program port entry-proc procedures global-count)
+  (reset-interned-symbols!)
   (emit-asm-line port ".text")
   (emit-asm-line port "")
   (emit-machine-procedure port entry-proc 'scheme_entry)
@@ -1583,6 +1670,7 @@
   (for-each (lambda (proc)
               (emit-procedure-descriptor port proc))
             procedures)
-  (emit-global-slots port global-count))
+  (emit-global-slots port global-count)
+  (emit-symbol-table port))
 
 )) ; end define-library

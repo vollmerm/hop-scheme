@@ -348,6 +348,10 @@
     (define (fold1 op1)
       (and (= (length arg-vals) 1)
            (list (op1 (car arg-vals)))))
+    ;; Constant values are host representations of target literals. A quoted
+    ;; symbol constant is carried as the host pair (quote sym), so predicates
+    ;; must not fall through to the host's pair?/null? on it: the target value
+    ;; is a symbol immediate, not a pair.
     (case op
       ((+)     (fold2 number? +))
       ((-)     (fold2 number? -))
@@ -355,8 +359,12 @@
       ((=)     (fold2 number? =))
       ((<)     (fold2 number? <))
       ((>)     (fold2 number? >))
-      ((null?) (fold1 null?))
-      ((pair?) (fold1 pair?))
+      ((eq?)   (fold2 (lambda (v) #t) equal?))
+      ((null?) (fold1 (lambda (v) (and (null? v)
+                                       (not (quoted-symbol-expr? v))))))
+      ((pair?) (fold1 (lambda (v) (and (pair? v)
+                                       (not (quoted-symbol-expr? v))))))
+      ((symbol?) (fold1 quoted-symbol-expr?))
       (else #f)))
 
   (define (lookup-arg facts v)
@@ -560,7 +568,7 @@
      ((literal-expr? rhs) #t)
      ((symbol? rhs)       #t)
      ((and (pair? rhs) (eq? (car rhs) 'primop))
-      (and (memq (cadr rhs) '(+ - * = < > null? pair? vector? unsafe-car unsafe-cdr))
+      (and (memq (cadr rhs) '(+ - * = < > eq? null? pair? symbol? vector? unsafe-car unsafe-cdr))
            #t))
      ((and (pair? rhs) (eq? (car rhs) 'global))          #t)
      ((and (pair? rhs) (eq? (car rhs) 'closure-env-ref)) #t)

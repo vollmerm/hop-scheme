@@ -198,6 +198,15 @@ runtime_cases=(
   "test69|1"
   "test70|10"
   "test71|30"
+  "test72|foo"
+  "test73|1"
+  "test74|10"
+  "test75|42"
+  "test76|a"
+  "test77|b"
+  "test78|2"
+  "test79|5"
+  "test80|3"
 )
 
 for case in "${runtime_cases[@]}"; do
@@ -242,6 +251,16 @@ assert_file_output \
   "file-test1" \
   "42" \
   $'(define base 40)\n(begin (define bump (lambda (x) (primop + base x))))\n(app bump 2)'
+
+assert_file_output \
+  "file-quote1" \
+  "b" \
+  $'(define lst (quote (a b)))\n(car (cdr lst))'
+
+assert_file_output \
+  "file-quote2" \
+  "y" \
+  $'(car (cdr \'(x y)))'
 
 assert_compile_error \
   "file-letrec-init-read" \

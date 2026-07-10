@@ -9,6 +9,7 @@
           single-binding?
           lambda-expr?
           literal-expr?
+          quoted-symbol-expr?
           nest-let-bindings
           set-union
           set-difference
@@ -77,8 +78,21 @@
 (define (lambda-expr? expr)
   (and (pair? expr) (eq? (car expr) 'lambda)))
 
+; A quoted symbol stays wrapped as (quote sym) all the way through the
+; pipeline so that a bare symbol always means a variable reference. Every
+; pass checks literal-expr? before dispatching on (car expr), which lets the
+; wrapper flow through untouched until the backend encodes it as a tagged
+; symbol immediate.
+(define (quoted-symbol-expr? expr)
+  (and (pair? expr)
+       (eq? (car expr) 'quote)
+       (pair? (cdr expr))
+       (symbol? (cadr expr))
+       (null? (cddr expr))))
+
 (define (literal-expr? expr)
-  (or (number? expr) (boolean? expr) (null? expr)))
+  (or (number? expr) (boolean? expr) (null? expr)
+      (quoted-symbol-expr? expr)))
 
 (define (nest-let-bindings bindings body-exprs)
   (if (null? bindings)

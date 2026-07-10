@@ -651,6 +651,43 @@
                        (app f (primop - m 1))))))
        (app f 0))))
 
+(define test72
+  '(quote foo))
+
+(define test73
+  '(if (eq? (quote a) (quote a)) 1 2))
+
+(define test74
+  '(let ((f (lambda (x) (if (eq? x (quote b)) 10 20))))
+     (app f (quote b))))
+
+(define test75
+  '(if (symbol? (quote a))
+       (if (symbol? 3) 0 42)
+       1))
+
+(define test76
+  '(car (quote (a b c))))
+
+(define test77
+  '(if (pair? (quote (a b)))
+       (car (cdr (quote (a b))))
+       (quote nope)))
+
+(define test78
+  '(car (cdr (quote (1 2 3)))))
+
+(define test79
+  '(let ((x (quote (a))))
+     (if (eq? x x) 5 6)))
+
+(define test80
+  '(letrec ((size (lambda (x)
+                    (if (null? x)
+                        0
+                        (primop + 1 (app size (cdr x)))))))
+     (app size (quote (a b c)))))
+
 (define sample-tests
   (list (cons "Test 1: Simple arithmetic" test1)
         (cons "Test 2: Lambda application" test2)
@@ -721,7 +758,16 @@
         (cons "Test 68: non-lambda letrec init returns closure" test68)
         (cons "Test 69: non-uniform arity cluster" test69)
         (cons "Test 70: per-member capture subsets (g path)" test70)
-        (cons "Test 71: per-member capture subsets (f base path)" test71)))
+        (cons "Test 71: per-member capture subsets (f base path)" test71)
+        (cons "Test 72: quoted symbol literal" test72)
+        (cons "Test 73: eq? on quoted symbols" test73)
+        (cons "Test 74: dynamic eq? symbol dispatch" test74)
+        (cons "Test 75: symbol? predicate" test75)
+        (cons "Test 76: car of quoted list" test76)
+        (cons "Test 77: pair? and traversal of quoted list" test77)
+        (cons "Test 78: quoted list of fixnums" test78)
+        (cons "Test 79: quoted structure is constructed once (eq? identity)" test79)
+        (cons "Test 80: recursion over quoted list" test80)))
 
 (define named-tests
   ;; These are runnable end-to-end regression cases. test6 and test7 stay as
@@ -793,7 +839,16 @@
          (cons 'test68 test68)
          (cons 'test69 test69)
          (cons 'test70 test70)
-         (cons 'test71 test71)))
+         (cons 'test71 test71)
+         (cons 'test72 test72)
+         (cons 'test73 test73)
+         (cons 'test74 test74)
+         (cons 'test75 test75)
+         (cons 'test76 test76)
+         (cons 'test77 test77)
+         (cons 'test78 test78)
+         (cons 'test79 test79)
+         (cons 'test80 test80)))
 
 (define (lookup-named-test name)
   (let ((binding (assoc name named-tests)))

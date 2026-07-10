@@ -22,11 +22,19 @@ typedef struct {
  *   ptr......010  box pointer
  *   ptr......011  closure pointer
  *   ptr......100  vector pointer
+ *   idx......101  symbol immediate
  *
  * Fixnums are stored by shifting the signed integer left by
  * HOP_FIXNUM_SHIFT. Heap objects are allocated at aligned addresses, so their
  * low tag bits are available; hop_tag_pointer installs the object tag and
  * hop_untag_pointer removes it before dereferencing.
+ *
+ * Symbols are immediates, not heap objects: the compiler interns every symbol
+ * it sees into a program-wide table and encodes each one as its table index
+ * shifted left by HOP_FIXNUM_SHIFT with the symbol tag installed. Two symbols
+ * are eq? exactly when their encoded words are equal, and the collector never
+ * needs to trace them. The compiler emits hop_symbol_count/hop_symbol_names
+ * alongside the generated code so the runtime can recover the printed name.
  *
  * Some values are represented as tagged immediates rather than pointers:
  *
@@ -44,6 +52,7 @@ typedef struct {
 #define HOP_BOX_TAG 2
 #define HOP_CLOSURE_TAG 3
 #define HOP_VECTOR_TAG 4
+#define HOP_SYMBOL_TAG 5
 
 #define HOP_NULL 20
 #define HOP_FALSE 36
@@ -77,6 +86,18 @@ static inline void *hop_untag_pointer(hop_value value) {
 extern void *hop_gc_top_frame;
 extern uint64_t hop_global_slot_count;
 extern hop_value hop_global_slots[];
+extern uint64_t hop_symbol_count;
+extern const char *hop_symbol_names[];
+
+static inline hop_value hop_encode_symbol(uint64_t index) {
+    return (hop_value)((index << HOP_FIXNUM_SHIFT) | HOP_SYMBOL_TAG);
+}
+
+static inline uint64_t hop_decode_symbol(hop_value value) {
+    return ((uint64_t)value) >> HOP_FIXNUM_SHIFT;
+}
+
+const char *hop_symbol_name(hop_value value);
 
 hop_value hop_alloc_box(hop_value value);
 hop_value hop_alloc_pair(hop_value car, hop_value cdr);

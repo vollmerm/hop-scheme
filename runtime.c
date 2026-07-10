@@ -876,6 +876,19 @@ hop_value hop_tail_call_8(hop_value arg0,
     return hop_call_8(arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7, closure_value);
 }
 
+const char *hop_symbol_name(hop_value value) {
+    uint64_t index;
+
+    if (!hop_has_tag(value, HOP_SYMBOL_TAG)) {
+        hop_panic("hop_symbol_name expected symbol");
+    }
+    index = hop_decode_symbol(value);
+    if (index >= hop_symbol_count) {
+        hop_panic("symbol index out of range");
+    }
+    return hop_symbol_names[index];
+}
+
 hop_value hop_global_ref(uint64_t index) {
     if (index >= hop_global_slot_count) {
         hop_panic("global index out of range");
