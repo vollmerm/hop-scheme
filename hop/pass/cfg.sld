@@ -27,7 +27,7 @@
 (define (build-cfg tac-instrs)
   (define (terminator? instr)
     (and (pair? instr)
-         (memq (car instr) '(if goto return tail-call direct-tail-call))))
+         (memq (car instr) '(if goto return tail-call direct-tail-call tail-apply-call))))
 
   (define (is-leader? index instrs)
     (let ((instr (list-ref instrs index)))
@@ -102,7 +102,7 @@
               (set-basic-block-successors!
                block
                (list (hash-table-ref/default label->block target-label #f)))))
-           ((and (pair? last-instr) (memq (car last-instr) '(return tail-call direct-tail-call)))
+           ((and (pair? last-instr) (memq (car last-instr) '(return tail-call direct-tail-call tail-apply-call)))
             (set-basic-block-successors! block '()))
            ((= i (- (length blocks) 1))
             (set-basic-block-successors! block '()))
@@ -534,9 +534,14 @@
       '())
      ((and (pair? rhs) (eq? (car rhs) 'closure-env-ref))
       (if (symbol? (cadr rhs)) (list (cadr rhs)) '()))
-     ((and (pair? rhs) (eq? (car rhs) 'make-closure))
+     ((and (pair? rhs) (memq (car rhs) '(make-closure make-variadic-closure)))
+      ;; make-variadic-closure has one extra literal field (k) between the
+      ;; proc-name and the captured-var list; sym-list already drops
+      ;; non-symbol entries, so the same extraction works for both shapes.
       (sym-list (cddr rhs)))
-     ((and (pair? rhs) (memq (car rhs) '(closure-call direct-call)))
+     ((and (pair? rhs) (memq (car rhs) '(closure-call direct-call apply-call)))
+      ;; apply-call's shape (closure-var n-fixed fixed-var... list-var) has
+      ;; one extra literal field (n-fixed), likewise dropped by sym-list.
       (sym-list (cdr rhs)))
      (else '())))
 
@@ -549,6 +554,8 @@
      ((and (pair? instr) (eq? (car instr) 'return))
       (if (symbol? (cadr instr)) (list (cadr instr)) '()))
      ((and (pair? instr) (eq? (car instr) 'tail-call))
+      (sym-list (cdr instr)))
+     ((and (pair? instr) (eq? (car instr) 'tail-apply-call))
       (sym-list (cdr instr)))
      ((and (pair? instr) (eq? (car instr) 'direct-tail-call))
       (sym-list (cddr instr)))

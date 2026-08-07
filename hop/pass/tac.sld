@@ -62,34 +62,93 @@
               arg-vars
               (append closure-procedures arg-procedures))))
 
-  (define (convert-known-call proc-name capture-count closure-expr args dest tail?)
+  (define (take-n lst n)
+    (if (= n 0)
+        '()
+        (cons (car lst) (take-n (cdr lst) (- n 1)))))
+
+  ;; Folds right-to-left over overflow argument temps, consing them into a
+  ;; proper list via the same (primop cons ...) shape an ordinary user
+  ;; `cons` call produces -- this is the compile-time fast-path rest-list
+  ;; build: it reuses the existing, already-tested cons/alloc-pair path, and
+  ;; when there is no overflow (the call site supplies exactly the fixed
+  ;; arity) it emits zero instructions and the rest value is the literal
+  ;; '() -- no allocation at all for the common exact-arity case.
+  (define (build-rest-cons-chain vars)
+    (let loop ((rest (reverse vars)) (acc-var '()) (instrs '()))
+      (if (null? rest)
+          (values instrs acc-var)
+          (let ((tmp (fresh-temp)))
+            (loop (cdr rest)
+                  tmp
+                  (append instrs
+                          (list `(assign ,tmp (primop cons ,(car rest) ,acc-var)))))))))
+
+  ;; apply's arguments are (fixed-arg-expr... list-expr) -- surface.sld
+  ;; guarantees at least one element (the trailing list expression). The
+  ;; leading fixed args are consed into an ordinary list right here, at the
+  ;; call site, exactly like the known-call rest-list fast path above --
+  ;; that keeps hop_apply's C signature a fixed 3 arguments (closure,
+  ;; leading-list, spread-list) no matter how many leading args any given
+  ;; call site has, so there is no per-arity family of apply helpers and no
+  ;; variable-arity marshaling needed in the backend.
+  (define (convert-apply closure-expr args)
     (let-values (((closure-instrs closure-var closure-procedures)
                   (convert-value closure-expr #f))
                  ((arg-instrs arg-vars arg-procedures)
                   (convert-list args)))
-      (let loop ((index 0) (env-instrs '()) (env-vars '()))
-        (if (= index capture-count)
-            (let ((all-args (append (reverse env-vars) arg-vars)))
-              (if tail?
-                  (values (append closure-instrs
-                                  arg-instrs
-                                  env-instrs
-                                  (list `(direct-tail-call ,proc-name ,@all-args)))
-                          (append closure-procedures arg-procedures))
-                  (let ((result-var (or dest (fresh-temp))))
-                    (values (append closure-instrs
-                                    arg-instrs
-                                    env-instrs
-                                    (list `(assign ,result-var
-                                                   (direct-call ,proc-name ,@all-args))))
-                            result-var
-                            (append closure-procedures arg-procedures)))))
-            (let ((env-var (fresh-temp)))
-              (loop (+ index 1)
-                    (append env-instrs
-                            (list `(assign ,env-var
-                                           (closure-env-ref ,closure-var ,index))))
-                    (cons env-var env-vars)))))))
+      (let* ((n (length arg-vars))
+             (leading-vars (take-n arg-vars (- n 1)))
+             (list-var (car (list-tail arg-vars (- n 1)))))
+        (let-values (((leading-instrs leading-list-var)
+                      (build-rest-cons-chain leading-vars)))
+          (values (append closure-instrs arg-instrs leading-instrs)
+                  closure-var
+                  leading-list-var
+                  list-var
+                  (append closure-procedures arg-procedures))))))
+
+  ;; rest-k is #f for a call to an ordinary (non-variadic) known target --
+  ;; that path is byte-identical to before this feature existed. When the
+  ;; target is variadic, rest-k is its fixed-argument count: the trailing
+  ;; args beyond rest-k are consed into a rest list at compile time, so the
+  ;; direct call still ends up with exactly rest-k+1 ordinary arguments
+  ;; (plus captures) -- no runtime dispatch either way.
+  (define (convert-known-call proc-name capture-count rest-k closure-expr args dest tail?)
+    (let-values (((closure-instrs closure-var closure-procedures)
+                  (convert-value closure-expr #f))
+                 ((arg-instrs arg-vars arg-procedures)
+                  (convert-list args)))
+      (let* ((fixed-arg-vars (if rest-k (take-n arg-vars rest-k) arg-vars))
+             (overflow-arg-vars (if rest-k (list-tail arg-vars rest-k) '())))
+        (let-values (((rest-instrs rest-var) (build-rest-cons-chain overflow-arg-vars)))
+          (let loop ((index 0) (env-instrs '()) (env-vars '()))
+            (if (= index capture-count)
+                (let ((all-args (append (reverse env-vars)
+                                         fixed-arg-vars
+                                         (if rest-k (list rest-var) '()))))
+                  (if tail?
+                      (values (append closure-instrs
+                                      arg-instrs
+                                      env-instrs
+                                      (if rest-k rest-instrs '())
+                                      (list `(direct-tail-call ,proc-name ,@all-args)))
+                              (append closure-procedures arg-procedures))
+                      (let ((result-var (or dest (fresh-temp))))
+                        (values (append closure-instrs
+                                        arg-instrs
+                                        env-instrs
+                                        (if rest-k rest-instrs '())
+                                        (list `(assign ,result-var
+                                                       (direct-call ,proc-name ,@all-args))))
+                                result-var
+                                (append closure-procedures arg-procedures)))))
+                (let ((env-var (fresh-temp)))
+                  (loop (+ index 1)
+                        (append env-instrs
+                                (list `(assign ,env-var
+                                               (closure-env-ref ,closure-var ,index))))
+                        (cons env-var env-vars)))))))))
 
   (define (local-name expr)
     (and (pair? expr)
@@ -462,6 +521,12 @@
          (if (not current-entry-label)
              (error "self-tail-call outside of procedure" expr)
              (let ((args (cdr expr)))
+               ;; Variadic bindings are excluded from this same-frame-loop
+               ;; optimization upstream (see (hop pass letrec)); this is
+               ;; defense-in-depth so a violated invariant fails loudly
+               ;; instead of miscounting a tagged params value's length.
+               (when (params-variadic? current-params)
+                 (error "self-tail-call target must not be variadic (unsupported)" expr))
                (when (not (= (length args) (length current-params)))
                  (error "Arity mismatch in self-tail-call" expr))
                (let-values (((arg-instrs arg-vars arg-procedures)
@@ -504,11 +569,21 @@
                              (list `(tail-call ,closure-var ,@arg-vars)))
                      procedures))))
 
+        ((closure-apply)
+         (let ((closure-expr (cadr expr))
+               (args (cddr expr)))
+           (let-values (((call-instrs closure-var leading-list-var list-var procedures)
+                         (convert-apply closure-expr args)))
+             (values (append call-instrs
+                             (list `(tail-apply-call ,closure-var ,leading-list-var ,list-var)))
+                     procedures))))
+
         ((known-call)
          (convert-known-call (cadr expr)
                              (caddr expr)
                              (cadddr expr)
-                             (cddddr expr)
+                             (car (cddddr expr))
+                             (cdr (cddddr expr))
                              #f
                              #t))
 
@@ -685,7 +760,21 @@
                                (cdddr expr)
                                (cddr expr)))
                 (proc-params (cadr lambda-expr))
-                (proc-body (body->expr (cddr lambda-expr))))
+                (proc-body (body->expr (cddr lambda-expr)))
+                ;; #f for an ordinary lambda; otherwise the *user-facing*
+                ;; fixed-arg count k -- captured env vars are excluded, since
+                ;; at an indirect call site (hop_call_N) the caller-supplied
+                ;; argument array never includes env values; those come from
+                ;; the closure's own env slots via hop_closure_env. Threaded
+                ;; as an explicit instruction field (rather than reusing the
+                ;; plain `make-closure` shape, which the mutual-recursion
+                ;; "cluster" machinery below also produces for an unrelated
+                ;; purpose) so instruction selection can route variadic
+                ;; closure allocation to its own runtime helper without
+                ;; touching the ordinary path.
+                (variadic-k (and (params-variadic? proc-params)
+                                  (- (length (params-fixed proc-params))
+                                     (length free-vars)))))
            (let ((entry-label (fresh-temp)))
              (let-values (((body-instrs body-procedures)
                            (convert-tail proc-body
@@ -701,9 +790,14 @@
                                       proc-params
                                       (cons `(label ,entry-label) body-instrs))))
                  (values (append fv-instrs
-                                 (list `(assign ,result-var
-                                                (make-closure ,proc-name
-                                                              ,@fv-vars))))
+                                 (list (if variadic-k
+                                           `(assign ,result-var
+                                                    (make-variadic-closure ,proc-name
+                                                                          ,variadic-k
+                                                                          ,@fv-vars))
+                                           `(assign ,result-var
+                                                    (make-closure ,proc-name
+                                                                  ,@fv-vars)))))
                          result-var
                          (append body-procedures
                                  fv-procedures
@@ -713,7 +807,8 @@
          (convert-known-call (cadr expr)
                              (caddr expr)
                              (cadddr expr)
-                             (cddddr expr)
+                             (car (cddddr expr))
+                             (cdr (cddddr expr))
                              dest
                              #f))
 
@@ -727,6 +822,18 @@
                                (list `(assign ,result-var
                                               (closure-call ,closure-var
                                                             ,@arg-vars))))
+                       result-var
+                       procedures)))))
+
+        ((closure-apply)
+         (let* ((closure-expr (cadr expr))
+                (args (cddr expr)))
+           (let-values (((call-instrs closure-var leading-list-var list-var procedures)
+                         (convert-apply closure-expr args)))
+             (let ((result-var (or dest (fresh-temp))))
+               (values (append call-instrs
+                               (list `(assign ,result-var
+                                              (apply-call ,closure-var ,leading-list-var ,list-var))))
                        result-var
                        procedures)))))
 

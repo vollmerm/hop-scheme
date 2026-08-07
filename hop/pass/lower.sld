@@ -122,7 +122,7 @@
          (let ((params (cadr e)))
            `(lambda ,params
               ,@(map (lambda (body-expr)
-                       (resolve body-expr (append params local-env)))
+                       (resolve body-expr (append (params-names params) local-env)))
                      (cddr e)))))
         ((letrec)
          (let* ((bindings (cadr e))
@@ -139,6 +139,9 @@
         ((app)
          `(app ,(resolve (cadr e) local-env)
                ,@(map (lambda (sub) (resolve sub local-env)) (cddr e))))
+        ((apply)
+         `(apply ,(resolve (cadr e) local-env)
+                 ,@(map (lambda (sub) (resolve sub local-env)) (cddr e))))
         ((cons make-vector vector-ref)
          `(,(car e) ,(resolve (cadr e) local-env)
            ,(resolve (caddr e) local-env)))

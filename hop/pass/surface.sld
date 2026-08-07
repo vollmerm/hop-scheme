@@ -30,7 +30,7 @@
   '(quote begin if lambda let let* letrec
     cond case and or when unless not
     define set! quasiquote unquote unquote-splicing
-    primop app global set-global!
+    primop app apply global set-global!
     box unbox set-box!
     cons car cdr pair? null? symbol? eq?
     make-vector vector-length vector-ref vector-set! vector?
@@ -48,10 +48,22 @@
    ((pair? lst) (proper-list? (cdr lst)))
    (else #f)))
 
-(define (check-params params context)
-  (if (proper-list? params)
-      params
-      (error "Variadic parameter lists are not supported yet" context)))
+;; Accepts the three parameter-list shapes R7RS allows and normalizes them
+;; into the AST's internal representation (see (hop utils) params-*):
+;;   (a b)      -> (a b)                       ; fixed arity, unchanged
+;;   (a b . r)  -> (variadic (a b) r)           ; fixed params + rest
+;;   args       -> (variadic () args)           ; all-rest
+(define (normalize-params params context)
+  (cond
+   ((symbol? params) (make-params '() params))
+   ((proper-list? params) params)
+   ((pair? params)
+    (let loop ((rest params) (fixed '()))
+      (cond
+       ((symbol? rest) (make-params (reverse fixed) rest))
+       ((pair? rest) (loop (cdr rest) (cons (car rest) fixed)))
+       (else (error "Malformed parameter list" context)))))
+   (else (error "Invalid parameter list" context))))
 
 ;; (define (f x y) body...) -> (define f (lambda (x y) body...))
 ;; (define x expr)          -> unchanged
@@ -60,7 +72,7 @@
     (cond
      ((pair? head)
       `(define ,(car head)
-         (lambda ,(check-params (cdr head) form) ,@(cddr form))))
+         (lambda ,(normalize-params (cdr head) form) ,@(cddr form))))
      ((symbol? head)
       (if (and (pair? (cddr form)) (null? (cdddr form)))
           form
@@ -177,7 +189,7 @@
                 ,(desugar-expr (cadddr expr))))))
 
         ((lambda)
-         `(lambda ,(check-params (cadr expr) expr)
+         `(lambda ,(normalize-params (cadr expr) expr)
             ,@(desugar-body (cddr expr) expr)))
 
         ((let)
@@ -270,6 +282,11 @@
 
         ((app)
          `(app ,@(map desugar-expr (cdr expr))))
+
+        ((apply)
+         (if (< (length (cdr expr)) 2)
+             (error "apply requires a procedure and at least a list argument" expr)
+             `(apply ,@(map desugar-expr (cdr expr)))))
 
         ((global)
          expr)

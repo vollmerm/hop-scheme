@@ -38,7 +38,7 @@
       (case (car expr)
         ((begin)
          (all (lambda (e) (letrec-init-safe? e group-names)) (cdr expr)))
-        ((primop app)
+        ((primop app apply)
          (all (lambda (e) (letrec-init-safe? e group-names)) (cdr expr)))
         ((if)
          (and (letrec-init-safe? (cadr expr) group-names)
@@ -173,6 +173,9 @@
         ((app)
          `(app ,(rewrite (cadr expr) env)
                ,@(map (lambda (e) (rewrite e env)) (cddr expr))))
+        ((apply)
+         `(apply ,(rewrite (cadr expr) env)
+                 ,@(map (lambda (e) (rewrite e env)) (cddr expr))))
         ((cons make-vector vector-ref)
          `(,(car expr) ,(rewrite (cadr expr) env)
            ,(rewrite (caddr expr) env)))
@@ -265,6 +268,9 @@
                            (tail-recursion-safe? arg group-names #f))
                          args)))))
 
+        ((apply)
+         (all (lambda (e) (tail-recursion-safe? e group-names #f)) (cdr expr)))
+
         ((cons set-box!)
          (and (tail-recursion-safe? (cadr expr) group-names #f)
               (tail-recursion-safe? (caddr expr) group-names #f)))
@@ -315,7 +321,7 @@
 
           ((lambda)
            (collect (body->expr (cddr expr))
-                    (append (cadr expr) bound)))
+                    (append (params-names (cadr expr)) bound)))
 
           ((letrec)
            (let* ((bindings (cadr expr))
@@ -328,7 +334,7 @@
                                    (collect body-expr new-bound))
                                  (cddr expr)))))
 
-          ((app)
+          ((app apply)
            (append-map (lambda (e) (collect e bound)) (cdr expr)))
 
           ((set-box!)
@@ -410,6 +416,9 @@
                                  (tail-call-targets arg group-names #f))
                                args))))
 
+        ((apply)
+         (append-map (lambda (e) (tail-call-targets e group-names #f)) (cdr expr)))
+
         ((set-box!)
          (append (tail-call-targets (cadr expr) group-names #f)
                  (tail-call-targets (caddr expr) group-names #f)))
@@ -459,9 +468,21 @@
                        group-names))
                 group-names))))
 
+  ;; A variadic binding's rest parameter is only meaningful as an ordinary
+  ;; call argument built at each call site (see (hop pass closure)), which
+  ;; the self-tail-call/group-tail-call same-frame-loop lowering below does
+  ;; not know how to construct. Variadic bindings are therefore excluded
+  ;; from that optimization entirely -- they still compile correctly and
+  ;; still tail-call, just through the ordinary app -> closure-call/
+  ;; known-call -> tail-call/tail-call-known path instead of a same-frame
+  ;; goto loop.
+  (define (lambda-variadic? binding)
+    (params-variadic? (cadr (cadr binding))))
+
   (define (eligible-mutual-tail-group? bindings)
     (let ((group-names (map car bindings)))
       (and (> (length bindings) 1)
+           (all (lambda (b) (not (lambda-variadic? b))) bindings)
            (mutually-tail-recursive? bindings)
            (all (lambda (binding)
                   (let* ((lambda-expr (cadr binding))
@@ -495,6 +516,9 @@
                     #t
                     (group-entry-safe? rator group-names))
                 (all (lambda (arg) (group-entry-safe? arg group-names)) args))))
+        ((apply)
+         (all (lambda (e) (group-entry-safe? e group-names)) (cdr expr)))
+
         ((set-box!)
          (and (group-entry-safe? (cadr expr) group-names)
               (group-entry-safe? (caddr expr) group-names)))
@@ -519,7 +543,7 @@
 
   (define (rewrite-lambda expr env current-group)
     (let* ((params (cadr expr))
-           (body-env (remove-shadowed-bindings env params))
+           (body-env (remove-shadowed-bindings env (params-names params)))
            (body-exprs (rewrite-sequence (cddr expr) body-env current-group #t)))
       `(lambda ,params ,@body-exprs)))
 
@@ -581,9 +605,11 @@
                               `(set-box! ,(car binding)
                                          ,(rewrite-lambda (cadr binding)
                                                           rec-env
-                                                          (if group-eligible?
-                                                              names
-                                                              (list (car binding))))))
+                                                          (if (lambda-variadic? binding)
+                                                              '()
+                                                              (if group-eligible?
+                                                                  names
+                                                                  (list (car binding)))))))
                             bindings))
                       (body-exprs
                        (append init-exprs
@@ -607,6 +633,10 @@
                      ,@(map (lambda (e) (rewrite e env current-group #f)) args)))
                `(app ,(rewrite rator env current-group #f)
                      ,@(map (lambda (e) (rewrite e env current-group #f)) args)))))
+
+        ((apply)
+         `(apply ,(rewrite (cadr expr) env current-group #f)
+                 ,@(map (lambda (e) (rewrite e env current-group #f)) (cddr expr))))
 
         ((cons)
          (error "cons in desugar-letrec: should have been canonicalized" expr))

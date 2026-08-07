@@ -217,6 +217,11 @@ runtime_cases=(
   "test88|3"
   "test89|2"
   "test90|200"
+  "test91|10"
+  "test92|6"
+  "test93|42"
+  "test94|3"
+  "test95|6"
 )
 
 for case in "${runtime_cases[@]}"; do
@@ -243,6 +248,32 @@ assert_asm_not_contains "test52" '_hop_cdr' 'all cdr operations in A are proven 
 assert_asm_contains "test5" '\bx(19|20|21|22|23|24|25|26|27|28)\b' 'callee-saved register allocation'
 assert_asm_not_contains "test16" '\bx23\b' 'uncoalesced temporary register in recursive loop'
 assert_asm_not_contains "test5" 'str x9, \[sp, #(24|32|40)\]' 'eager root shadow writes without safepoints'
+
+# variadic known-call fast path: the overflow args are consed at compile
+# time and the call itself is still a direct label branch, exactly like an
+# ordinary fixed-arity known-call -- no runtime dispatch helper at all.
+# (test91 itself also contains sum-list's own self-recursive call, which
+# is -- independent of variadic support -- not resolved to a known-call by
+# 0CFA, so the "no generic call helper anywhere" check belongs on test95,
+# a minimal program with nothing else that could call indirectly.)
+assert_asm_contains "test91" 'b(l)? _cfa\.proc\.[0-9]+' 'direct closure call lowering for variadic known-call'
+assert_asm_contains "test95" 'b(l)? _cfa\.proc\.[0-9]+' 'direct closure call lowering for variadic known-call'
+assert_asm_not_contains "test95" '_hop_(tail_)?call_[0-9]+' 'generic call helper'
+
+# indirect call to a statically-unresolvable variadic target must go
+# through the runtime's hop_call_N family (which internally branches on the
+# closure's variadic-ness) -- there is no way to lower this to a direct
+# label call.
+assert_asm_contains "test92" '_hop_(tail_)?call_[0-9]+' 'generic call helper for indirect variadic target'
+
+# apply's argument count is only known at run time even when its target is
+# statically known, so it can never take the known-call fast path: it
+# always lowers to the single fixed hop_apply entry point.
+assert_asm_contains "test94" '_hop_apply' 'apply always lowers through hop_apply, never a direct call'
+# Anchored to leading instruction indentation so this doesn't spuriously
+# match the unrelated ".globl _cfa.proc.N" export directive every compiled
+# procedure emits (that line begins at column 0, not indented).
+assert_asm_not_contains "test94" '^    b(l)? _cfa\.proc\.[0-9]+' 'apply never becomes a direct closure call'
 
 # constant folding: x*x with x=3 must collapse to an immediate load, no multiply
 assert_asm_not_contains "test53" '\bmul\b' 'constant-folded multiplication eliminated'
@@ -289,5 +320,25 @@ assert_compile_error \
   "file-letrec-init-read" \
   'letrec init cannot read recursive bindings during initialization' \
   $'(letrec ((x 1)\n          (y x))\n   y)'
+
+# (define (f . args) ...) surface sugar for an all-rest lambda.
+assert_file_output \
+  "file-variadic-all-rest" \
+  "1" \
+  $'(define (my-list . xs) xs)\n(car (my-list 1 2 3))'
+
+# (define (f a . rest) ...) surface sugar for fixed params + a rest param.
+assert_file_output \
+  "file-variadic-fixed-and-rest" \
+  "3" \
+  $'(define (f a . rest) (+ a (car rest)))\n(f 1 2 3)'
+
+# A known call site (f referenced directly) supplying fewer arguments than
+# f's fixed parameter count is a provably-wrong program: (hop pass cfa)
+# catches it at compile time rather than deferring to a runtime panic.
+assert_compile_error \
+  "file-variadic-too-few-args" \
+  'Too few arguments to variadic procedure' \
+  $'(define (f a b . rest) (+ a b))\n(f 1)'
 
 echo "compiler tests passed"

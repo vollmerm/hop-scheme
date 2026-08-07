@@ -82,6 +82,23 @@
      (max 0 (- (length (cddr instr)) (length aarch64-arg-registers))))
     ((tail-call-known)
      (max 0 (- (length (cddr instr)) (length aarch64-arg-registers))))
+    ;; call-apply/tail-call-apply always carry exactly 3 fixed operands
+    ;; (closure, leading-list, list-arg), well under the register budget --
+    ;; no stack args needed regardless of how many leading args or how long
+    ;; the spread list is, since both were already consed into ordinary
+    ;; list values before the call (see (hop pass tac)).
+    ((alloc-closure)
+     ;; emit-alloc-closure writes captures to the same [sp, #...] outgoing
+     ;; area as call argument spilling whenever it takes the general (>3
+     ;; captures) path; account for that here so the frame is sized to
+     ;; actually cover those writes instead of aliasing the GC frame header
+     ;; just above the outgoing-args area.
+     (let ((count (length (cdddr instr))))
+       (if (> count 3) count 0)))
+    ((alloc-closure-variadic)
+     ;; Always uses the general captures-to-stack path (see
+     ;; emit-alloc-closure-variadic), regardless of capture count.
+     (length (cddddr instr)))
     (else 0)))
 
 ;;; ── Step 1: Instruction Selection ─────────────────────────────────────────
@@ -129,10 +146,14 @@
       (list `(load-closure-env ,dst ,(cadr rhs) ,(caddr rhs))))
      ((and (pair? rhs) (eq? (car rhs) 'make-closure))
       (list `(alloc-closure ,dst ,@(cdr rhs))))
+     ((and (pair? rhs) (eq? (car rhs) 'make-variadic-closure))
+      (list `(alloc-closure-variadic ,dst ,@(cdr rhs))))
      ((and (pair? rhs) (eq? (car rhs) 'closure-call))
       (list `(call ,dst ,@(cdr rhs))))
      ((and (pair? rhs) (eq? (car rhs) 'direct-call))
       (list `(call-known ,dst ,@(cdr rhs))))
+     ((and (pair? rhs) (eq? (car rhs) 'apply-call))
+      (list `(call-apply ,dst ,@(cdr rhs))))
      (else
       (error "Unknown assignment rhs during instruction selection" rhs))))
   (cond
@@ -153,6 +174,8 @@
     (list `(tail-call ,@(cdr instr))))
    ((eq? (car instr) 'direct-tail-call)
     (list `(tail-call-known ,@(cdr instr))))
+   ((eq? (car instr) 'tail-apply-call)
+    (list `(tail-call-apply ,@(cdr instr))))
    ((eq? (car instr) 'set-box!)
     (list `(store-box ,(cadr instr) ,(caddr instr))))
    ((eq? (car instr) 'set-global!)
@@ -169,7 +192,7 @@
    (basic-block-successors block)))
 
 (define (select-machine-procedure name params cfg)
-  (let ((param-locations (make-param-locations params)))
+  (let ((param-locations (make-param-locations (params-names params))))
     (let loop ((blocks cfg)
                (first? #t)
                (result '()))
@@ -228,6 +251,17 @@
                  (if (symbol? (car rest))
                      (cons (car rest) result)
                      result)))))
+    ((alloc-closure-variadic)
+     ;; (alloc-closure-variadic dst proc-name k captures...) -- proc-name and
+     ;; k are literal/label operands, not registers; the generic symbol
+     ;; filter below already skips them.
+     (let loop ((rest (cddddr instr)) (result '()))
+       (if (null? rest)
+           (reverse result)
+           (loop (cdr rest)
+                 (if (symbol? (car rest))
+                     (cons (car rest) result)
+                     result)))))
     ((call)
      (let ((closure (caddr instr))
            (args (cdddr instr)))
@@ -266,6 +300,25 @@
                  (if (symbol? (car rest))
                      (cons (car rest) result)
                      result)))))
+    ((call-apply)
+     ;; (call-apply dst closure leading-list list-arg) -- all three operands
+     ;; are used, dst is a def handled separately below.
+     (let loop ((rest (cddr instr)) (result '()))
+       (if (null? rest)
+           (reverse result)
+           (loop (cdr rest)
+                 (if (symbol? (car rest))
+                     (cons (car rest) result)
+                     result)))))
+    ((tail-call-apply)
+     ;; (tail-call-apply closure leading-list list-arg)
+     (let loop ((rest (cdr instr)) (result '()))
+       (if (null? rest)
+           (reverse result)
+           (loop (cdr rest)
+                 (if (symbol? (car rest))
+                     (cons (car rest) result)
+                     result)))))
     ((branch-if ret)
      (if (symbol? (cadr instr)) (list (cadr instr)) '()))
     ((jump) '())
@@ -276,11 +329,12 @@
     ((move-in move alloc-pair alloc-vector alloc-box load-box load-car load-cdr
              unsafe-load-car unsafe-load-cdr is-pair is-null is-symbol is-vector
              vector-length vector-ref vector-set!
-             load-closure-env load-global alloc-closure call call-known)
+             load-closure-env load-global alloc-closure alloc-closure-variadic
+             call call-known call-apply)
       (list (cadr instr)))
     ((binop safe-binop)
       (list (caddr instr)))
-    ((store-box store-global branch-if jump ret tail-call tail-call-known) '())
+    ((store-box store-global branch-if jump ret tail-call tail-call-known tail-call-apply) '())
     (else (error "Unknown machine instruction in def analysis" instr))))
 
 (define (machine-instr-bias-source instr)
@@ -693,6 +747,12 @@
                      ,(caddr instr)
                      ,@(map (lambda (operand) (lookup-home homes operand))
                             (cdddr instr))))
+    ((alloc-closure-variadic)
+     `(alloc-closure-variadic ,(lookup-home homes (cadr instr))
+                              ,(caddr instr)
+                              ,(cadddr instr)
+                              ,@(map (lambda (operand) (lookup-home homes operand))
+                                     (cddddr instr))))
     ((call)
      `(call ,(lookup-home homes (cadr instr))
             ,(lookup-home homes (caddr instr))
@@ -703,6 +763,10 @@
                   ,(caddr instr)
                   ,@(map (lambda (operand) (lookup-home homes operand))
                          (cdddr instr))))
+    ((call-apply)
+     `(call-apply ,(lookup-home homes (cadr instr))
+                  ,@(map (lambda (operand) (lookup-home homes operand))
+                         (cddr instr))))
     ((tail-call)
      `(tail-call ,(lookup-home homes (cadr instr))
                  ,@(map (lambda (operand) (lookup-home homes operand))
@@ -711,6 +775,9 @@
      `(tail-call-known ,(cadr instr)
                        ,@(map (lambda (operand) (lookup-home homes operand))
                               (cddr instr))))
+    ((tail-call-apply)
+     `(tail-call-apply ,@(map (lambda (operand) (lookup-home homes operand))
+                              (cdr instr))))
     ((branch-if)
      `(branch-if ,(lookup-home homes (cadr instr))
                  ,(caddr instr)
@@ -722,7 +789,13 @@
      (error "Unknown machine instruction during allocation" instr))))
 
 (define (safepoint-machine-instruction? instr)
-  (memq (car instr) '(alloc-box alloc-pair alloc-vector alloc-closure call call-known)))
+  ;; tail-call/tail-call-known/tail-call-apply are deliberately excluded:
+  ;; the current frame is already popped from the GC frame chain (and its
+  ;; values have nothing left to be reloaded into) by the time the actual
+  ;; jump executes, so there is nothing in this frame left to sync.
+  (memq (car instr)
+        '(alloc-box alloc-pair alloc-vector alloc-closure alloc-closure-variadic
+          call call-known call-apply)))
 
 (define (register-operand? operand)
   (and (pair? operand)
@@ -908,6 +981,28 @@
                      `(restore-callee-saved ,saved-registers)
                      `(deallocate-frame ,stack-size)
                      `(tail-call-label ,proc-name)))))
+    ;; apply's argument count is a runtime-unknown quantity even when its
+    ;; target is statically known (see (hop pass cfa)), so it can never use
+    ;; the call-known fast path; it always goes through a single fixed
+    ;; runtime entry point with a fixed 3-argument shape (closure,
+    ;; leading-args-list, spread-list) -- the leading args and the spread
+    ;; list were already consed into ordinary lists in TAC (hop pass tac),
+    ;; so no per-arity family of apply helpers, and no variable-arity
+    ;; marshaling, is needed here: this lowers exactly like an ordinary
+    ;; 3-argument call to a fixed runtime label.
+    ((call-apply)
+     (let ((dst (cadr instr))
+           (args (cddr instr)))
+       (append (lower-arg-moves args)
+               (list '(call-label hop_apply)
+                     `(move ,dst (arg-register ,aarch64-return-register))))))
+    ((tail-call-apply)
+     (let ((args (cdr instr)))
+       (append (lower-arg-moves args)
+               (list '(gc-pop-frame)
+                     `(restore-callee-saved ,saved-registers)
+                     `(deallocate-frame ,stack-size)
+                     '(tail-call-label hop_apply)))))
     ((ret)
      (list `(move-out (arg-register ,aarch64-return-register) ,(cadr instr))
            '(gc-pop-frame)
@@ -1340,6 +1435,28 @@
           (emit-asm-line port "    bl _hop_alloc_closure_n")))
     (emit-store-operand port "x0" dst proc)))
 
+;; Variadic closures are a new, unoptimized-for-speed path (ordinary
+;; closures never route through here), so there is no need to special-case
+;; small capture counts the way emit-alloc-closure does above -- always
+;; write captures to the outgoing-stack area and go through the one general
+;; runtime helper, exactly like the >3-capture branch of emit-alloc-closure.
+(define (emit-alloc-closure-variadic port dst proc-name k captures proc)
+  (let ((count (length captures)))
+    (let loop ((rest captures) (index 0))
+      (unless (null? rest)
+        (emit-load-operand port "x9" (car rest) proc)
+        (emit-asm-line port
+                       (string-append "    str x9, [sp, #"
+                                      (number->string (* 8 index))
+                                      "]"))
+        (loop (cdr rest) (+ index 1))))
+    (emit-procedure-address port "x0" proc-name)
+    (emit-asm-line port (string-append "    mov x1, #" (number->string k)))
+    (emit-asm-line port (string-append "    mov x2, #" (number->string count)))
+    (emit-asm-line port "    mov x3, sp")
+    (emit-asm-line port "    bl _hop_alloc_closure_variadic")
+    (emit-store-operand port "x0" dst proc)))
+
 (define (emit-call-helper port argc tail?)
   (emit-asm-line port
                  (string-append "    "
@@ -1514,6 +1631,8 @@
       (emit-runtime-global-write port (cadr instr) (caddr instr) proc))
     ((alloc-closure)
      (emit-alloc-closure port (cadr instr) (caddr instr) (cdddr instr) proc))
+    ((alloc-closure-variadic)
+     (emit-alloc-closure-variadic port (cadr instr) (caddr instr) (cadddr instr) (cddddr instr) proc))
     ((call-indirect)
      (emit-call-helper port (cadr instr) #f))
     ((call-label)

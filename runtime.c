@@ -31,7 +31,17 @@ enum {
     HOP_OBJ_BOX = 1,
     HOP_OBJ_PAIR = 2,
     HOP_OBJ_CLOSURE = 3,
-    HOP_OBJ_VECTOR = 4
+    HOP_OBJ_VECTOR = 4,
+    /*
+     * A variadic closure uses the same pointer tag (HOP_CLOSURE_TAG) as an
+     * ordinary closure -- only this header type byte distinguishes them --
+     * and the same [header][code][env...] layout, with one extra trailing
+     * word holding its fixed-argument count k (a plain integer, not a
+     * GC-traced value). Keeping env slots at the same fixed offset for both
+     * kinds means hop_closure_env, and every hot hop_call_N switch body
+     * that reads it, never need to branch on variadic-ness at all.
+     */
+    HOP_OBJ_CLOSURE_VARIADIC = 5
 };
 
 #define HOP_HEADER_TYPE_MASK ((hop_word)0xff)
@@ -131,6 +141,8 @@ static size_t hop_object_words(hop_value *object) {
         return 3;
     case HOP_OBJ_CLOSURE:
         return 2 + (size_t)hop_header_aux(header);
+    case HOP_OBJ_CLOSURE_VARIADIC:
+        return 3 + (size_t)hop_header_aux(header);
     case HOP_OBJ_VECTOR:
         return 1 + (size_t)hop_header_aux(header);
     case HOP_OBJ_FORWARD:
@@ -260,6 +272,10 @@ static void hop_scan_copied_objects(void) {
             object[2] = hop_copy_value(object[2]);
             break;
         case HOP_OBJ_CLOSURE:
+        case HOP_OBJ_CLOSURE_VARIADIC:
+            /* Both kinds keep env slots at the same offset, for exactly
+             * env_count words; a variadic closure's trailing k word is a
+             * plain integer, not a pointer, and must not be traced. */
             for (index = 0; index < (size_t)hop_header_aux(header); index += 1) {
                 object[2 + index] = hop_copy_value(object[2 + index]);
             }
@@ -464,7 +480,10 @@ static hop_value *hop_alloc_closure_raw(void *code, int64_t env_count) {
 static hop_value *hop_as_closure(hop_value closure_value) {
     hop_value *closure =
         hop_expect_pointer_tag(closure_value, HOP_CLOSURE_TAG, "call expected closure");
-    hop_expect_object_type(closure, HOP_OBJ_CLOSURE, "call expected closure");
+    hop_word type = hop_header_type((hop_word)closure[0]);
+    if (type != HOP_OBJ_CLOSURE && type != HOP_OBJ_CLOSURE_VARIADIC) {
+        hop_panic("call expected closure");
+    }
     return closure;
 }
 
@@ -478,6 +497,15 @@ static int64_t hop_closure_env_count(hop_value *closure) {
 
 static hop_value *hop_closure_env(hop_value *closure) {
     return closure + 2;
+}
+
+static int hop_closure_is_variadic(hop_value *closure) {
+    return hop_header_type((hop_word)closure[0]) == HOP_OBJ_CLOSURE_VARIADIC;
+}
+
+/* Valid only when hop_closure_is_variadic(closure) is true. */
+static int64_t hop_closure_variadic_k(hop_value *closure) {
+    return (int64_t)closure[2 + hop_closure_env_count(closure)];
 }
 
 hop_value hop_alloc_closure_0(void *code) {
@@ -557,6 +585,32 @@ hop_value hop_alloc_closure_n(void *code, int64_t count, hop_value *envs) {
     return hop_tag_pointer(closure, HOP_CLOSURE_TAG);
 }
 
+/*
+ * Variadic closures are a new, unoptimized-for-speed path (ordinary
+ * closures never route through here), so there is no small-count fast case
+ * the way hop_alloc_closure_0..3 provide above -- always go through the
+ * general captures-buffer path, mirroring hop_alloc_closure_n.
+ */
+hop_value hop_alloc_closure_variadic(void *code, int64_t k, int64_t count, hop_value *envs) {
+    hop_value *closure;
+    int64_t i;
+
+    if (count > HOP_MAX_CLOSURE_ENV) {
+        hop_panic("too many closure captures");
+    }
+    for (i = 0; i < count; i++) {
+        hop_temp_closure_roots[i] = envs[i];
+    }
+    closure = hop_alloc_words(3 + (size_t)count, hop_temp_closure_roots, (size_t)count);
+    closure[0] = (hop_value)hop_make_header(HOP_OBJ_CLOSURE_VARIADIC, (hop_word)count);
+    closure[1] = (hop_value)(uintptr_t)code;
+    for (i = 0; i < count; i++) {
+        hop_closure_env(closure)[i] = hop_temp_closure_roots[i];
+    }
+    closure[2 + count] = (hop_value)k;
+    return hop_tag_pointer(closure, HOP_CLOSURE_TAG);
+}
+
 typedef hop_value (*hop_fun_0_0)(void);
 typedef hop_value (*hop_fun_0_1)(hop_value);
 typedef hop_value (*hop_fun_0_2)(hop_value, hop_value);
@@ -603,8 +657,184 @@ typedef hop_value (*hop_fun_7_0)(hop_value, hop_value, hop_value, hop_value, hop
 typedef hop_value (*hop_fun_7_1)(hop_value, hop_value, hop_value, hop_value, hop_value, hop_value, hop_value, hop_value);
 typedef hop_value (*hop_fun_8_0)(hop_value, hop_value, hop_value, hop_value, hop_value, hop_value, hop_value, hop_value);
 
+/*
+ * Shared indirect-invocation primitive, reused by hop_call_N's variadic
+ * branch below and by hop_apply. A variadic closure's underlying native
+ * function has the exact same C shape as an ordinary (env_count, argc)-ary
+ * function -- the trailing "argument" just happens to already be a
+ * cons-list value -- so no new typedefs are needed here: this covers
+ * exactly the same env_count+argc<=8 region the hop_fun_* typedefs above
+ * already cover (the same ceiling hop_call_N already has), and panics
+ * outside it exactly like their default: cases do.
+ */
+static hop_value hop_dispatch_flat_call(void *code, int64_t env_count,
+                                        hop_value *env, hop_value *args, int64_t argc) {
+    switch (argc) {
+    case 0:
+        switch (env_count) {
+        case 0: return ((hop_fun_0_0)code)();
+        case 1: return ((hop_fun_1_0)code)(env[0]);
+        case 2: return ((hop_fun_2_0)code)(env[0], env[1]);
+        case 3: return ((hop_fun_3_0)code)(env[0], env[1], env[2]);
+        case 4: return ((hop_fun_4_0)code)(env[0], env[1], env[2], env[3]);
+        case 5: return ((hop_fun_5_0)code)(env[0], env[1], env[2], env[3], env[4]);
+        case 6: return ((hop_fun_6_0)code)(env[0], env[1], env[2], env[3], env[4], env[5]);
+        case 7: return ((hop_fun_7_0)code)(env[0], env[1], env[2], env[3], env[4], env[5], env[6]);
+        case 8: return ((hop_fun_8_0)code)(env[0], env[1], env[2], env[3], env[4], env[5], env[6], env[7]);
+        default: hop_panic("unsupported (env_count, argc) combination in hop_dispatch_flat_call");
+        }
+    case 1:
+        switch (env_count) {
+        case 0: return ((hop_fun_0_1)code)(args[0]);
+        case 1: return ((hop_fun_1_1)code)(env[0], args[0]);
+        case 2: return ((hop_fun_2_1)code)(env[0], env[1], args[0]);
+        case 3: return ((hop_fun_3_1)code)(env[0], env[1], env[2], args[0]);
+        case 4: return ((hop_fun_4_1)code)(env[0], env[1], env[2], env[3], args[0]);
+        case 5: return ((hop_fun_5_1)code)(env[0], env[1], env[2], env[3], env[4], args[0]);
+        case 6: return ((hop_fun_6_1)code)(env[0], env[1], env[2], env[3], env[4], env[5], args[0]);
+        case 7: return ((hop_fun_7_1)code)(env[0], env[1], env[2], env[3], env[4], env[5], env[6], args[0]);
+        default: hop_panic("unsupported (env_count, argc) combination in hop_dispatch_flat_call");
+        }
+    case 2:
+        switch (env_count) {
+        case 0: return ((hop_fun_0_2)code)(args[0], args[1]);
+        case 1: return ((hop_fun_1_2)code)(env[0], args[0], args[1]);
+        case 2: return ((hop_fun_2_2)code)(env[0], env[1], args[0], args[1]);
+        case 3: return ((hop_fun_3_2)code)(env[0], env[1], env[2], args[0], args[1]);
+        case 4: return ((hop_fun_4_2)code)(env[0], env[1], env[2], env[3], args[0], args[1]);
+        case 5: return ((hop_fun_5_2)code)(env[0], env[1], env[2], env[3], env[4], args[0], args[1]);
+        case 6: return ((hop_fun_6_2)code)(env[0], env[1], env[2], env[3], env[4], env[5], args[0], args[1]);
+        default: hop_panic("unsupported (env_count, argc) combination in hop_dispatch_flat_call");
+        }
+    case 3:
+        switch (env_count) {
+        case 0: return ((hop_fun_0_3)code)(args[0], args[1], args[2]);
+        case 1: return ((hop_fun_1_3)code)(env[0], args[0], args[1], args[2]);
+        case 2: return ((hop_fun_2_3)code)(env[0], env[1], args[0], args[1], args[2]);
+        case 3: return ((hop_fun_3_3)code)(env[0], env[1], env[2], args[0], args[1], args[2]);
+        case 4: return ((hop_fun_4_3)code)(env[0], env[1], env[2], env[3], args[0], args[1], args[2]);
+        case 5: return ((hop_fun_5_3)code)(env[0], env[1], env[2], env[3], env[4], args[0], args[1], args[2]);
+        default: hop_panic("unsupported (env_count, argc) combination in hop_dispatch_flat_call");
+        }
+    case 4:
+        switch (env_count) {
+        case 0: return ((hop_fun_0_4)code)(args[0], args[1], args[2], args[3]);
+        case 1: return ((hop_fun_1_4)code)(env[0], args[0], args[1], args[2], args[3]);
+        case 2: return ((hop_fun_2_4)code)(env[0], env[1], args[0], args[1], args[2], args[3]);
+        case 3: return ((hop_fun_3_4)code)(env[0], env[1], env[2], args[0], args[1], args[2], args[3]);
+        case 4: return ((hop_fun_4_4)code)(env[0], env[1], env[2], env[3], args[0], args[1], args[2], args[3]);
+        default: hop_panic("unsupported (env_count, argc) combination in hop_dispatch_flat_call");
+        }
+    case 5:
+        switch (env_count) {
+        case 0: return ((hop_fun_0_5)code)(args[0], args[1], args[2], args[3], args[4]);
+        case 1: return ((hop_fun_1_5)code)(env[0], args[0], args[1], args[2], args[3], args[4]);
+        case 2: return ((hop_fun_2_5)code)(env[0], env[1], args[0], args[1], args[2], args[3], args[4]);
+        case 3: return ((hop_fun_3_5)code)(env[0], env[1], env[2], args[0], args[1], args[2], args[3], args[4]);
+        default: hop_panic("unsupported (env_count, argc) combination in hop_dispatch_flat_call");
+        }
+    case 6:
+        switch (env_count) {
+        case 0: return ((hop_fun_0_6)code)(args[0], args[1], args[2], args[3], args[4], args[5]);
+        case 1: return ((hop_fun_1_6)code)(env[0], args[0], args[1], args[2], args[3], args[4], args[5]);
+        case 2: return ((hop_fun_2_6)code)(env[0], env[1], args[0], args[1], args[2], args[3], args[4], args[5]);
+        default: hop_panic("unsupported (env_count, argc) combination in hop_dispatch_flat_call");
+        }
+    case 7:
+        switch (env_count) {
+        case 0: return ((hop_fun_0_7)code)(args[0], args[1], args[2], args[3], args[4], args[5], args[6]);
+        case 1: return ((hop_fun_1_7)code)(env[0], args[0], args[1], args[2], args[3], args[4], args[5], args[6]);
+        default: hop_panic("unsupported (env_count, argc) combination in hop_dispatch_flat_call");
+        }
+    case 8:
+        switch (env_count) {
+        case 0: return ((hop_fun_0_8)code)(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]);
+        default: hop_panic("unsupported (env_count, argc) combination in hop_dispatch_flat_call");
+        }
+    default:
+        hop_panic("unsupported (env_count, argc) combination in hop_dispatch_flat_call");
+    }
+}
+
+/*
+ * Scratch buffer for building a variadic call's rest-list and (for
+ * hop_apply) its fully-flattened argument list. Sized generously relative
+ * to the existing HOP_MAX_CLOSURE_ENV=16 capture ceiling and the
+ * env_count+argc<=8 dispatch ceiling above; exceeding it panics, mirroring
+ * how hop_alloc_closure_n already panics past HOP_MAX_CLOSURE_ENV. Reused
+ * (not held concurrently) by hop_invoke_variadic_closure and hop_apply --
+ * both run to completion, including every allocation, before returning.
+ */
+#define HOP_MAX_VARIADIC_ARGS 64
+static hop_value hop_temp_variadic_roots[HOP_MAX_VARIADIC_ARGS];
+
+/*
+ * Shared by every hop_call_N's variadic branch below. args[] holds exactly
+ * the argc arguments the caller passed at this indirect call site (never
+ * including captured env values -- those come from the closure's own env
+ * slots, exactly as for an ordinary closure).
+ */
+static hop_value hop_invoke_variadic_closure(hop_value closure_value, hop_value *args, int64_t argc) {
+    hop_value *closure = hop_as_closure(closure_value);
+    int64_t k = hop_closure_variadic_k(closure);
+    int64_t env_count;
+    void *code;
+    hop_value rest;
+    hop_value fixed_and_rest[9];
+    int64_t i;
+
+    if (argc < k) {
+        hop_panic("procedure called with too few arguments");
+    }
+    /* hop_dispatch_flat_call itself cannot dispatch a combined
+     * env_count+argc beyond 8; check k here too so a large k can never
+     * overrun the fixed-size fixed_and_rest buffer below. */
+    if (k + 1 > 8) {
+        hop_panic("procedure has too many fixed parameters for indirect variadic dispatch");
+    }
+    if (argc > HOP_MAX_VARIADIC_ARGS - 2) {
+        hop_panic("too many arguments to variadic procedure");
+    }
+
+    /*
+     * Root closure_value + every argument across the consing loop below:
+     * each hop_alloc_words call is a GC safepoint, and this function's own
+     * plain C stack frame -- unlike the compiler's own frames -- is
+     * invisible to the precise collector's frame-descriptor walk. Every
+     * allocation below roots the *entire* still-live window, and closure
+     * is always re-derived from the rooted buffer afterward rather than
+     * reusing a pointer computed before an allocation could have moved it.
+     */
+    hop_temp_variadic_roots[0] = closure_value;
+    for (i = 0; i < argc; i++) {
+        hop_temp_variadic_roots[1 + i] = args[i];
+    }
+    rest = HOP_NULL;
+    hop_temp_variadic_roots[1 + argc] = rest;
+    for (i = argc - 1; i >= k; i--) {
+        hop_value *pair = hop_alloc_words(3, hop_temp_variadic_roots, (size_t)(argc + 2));
+        pair[0] = (hop_value)hop_make_header(HOP_OBJ_PAIR, 0);
+        pair[1] = hop_temp_variadic_roots[1 + i];
+        pair[2] = hop_temp_variadic_roots[1 + argc];
+        rest = hop_tag_pointer(pair, HOP_PAIR_TAG);
+        hop_temp_variadic_roots[1 + argc] = rest;
+    }
+
+    closure = hop_as_closure(hop_temp_variadic_roots[0]);
+    env_count = hop_closure_env_count(closure);
+    code = hop_closure_code(closure);
+    for (i = 0; i < k; i++) {
+        fixed_and_rest[i] = hop_temp_variadic_roots[1 + i];
+    }
+    fixed_and_rest[k] = hop_temp_variadic_roots[1 + argc];
+    return hop_dispatch_flat_call(code, env_count, hop_closure_env(closure), fixed_and_rest, k + 1);
+}
+
 hop_value hop_call_0(hop_value closure_value) {
     hop_value *closure = hop_as_closure(closure_value);
+    if (hop_closure_is_variadic(closure)) {
+        return hop_invoke_variadic_closure(closure_value, NULL, 0);
+    }
     hop_value *env = hop_closure_env(closure);
     switch (hop_closure_env_count(closure)) {
     case 0:
@@ -632,6 +862,10 @@ hop_value hop_call_0(hop_value closure_value) {
 
 hop_value hop_call_1(hop_value arg0, hop_value closure_value) {
     hop_value *closure = hop_as_closure(closure_value);
+    if (hop_closure_is_variadic(closure)) {
+        hop_value args[1] = {arg0};
+        return hop_invoke_variadic_closure(closure_value, args, 1);
+    }
     hop_value *env = hop_closure_env(closure);
     switch (hop_closure_env_count(closure)) {
     case 0:
@@ -657,6 +891,10 @@ hop_value hop_call_1(hop_value arg0, hop_value closure_value) {
 
 hop_value hop_call_2(hop_value arg0, hop_value arg1, hop_value closure_value) {
     hop_value *closure = hop_as_closure(closure_value);
+    if (hop_closure_is_variadic(closure)) {
+        hop_value args[2] = {arg0, arg1};
+        return hop_invoke_variadic_closure(closure_value, args, 2);
+    }
     hop_value *env = hop_closure_env(closure);
     switch (hop_closure_env_count(closure)) {
     case 0:
@@ -683,6 +921,10 @@ hop_value hop_call_3(hop_value arg0,
                      hop_value arg2,
                      hop_value closure_value) {
     hop_value *closure = hop_as_closure(closure_value);
+    if (hop_closure_is_variadic(closure)) {
+        hop_value args[3] = {arg0, arg1, arg2};
+        return hop_invoke_variadic_closure(closure_value, args, 3);
+    }
     hop_value *env = hop_closure_env(closure);
     switch (hop_closure_env_count(closure)) {
     case 0:
@@ -708,6 +950,10 @@ hop_value hop_call_4(hop_value arg0,
                      hop_value arg3,
                      hop_value closure_value) {
     hop_value *closure = hop_as_closure(closure_value);
+    if (hop_closure_is_variadic(closure)) {
+        hop_value args[4] = {arg0, arg1, arg2, arg3};
+        return hop_invoke_variadic_closure(closure_value, args, 4);
+    }
     hop_value *env = hop_closure_env(closure);
     switch (hop_closure_env_count(closure)) {
     case 0:
@@ -732,6 +978,10 @@ hop_value hop_call_5(hop_value arg0,
                      hop_value arg4,
                      hop_value closure_value) {
     hop_value *closure = hop_as_closure(closure_value);
+    if (hop_closure_is_variadic(closure)) {
+        hop_value args[5] = {arg0, arg1, arg2, arg3, arg4};
+        return hop_invoke_variadic_closure(closure_value, args, 5);
+    }
     hop_value *env = hop_closure_env(closure);
     switch (hop_closure_env_count(closure)) {
     case 0:
@@ -755,6 +1005,10 @@ hop_value hop_call_6(hop_value arg0,
                      hop_value arg5,
                      hop_value closure_value) {
     hop_value *closure = hop_as_closure(closure_value);
+    if (hop_closure_is_variadic(closure)) {
+        hop_value args[6] = {arg0, arg1, arg2, arg3, arg4, arg5};
+        return hop_invoke_variadic_closure(closure_value, args, 6);
+    }
     hop_value *env = hop_closure_env(closure);
     switch (hop_closure_env_count(closure)) {
     case 0:
@@ -777,6 +1031,10 @@ hop_value hop_call_7(hop_value arg0,
                      hop_value arg6,
                      hop_value closure_value) {
     hop_value *closure = hop_as_closure(closure_value);
+    if (hop_closure_is_variadic(closure)) {
+        hop_value args[7] = {arg0, arg1, arg2, arg3, arg4, arg5, arg6};
+        return hop_invoke_variadic_closure(closure_value, args, 7);
+    }
     hop_value *env = hop_closure_env(closure);
     switch (hop_closure_env_count(closure)) {
     case 0:
@@ -798,6 +1056,10 @@ hop_value hop_call_8(hop_value arg0,
                      hop_value arg7,
                      hop_value closure_value) {
     hop_value *closure = hop_as_closure(closure_value);
+    if (hop_closure_is_variadic(closure)) {
+        hop_value args[8] = {arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7};
+        return hop_invoke_variadic_closure(closure_value, args, 8);
+    }
     hop_value *env = hop_closure_env(closure);
     switch (hop_closure_env_count(closure)) {
     case 0:
@@ -874,6 +1136,103 @@ hop_value hop_tail_call_8(hop_value arg0,
                           hop_value arg7,
                           hop_value closure_value) {
     return hop_call_8(arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7, closure_value);
+}
+
+/*
+ * apply's spread argument count is only known once list_arg is walked here
+ * at run time -- even when its target closure is statically known at the
+ * call site, the compiler can never resolve apply to a fixed-argc direct
+ * call, so it always lowers to this single fixed-signature entry point
+ * (see (hop pass cfa) and (hop pass tac)). leading_list holds any leading
+ * fixed arguments, already consed into an ordinary list by the compiler at
+ * the call site; list_arg is apply's final, user-supplied argument and
+ * must be a proper list.
+ */
+hop_value hop_apply(hop_value closure_value, hop_value leading_list, hop_value list_arg) {
+    hop_value *closure;
+    int64_t argc, k, env_count, i;
+    void *code;
+    hop_value cursor;
+    hop_value rest;
+
+    /*
+     * Flatten leading_list ++ list_arg into the rooted scratch buffer.
+     * Walking allocates nothing (hop_car/hop_cdr never call
+     * hop_alloc_words), so no GC safepoint occurs during this loop and
+     * nothing needs protecting yet.
+     */
+    hop_temp_variadic_roots[0] = closure_value;
+    argc = 0;
+    cursor = leading_list;
+    while (cursor != HOP_NULL) {
+        if (!hop_has_tag(cursor, HOP_PAIR_TAG)) {
+            hop_panic("apply: internal leading-argument list is malformed");
+        }
+        if (argc > HOP_MAX_VARIADIC_ARGS - 3) {
+            hop_panic("apply: too many spread arguments");
+        }
+        hop_temp_variadic_roots[1 + argc] = hop_car(cursor);
+        argc += 1;
+        cursor = hop_cdr(cursor);
+    }
+    cursor = list_arg;
+    while (cursor != HOP_NULL) {
+        if (!hop_has_tag(cursor, HOP_PAIR_TAG)) {
+            hop_panic("apply: last argument is not a proper list");
+        }
+        if (argc > HOP_MAX_VARIADIC_ARGS - 3) {
+            hop_panic("apply: too many spread arguments");
+        }
+        hop_temp_variadic_roots[1 + argc] = hop_car(cursor);
+        argc += 1;
+        cursor = hop_cdr(cursor);
+    }
+
+    closure = hop_as_closure(hop_temp_variadic_roots[0]);
+
+    if (!hop_closure_is_variadic(closure)) {
+        /* Arity is unverifiable here exactly as it is everywhere else in
+         * this runtime -- ordinary closures carry no declared-arity
+         * metadata by design (see hop_call_N). hop_dispatch_flat_call
+         * itself panics if argc exceeds what this runtime's calling
+         * convention can dispatch through this path (env_count+argc<=8),
+         * the same ceiling every other indirect call already has. */
+        env_count = hop_closure_env_count(closure);
+        code = hop_closure_code(closure);
+        return hop_dispatch_flat_call(code, env_count, hop_closure_env(closure),
+                                      hop_temp_variadic_roots + 1, argc);
+    }
+
+    k = hop_closure_variadic_k(closure);
+    if (argc < k) {
+        hop_panic("apply: too few arguments for variadic procedure");
+    }
+    if (k + 1 > 8) {
+        hop_panic("procedure has too many fixed parameters for indirect variadic dispatch");
+    }
+
+    rest = HOP_NULL;
+    hop_temp_variadic_roots[1 + argc] = rest;
+    for (i = argc - 1; i >= k; i--) {
+        hop_value *pair = hop_alloc_words(3, hop_temp_variadic_roots, (size_t)(argc + 2));
+        pair[0] = (hop_value)hop_make_header(HOP_OBJ_PAIR, 0);
+        pair[1] = hop_temp_variadic_roots[1 + i];
+        pair[2] = hop_temp_variadic_roots[1 + argc];
+        rest = hop_tag_pointer(pair, HOP_PAIR_TAG);
+        hop_temp_variadic_roots[1 + argc] = rest;
+    }
+
+    closure = hop_as_closure(hop_temp_variadic_roots[0]);
+    env_count = hop_closure_env_count(closure);
+    code = hop_closure_code(closure);
+    {
+        hop_value fixed_and_rest[9];
+        for (i = 0; i < k; i++) {
+            fixed_and_rest[i] = hop_temp_variadic_roots[1 + i];
+        }
+        fixed_and_rest[k] = hop_temp_variadic_roots[1 + argc];
+        return hop_dispatch_flat_call(code, env_count, hop_closure_env(closure), fixed_and_rest, k + 1);
+    }
 }
 
 const char *hop_symbol_name(hop_value value) {

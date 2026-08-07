@@ -751,6 +751,49 @@
      (when (eq? 'x 'y) 100)
      (unless (eq? 'x 'y) 200)))
 
+;; Variadic lambda summing a rest list via recursion. f is applied directly
+;; from a single letrec binding, so 0CFA resolves it to a known-call: the
+;; overflow arguments (2 3 4) are consed into the rest list entirely at
+;; compile time, with no runtime dispatch for the call itself.
+(define test91
+  '(letrec ((sum-list
+             (lambda (lst)
+               (if (primop null? lst) 0
+                   (primop + (primop car lst) (app sum-list (primop cdr lst)))))))
+     (letrec ((f (lambda (variadic (a) rest) (primop + a (app sum-list rest)))))
+       (app f 1 2 3 4))))
+
+;; Indirect call to a variadic target: h's value flows from an if between
+;; two different variadic closures, so 0CFA cannot resolve a single target
+;; and the call must go through the runtime's hop_call_N variadic branch.
+(define test92
+  '(letrec ((g1 (lambda (variadic (a b) rest)
+                  (primop + a (primop + b (primop car rest))))))
+     (letrec ((g2 (lambda (variadic (a b) rest)
+                    (primop + (primop + a b) (primop + (primop car rest) 100)))))
+       (let ((h (if (primop null? (quote ())) g1 g2)))
+         (app h 1 2 3 4)))))
+
+;; All-rest lambda: (lambda args ...), i.e. zero fixed parameters.
+(define test93
+  '(let ((f (lambda (variadic () args) (primop car args))))
+     (app f 42)))
+
+;; apply spreads a list onto a variadic target, with one leading fixed
+;; argument ahead of the spread list.
+(define test94
+  '(let ((f (lambda (variadic (a) rest) (primop + a (primop car rest)))))
+     (apply f 1 (cons 2 (cons 3 ())))))
+
+;; Minimal known-call-only program (unlike test91, nothing else in this
+;; program makes an indirect call), so this is the clean assembly-level
+;; witness that a variadic known-call compiles to a direct label branch
+;; with no runtime dispatch helper anywhere in the program at all.
+(define test95
+  '(letrec ((f (lambda (variadic (a b) rest)
+                 (primop + a (primop + b (primop car rest))))))
+     (app f 1 2 3 4)))
+
 (define sample-tests
   (list (cons "Test 1: Simple arithmetic" test1)
         (cons "Test 2: Lambda application" test2)
@@ -840,7 +883,12 @@
         (cons "Test 87: cond arrow clauses (surface)" test87)
         (cons "Test 88: two-armed if (surface)" test88)
         (cons "Test 89: alist lookup over dotted quoted data (surface)" test89)
-        (cons "Test 90: when/unless (surface)" test90)))
+        (cons "Test 90: when/unless (surface)" test90)
+        (cons "Test 91: variadic lambda, known-call fast path" test91)
+        (cons "Test 92: variadic lambda, indirect call" test92)
+        (cons "Test 93: all-rest lambda" test93)
+        (cons "Test 94: apply spreads a list onto a variadic target" test94)
+        (cons "Test 95: minimal variadic known-call (no other indirect calls)" test95)))
 
 (define named-tests
   ;; These are runnable end-to-end regression cases. test6 and test7 stay as
@@ -931,7 +979,12 @@
          (cons 'test87 test87)
          (cons 'test88 test88)
          (cons 'test89 test89)
-         (cons 'test90 test90)))
+         (cons 'test90 test90)
+         (cons 'test91 test91)
+         (cons 'test92 test92)
+         (cons 'test93 test93)
+         (cons 'test94 test94)
+         (cons 'test95 test95)))
 
 (define (lookup-named-test name)
   (let ((binding (assoc name named-tests)))

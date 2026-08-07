@@ -112,6 +112,15 @@ hop_value hop_alloc_closure_1(void *code, hop_value env0);
 hop_value hop_alloc_closure_2(void *code, hop_value env0, hop_value env1);
 hop_value hop_alloc_closure_3(void *code, hop_value env0, hop_value env1, hop_value env2);
 hop_value hop_alloc_closure_n(void *code, int64_t count, hop_value *envs);
+/*
+ * A variadic closure's underlying native function is an ordinary
+ * fixed-arity function of (env-vars... fixed-params... rest-param): the
+ * rest-list is always built by the *caller* before the call (see
+ * hop_call_N and hop_apply below), never by the callee. k is the
+ * user-facing fixed-argument count (captured env vars are not counted --
+ * those never travel through a caller-supplied argument list).
+ */
+hop_value hop_alloc_closure_variadic(void *code, int64_t k, int64_t count, hop_value *envs);
 hop_value hop_call_0(hop_value closure_value);
 hop_value hop_call_1(hop_value arg0, hop_value closure_value);
 hop_value hop_call_2(hop_value arg0, hop_value arg1, hop_value closure_value);
@@ -132,6 +141,17 @@ hop_value hop_tail_call_7(hop_value arg0, hop_value arg1, hop_value arg2, hop_va
 hop_value hop_tail_call_8(hop_value arg0, hop_value arg1, hop_value arg2, hop_value arg3, hop_value arg4, hop_value arg5, hop_value arg6, hop_value arg7, hop_value closure_value);
 hop_value hop_global_ref(uint64_t index);
 hop_value hop_global_set(uint64_t index, hop_value value);
+
+/*
+ * apply's argument count is only known once the spread list is walked at
+ * run time -- even when its target closure is statically known, the
+ * compiler can never resolve apply to a fixed-argc direct call the way an
+ * ordinary application can (see (hop pass cfa)'s known-call rewriting).
+ * leading_list holds any leading fixed arguments already consed into an
+ * ordinary list at the call site; list_arg is apply's final, user-supplied
+ * spread argument and must be a proper list.
+ */
+hop_value hop_apply(hop_value closure_value, hop_value leading_list, hop_value list_arg);
 
 hop_value hop_safe_add(hop_value a, hop_value b);
 hop_value hop_safe_sub(hop_value a, hop_value b);

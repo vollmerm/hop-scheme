@@ -13,8 +13,14 @@
           nest-let-bindings
           set-union
           set-difference
-          set-equal?)
-  (import (scheme base))
+          set-equal?
+          params-variadic?
+          params-fixed
+          params-rest
+          params-names
+          make-params)
+  (import (scheme base)
+          (scheme cxr))
   (begin
 
 (define (body->expr body-exprs)
@@ -77,6 +83,33 @@
 
 (define (lambda-expr? expr)
   (and (pair? expr) (eq? (car expr) 'lambda)))
+
+;; A lambda's parameter list is either a plain proper list of symbols
+;; (ordinary fixed-arity lambda, unchanged from before variadic support) or
+;; a tagged 3-element list (variadic (fixed-sym...) rest-sym) recording a
+;; rest parameter. The tagged shape is itself a proper list, so it flows
+;; safely through code that only ever forwards `params` opaquely; only code
+;; that needs to actually split fixed-vs-rest, or collect every bound name,
+;; needs the helpers below.
+(define (params-variadic? params)
+  (and (pair? params) (eq? (car params) 'variadic)))
+
+(define (params-fixed params)
+  (if (params-variadic? params) (cadr params) params))
+
+(define (params-rest params)
+  (if (params-variadic? params) (caddr params) #f))
+
+;; Every name bound by this parameter list, fixed params first and the rest
+;; parameter (if any) last -- the shape most callers actually want when they
+;; just need "the set of names this lambda binds".
+(define (params-names params)
+  (if (params-variadic? params)
+      (append (params-fixed params) (list (params-rest params)))
+      params))
+
+(define (make-params fixed rest)
+  (if rest (list 'variadic fixed rest) fixed))
 
 ; A quoted symbol stays wrapped as (quote sym) all the way through the
 ; pipeline so that a bare symbol always means a variable reference. Every

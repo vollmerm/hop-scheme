@@ -95,6 +95,14 @@
            (wrap-let-bindings
             (append op-bindings arg-bindings)
             `(closure-call ,simple-op ,@simple-args))))
+        ((closure-apply)
+         (let-values (((op-bindings simple-op)
+                       (normalize-simple (cadr expr)))
+                      ((arg-bindings simple-args)
+                       (normalize-simple-list (cddr expr))))
+           (wrap-let-bindings
+            (append op-bindings arg-bindings)
+            `(closure-apply ,simple-op ,@simple-args))))
         ((self-tail-call)
          (let-values (((arg-bindings simple-args)
                        (normalize-simple-list (cdr expr))))
@@ -207,7 +215,7 @@
                                   (body->expr (cddr lambda-expr))))
            (collect-procedures (body->expr (cddr lambda-expr)))
            (for-each collect-procedures captures)))
-        ((closure-call known-call self-tail-call)
+        ((closure-call known-call self-tail-call closure-apply)
          (for-each collect-procedures (cdr expr)))
         ((group-tail-call)
          (for-each collect-procedures (cddr expr)))
@@ -271,7 +279,7 @@
                 (params (cadr meta))
                 (captures (cdddr expr))
                 (env-params
-                 (let loop ((rest params) (remaining capture-count) (result '()))
+                 (let loop ((rest (params-fixed params)) (remaining capture-count) (result '()))
                    (if (= remaining 0)
                        (reverse result)
                        (loop (cdr rest)
@@ -296,7 +304,7 @@
               (let* ((meta (hash-table-ref/default procedures proc-name #f))
                      (capture-count (car meta))
                      (params (cadr meta))
-                     (actual-params (list-tail params capture-count)))
+                     (actual-params (list-tail (params-fixed params) capture-count)))
                 (let loop ((param-rest actual-params) (arg-rest arg-sets))
                   (if (or (null? param-rest) (null? arg-rest))
                       'done
@@ -310,13 +318,25 @@
                  (loop (cdr rest)
                        (set-union result
                                   (flow-ref proc-results (car rest))))))))
+        ((closure-apply)
+         ;; The spread argument count is only known at runtime, so there is
+         ;; no sound way to zip argument flow-sets against a fixed params
+         ;; list here. Recurse for side effects (registering nested
+         ;; make-closures, propagating flow through subexpressions) but add
+         ;; no flow edges into any procedure's params, and contribute no
+         ;; value-flow of our own -- callers of apply's result are
+         ;; conservatively treated as flowing from an unknown source.
+         (begin
+           (analyze-expr (cadr expr) current-proc)
+           (for-each (lambda (a) (analyze-expr a current-proc)) (cddr expr))
+           '()))
         ((self-tail-call)
          (let ((meta (and current-proc (hash-table-ref/default procedures current-proc #f))))
            (if (not meta)
                '()
                (let* ((capture-count (car meta))
                       (params (cadr meta))
-                      (actual-params (list-tail params capture-count))
+                      (actual-params (list-tail (params-fixed params) capture-count))
                       (actual-arg-sets
                        (map (lambda (arg)
                               (analyze-expr arg current-proc))
@@ -459,14 +479,29 @@
                       (hash-table-ref/default procedures (car targets) #f))
                  (let* ((proc-name (car targets))
                         (meta (hash-table-ref/default procedures proc-name #f))
-                        (capture-count (car meta)))
-                   `(known-call ,proc-name ,capture-count ,rator ,@args))
+                        (capture-count (car meta))
+                        (params (cadr meta))
+                        ;; #f for an ordinary target; the fixed-arg count k
+                        ;; for a variadic one. 0CFA has already proven the
+                        ;; call target, so N < k here is a provable-wrong
+                        ;; program, not merely a possibly-wrong one -- raise
+                        ;; it as a compile error rather than degrading to a
+                        ;; generic call that could only fail later, at
+                        ;; runtime, with a less specific message.
+                        (rest-k (and (params-variadic? params)
+                                     (- (length (params-fixed params)) capture-count))))
+                   (if (and rest-k (< (length args) rest-k))
+                       (error "Too few arguments to variadic procedure" proc-name expr)
+                       `(known-call ,proc-name ,capture-count ,rest-k ,rator ,@args)))
                  `(closure-call ,rator ,@args))))
           ((known-call)
            `(known-call ,(cadr expr)
                         ,(caddr expr)
-                        ,(rewrite (cadddr expr))
-                        ,@(map rewrite (cddddr expr))))
+                        ,(cadddr expr)
+                        ,(rewrite (car (cddddr expr)))
+                        ,@(map rewrite (cdr (cddddr expr)))))
+          ((closure-apply)
+           `(closure-apply ,(rewrite (cadr expr)) ,@(map rewrite (cddr expr))))
           ((self-tail-call)
            `(self-tail-call ,@(map rewrite (cdr expr))))
           ((group-tail-call)

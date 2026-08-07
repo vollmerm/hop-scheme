@@ -40,9 +40,9 @@
         ((lambda)
          (let* ((params (cadr expr))
                 (body (body->expr (cddr expr))))
-           (collect body (append params bound))))
+           (collect body (append (params-names params) bound))))
 
-        ((app)
+        ((app apply)
          (append-map (lambda (e) (collect e bound)) (cdr expr)))
 
         ((self-tail-call)
@@ -107,7 +107,7 @@
         ((group-tail-call)
          (cons (cadr expr)
                (append-map collect-group-tail-targets (cddr expr))))
-        ((begin app set-box!)
+        ((begin app apply set-box!)
          (append-map collect-group-tail-targets (cdr expr)))
         ((primop)
          (append-map collect-group-tail-targets (cddr expr)))
@@ -135,7 +135,7 @@
      ((literal-expr? expr) #f)
      ((pair? expr)
       (case (car expr)
-        ((begin app primop set-box!)
+        ((begin app apply primop set-box!)
          (any (lambda (e) (mentions-box-var? e box-vars)) (cdr expr)))
         ((if)
          (or (mentions-box-var? (cadr expr) box-vars)
@@ -174,7 +174,7 @@
               (all (lambda (e) (safe-group-body? e box-vars)) (cddr expr))))
         ((lambda)
          (not (mentions-box-var? (body->expr (cddr expr)) box-vars)))
-        ((app)
+        ((app apply)
          (let ((rator (cadr expr))
                (args (cddr expr)))
            (if (and (pair? rator)
@@ -351,17 +351,27 @@
         ((lambda)
          (let* ((params (cadr expr))
                 (body (body->expr (cddr expr)))
-                (fvs (free-vars body params))
+                (fvs (free-vars body (params-names params)))
                 (env-vars (make-env-vars "env." (length fvs)))
-                (param-bindings (map (lambda (p) (list p `(local ,p))) params))
+                (param-bindings (map (lambda (p) (list p `(local ,p)))
+                                     (params-names params)))
                 (env-bindings (map (lambda (fv env-var)
                                      (list fv `(closure ,env-var)))
                                    fvs env-vars))
                 (new-env (append param-bindings env-bindings env))
                 (self-tail-env (map (lambda (env-var) `(local ,env-var)) env-vars))
-                (body-converted (convert body new-env self-tail-env)))
+                (body-converted (convert body new-env self-tail-env))
+                ;; The captured-env vars are prepended into the *fixed*
+                ;; portion of the parameter list, and the rest parameter (if
+                ;; any) stays trailing -- this is the flat native calling
+                ;; convention every later pass relies on: env0 ... envN
+                ;; fixed0 ... fixedN [rest]. The rest parameter itself is
+                ;; bound like any other local: it just happens to hold an
+                ;; already-built list value by the time the body runs.
+                (native-params (make-params (append env-vars (params-fixed params))
+                                             (params-rest params))))
            `(make-closure
-             (lambda ,(append env-vars params) ,body-converted)
+             (lambda ,native-params ,body-converted)
              ,@(map (lambda (fv)
                       (let ((binding (assoc fv env)))
                         (if binding
@@ -373,6 +383,11 @@
                (rands (cddr expr)))
            `(closure-call ,(convert rator env self-tail-prefix)
                           ,@(map (lambda (e) (convert e env self-tail-prefix)) rands))))
+        ((apply)
+         (let ((rator (cadr expr))
+               (rands (cddr expr)))
+           `(closure-apply ,(convert rator env self-tail-prefix)
+                           ,@(map (lambda (e) (convert e env self-tail-prefix)) rands))))
         ((cons)
          (error "cons in closure-convert: should have been canonicalized" expr))
         ((self-tail-call)
