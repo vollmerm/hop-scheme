@@ -92,8 +92,9 @@
      ;; area as call argument spilling whenever it takes the general (>3
      ;; captures) path; account for that here so the frame is sized to
      ;; actually cover those writes instead of aliasing the GC frame header
-     ;; just above the outgoing-args area.
-     (let ((count (length (cdddr instr))))
+     ;; just above the outgoing-args area. (alloc-closure dst proc-name
+     ;; arity captures...) -- captures start after the arity field.
+     (let ((count (length (cddddr instr))))
        (if (> count 3) count 0)))
     ((alloc-closure-variadic)
      ;; Always uses the general captures-to-stack path (see
@@ -244,7 +245,11 @@
     ((store-global)
      (if (symbol? (caddr instr)) (list (caddr instr)) '()))
     ((alloc-closure)
-     (let loop ((rest (cdddr instr)) (result '()))
+     ;; (alloc-closure dst proc-name arity captures...) -- proc-name and
+     ;; arity are literal/label operands, not registers; the generic symbol
+     ;; filter below already skips them (see the alloc-closure-variadic
+     ;; comment right below for the identical pattern).
+     (let loop ((rest (cddddr instr)) (result '()))
        (if (null? rest)
            (reverse result)
            (loop (cdr rest)
@@ -745,8 +750,9 @@
     ((alloc-closure)
      `(alloc-closure ,(lookup-home homes (cadr instr))
                      ,(caddr instr)
+                     ,(cadddr instr)
                      ,@(map (lambda (operand) (lookup-home homes operand))
-                            (cdddr instr))))
+                            (cddddr instr))))
     ((alloc-closure-variadic)
      `(alloc-closure-variadic ,(lookup-home homes (cadr instr))
                               ,(caddr instr)
@@ -1401,7 +1407,7 @@
 (define (register-name operand)
   (symbol->string (cadr operand)))
 
-(define (emit-alloc-closure port dst proc-name captures proc)
+(define (emit-alloc-closure port dst proc-name arity captures proc)
   (let ((count (length captures)))
     (if (<= count 3)
         (begin
@@ -1415,6 +1421,11 @@
                                      (car rest)
                                      proc)
                   (loop (cdr rest) (+ index 1)))))
+          (emit-asm-line port
+                         (string-append "    mov x"
+                                        (number->string (+ count 1))
+                                        ", #"
+                                        (number->string arity)))
           (emit-asm-line port
                          (string-append "    bl _hop_alloc_closure_"
                                         (number->string count))))
@@ -1432,6 +1443,9 @@
                          (string-append "    mov x1, #"
                                         (number->string count)))
           (emit-asm-line port "    mov x2, sp")
+          (emit-asm-line port
+                         (string-append "    mov x3, #"
+                                        (number->string arity)))
           (emit-asm-line port "    bl _hop_alloc_closure_n")))
     (emit-store-operand port "x0" dst proc)))
 
@@ -1630,7 +1644,7 @@
     ((store-global)
       (emit-runtime-global-write port (cadr instr) (caddr instr) proc))
     ((alloc-closure)
-     (emit-alloc-closure port (cadr instr) (caddr instr) (cdddr instr) proc))
+     (emit-alloc-closure port (cadr instr) (caddr instr) (cadddr instr) (cddddr instr) proc))
     ((alloc-closure-variadic)
      (emit-alloc-closure-variadic port (cadr instr) (caddr instr) (cadddr instr) (cddddr instr) proc))
     ((call-indirect)

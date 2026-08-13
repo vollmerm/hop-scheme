@@ -162,7 +162,7 @@ runtime_cases=(
   "test33|7"
   "test34|6"
   "test35|1830|2048"
-  "test36|1275|2048"
+  "test36|1275|4096"
   "test37|8"
   "test38|#t"
   "test39|3"
@@ -222,6 +222,7 @@ runtime_cases=(
   "test93|42"
   "test94|3"
   "test95|6"
+  "test96|11"
 )
 
 for case in "${runtime_cases[@]}"; do
@@ -259,6 +260,13 @@ assert_asm_not_contains "test5" 'str x9, \[sp, #(24|32|40)\]' 'eager root shadow
 assert_asm_contains "test91" 'b(l)? _cfa\.proc\.[0-9]+' 'direct closure call lowering for variadic known-call'
 assert_asm_contains "test95" 'b(l)? _cfa\.proc\.[0-9]+' 'direct closure call lowering for variadic known-call'
 assert_asm_not_contains "test95" '_hop_(tail_)?call_[0-9]+' 'generic call helper'
+
+# Cluster fallback dispatch: with two externally-callable members
+# (even? and odd?), the shared cluster-proc must branch on the runtime
+# entry-tag rather than collapsing to an unconditional jump to whichever
+# member happens to be first (see test96's definition for why a broken
+# dispatch would still "run" but produce the wrong answer).
+assert_asm_contains "test96" 'b\.ne Lentry\.' 'conditional entry-tag dispatch branch between cluster members'
 
 # indirect call to a statically-unresolvable variadic target must go
 # through the runtime's hop_call_N family (which internally branches on the

@@ -140,7 +140,11 @@ static size_t hop_object_words(hop_value *object) {
     case HOP_OBJ_PAIR:
         return 3;
     case HOP_OBJ_CLOSURE:
-        return 2 + (size_t)hop_header_aux(header);
+        /* One extra trailing word beyond header+code+env slots holds the
+         * closure's declared exact arity (see hop_closure_arity below) --
+         * the same layout HOP_OBJ_CLOSURE_VARIADIC already uses for its
+         * trailing k word. */
+        return 3 + (size_t)hop_header_aux(header);
     case HOP_OBJ_CLOSURE_VARIADIC:
         return 3 + (size_t)hop_header_aux(header);
     case HOP_OBJ_VECTOR:
@@ -470,10 +474,11 @@ hop_value hop_safe_gt(hop_value a, hop_value b) {
     return (a > b) ? HOP_TRUE : HOP_FALSE;
 }
 
-static hop_value *hop_alloc_closure_raw(void *code, int64_t env_count) {
-    hop_value *closure = hop_alloc_words(2 + (size_t)env_count, NULL, 0);
+static hop_value *hop_alloc_closure_raw(void *code, int64_t env_count, int64_t arity) {
+    hop_value *closure = hop_alloc_words(3 + (size_t)env_count, NULL, 0);
     closure[0] = (hop_value)hop_make_header(HOP_OBJ_CLOSURE, (hop_word)env_count);
     closure[1] = (hop_value)(uintptr_t)code;
+    closure[2 + env_count] = (hop_value)arity;
     return closure;
 }
 
@@ -499,66 +504,80 @@ static hop_value *hop_closure_env(hop_value *closure) {
     return closure + 2;
 }
 
+/*
+ * Every closure -- ordinary or variadic -- stores its declared, user-facing
+ * exact/minimum fixed-argument count (captures excluded) in the single
+ * trailing word just past its env slots. For an ordinary closure this is
+ * the exact required argc; for a variadic closure it is the minimum (see
+ * hop_closure_is_variadic below for which check applies).
+ */
+static int64_t hop_closure_arity(hop_value *closure) {
+    return (int64_t)closure[2 + hop_closure_env_count(closure)];
+}
+
 static int hop_closure_is_variadic(hop_value *closure) {
     return hop_header_type((hop_word)closure[0]) == HOP_OBJ_CLOSURE_VARIADIC;
 }
 
 /* Valid only when hop_closure_is_variadic(closure) is true. */
 static int64_t hop_closure_variadic_k(hop_value *closure) {
-    return (int64_t)closure[2 + hop_closure_env_count(closure)];
+    return hop_closure_arity(closure);
 }
 
-hop_value hop_alloc_closure_0(void *code) {
-    return hop_tag_pointer(hop_alloc_closure_raw(code, 0), HOP_CLOSURE_TAG);
+hop_value hop_alloc_closure_0(void *code, int64_t arity) {
+    return hop_tag_pointer(hop_alloc_closure_raw(code, 0, arity), HOP_CLOSURE_TAG);
 }
 
-hop_value hop_alloc_closure_1(void *code, hop_value env0) {
+hop_value hop_alloc_closure_1(void *code, hop_value env0, int64_t arity) {
     hop_value roots[1];
     hop_value *closure;
 
     /* Code pointers are not GC-managed; only the captured Scheme values move. */
     roots[0] = env0;
-    closure = hop_alloc_words(3, roots, 1);
+    closure = hop_alloc_words(4, roots, 1);
     closure[0] = (hop_value)hop_make_header(HOP_OBJ_CLOSURE, 1);
     closure[1] = (hop_value)(uintptr_t)code;
     hop_closure_env(closure)[0] = roots[0];
+    closure[2 + 1] = (hop_value)arity;
     return hop_tag_pointer(closure, HOP_CLOSURE_TAG);
 }
 
-hop_value hop_alloc_closure_2(void *code, hop_value env0, hop_value env1) {
+hop_value hop_alloc_closure_2(void *code, hop_value env0, hop_value env1, int64_t arity) {
     hop_value roots[2];
     hop_value *closure;
 
     roots[0] = env0;
     roots[1] = env1;
-    closure = hop_alloc_words(4, roots, 2);
+    closure = hop_alloc_words(5, roots, 2);
     closure[0] = (hop_value)hop_make_header(HOP_OBJ_CLOSURE, 2);
     closure[1] = (hop_value)(uintptr_t)code;
     hop_closure_env(closure)[0] = roots[0];
     hop_closure_env(closure)[1] = roots[1];
+    closure[2 + 2] = (hop_value)arity;
     return hop_tag_pointer(closure, HOP_CLOSURE_TAG);
 }
 
-hop_value hop_alloc_closure_3(void *code, hop_value env0, hop_value env1, hop_value env2) {
+hop_value hop_alloc_closure_3(void *code, hop_value env0, hop_value env1, hop_value env2, int64_t arity) {
     hop_value roots[3];
     hop_value *closure;
 
     roots[0] = env0;
     roots[1] = env1;
     roots[2] = env2;
-    closure = hop_alloc_words(5, roots, 3);
+    closure = hop_alloc_words(6, roots, 3);
     closure[0] = (hop_value)hop_make_header(HOP_OBJ_CLOSURE, 3);
     closure[1] = (hop_value)(uintptr_t)code;
     hop_closure_env(closure)[0] = roots[0];
     hop_closure_env(closure)[1] = roots[1];
     hop_closure_env(closure)[2] = roots[2];
+    closure[2 + 3] = (hop_value)arity;
     return hop_tag_pointer(closure, HOP_CLOSURE_TAG);
 }
 
 #define HOP_MAX_CLOSURE_ENV 16
 static hop_value hop_temp_closure_roots[HOP_MAX_CLOSURE_ENV];
 
-hop_value hop_alloc_closure_n(void *code, int64_t count, hop_value *envs) {
+hop_value hop_alloc_closure_n(void *code, int64_t count, hop_value *envs, int64_t arity) {
     hop_value *closure;
     int64_t i;
 
@@ -576,12 +595,13 @@ hop_value hop_alloc_closure_n(void *code, int64_t count, hop_value *envs) {
     for (i = 0; i < count; i++) {
         hop_temp_closure_roots[i] = envs[i];
     }
-    closure = hop_alloc_words(2 + (size_t)count, hop_temp_closure_roots, (size_t)count);
+    closure = hop_alloc_words(3 + (size_t)count, hop_temp_closure_roots, (size_t)count);
     closure[0] = (hop_value)hop_make_header(HOP_OBJ_CLOSURE, (hop_word)count);
     closure[1] = (hop_value)(uintptr_t)code;
     for (i = 0; i < count; i++) {
         hop_closure_env(closure)[i] = hop_temp_closure_roots[i];
     }
+    closure[2 + count] = (hop_value)arity;
     return hop_tag_pointer(closure, HOP_CLOSURE_TAG);
 }
 
@@ -830,11 +850,28 @@ static hop_value hop_invoke_variadic_closure(hop_value closure_value, hop_value 
     return hop_dispatch_flat_call(code, env_count, hop_closure_env(closure), fixed_and_rest, k + 1);
 }
 
+/*
+ * Ordinary (non-variadic) closures declare an exact required argument
+ * count (see hop_closure_arity above). An indirect call site can never
+ * prove this statically -- unlike (hop pass cfa)'s rewrite-known-calls,
+ * which performs the equivalent check at compile time whenever the call
+ * target *is* provably known -- so hop_call_N validates it here instead of
+ * silently invoking the underlying function with the wrong number of
+ * arguments (which would otherwise read garbage/uninitialized registers or
+ * silently drop extra arguments).
+ */
+static void hop_check_ordinary_arity(hop_value *closure, int64_t argc) {
+    if (hop_closure_arity(closure) != argc) {
+        hop_panic("procedure called with wrong number of arguments");
+    }
+}
+
 hop_value hop_call_0(hop_value closure_value) {
     hop_value *closure = hop_as_closure(closure_value);
     if (hop_closure_is_variadic(closure)) {
         return hop_invoke_variadic_closure(closure_value, NULL, 0);
     }
+    hop_check_ordinary_arity(closure, 0);
     hop_value *env = hop_closure_env(closure);
     switch (hop_closure_env_count(closure)) {
     case 0:
@@ -866,6 +903,7 @@ hop_value hop_call_1(hop_value arg0, hop_value closure_value) {
         hop_value args[1] = {arg0};
         return hop_invoke_variadic_closure(closure_value, args, 1);
     }
+    hop_check_ordinary_arity(closure, 1);
     hop_value *env = hop_closure_env(closure);
     switch (hop_closure_env_count(closure)) {
     case 0:
@@ -895,6 +933,7 @@ hop_value hop_call_2(hop_value arg0, hop_value arg1, hop_value closure_value) {
         hop_value args[2] = {arg0, arg1};
         return hop_invoke_variadic_closure(closure_value, args, 2);
     }
+    hop_check_ordinary_arity(closure, 2);
     hop_value *env = hop_closure_env(closure);
     switch (hop_closure_env_count(closure)) {
     case 0:
@@ -925,6 +964,7 @@ hop_value hop_call_3(hop_value arg0,
         hop_value args[3] = {arg0, arg1, arg2};
         return hop_invoke_variadic_closure(closure_value, args, 3);
     }
+    hop_check_ordinary_arity(closure, 3);
     hop_value *env = hop_closure_env(closure);
     switch (hop_closure_env_count(closure)) {
     case 0:
@@ -954,6 +994,7 @@ hop_value hop_call_4(hop_value arg0,
         hop_value args[4] = {arg0, arg1, arg2, arg3};
         return hop_invoke_variadic_closure(closure_value, args, 4);
     }
+    hop_check_ordinary_arity(closure, 4);
     hop_value *env = hop_closure_env(closure);
     switch (hop_closure_env_count(closure)) {
     case 0:
@@ -982,6 +1023,7 @@ hop_value hop_call_5(hop_value arg0,
         hop_value args[5] = {arg0, arg1, arg2, arg3, arg4};
         return hop_invoke_variadic_closure(closure_value, args, 5);
     }
+    hop_check_ordinary_arity(closure, 5);
     hop_value *env = hop_closure_env(closure);
     switch (hop_closure_env_count(closure)) {
     case 0:
@@ -1009,6 +1051,7 @@ hop_value hop_call_6(hop_value arg0,
         hop_value args[6] = {arg0, arg1, arg2, arg3, arg4, arg5};
         return hop_invoke_variadic_closure(closure_value, args, 6);
     }
+    hop_check_ordinary_arity(closure, 6);
     hop_value *env = hop_closure_env(closure);
     switch (hop_closure_env_count(closure)) {
     case 0:
@@ -1035,6 +1078,7 @@ hop_value hop_call_7(hop_value arg0,
         hop_value args[7] = {arg0, arg1, arg2, arg3, arg4, arg5, arg6};
         return hop_invoke_variadic_closure(closure_value, args, 7);
     }
+    hop_check_ordinary_arity(closure, 7);
     hop_value *env = hop_closure_env(closure);
     switch (hop_closure_env_count(closure)) {
     case 0:
@@ -1060,6 +1104,7 @@ hop_value hop_call_8(hop_value arg0,
         hop_value args[8] = {arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7};
         return hop_invoke_variadic_closure(closure_value, args, 8);
     }
+    hop_check_ordinary_arity(closure, 8);
     hop_value *env = hop_closure_env(closure);
     switch (hop_closure_env_count(closure)) {
     case 0:
@@ -1191,12 +1236,12 @@ hop_value hop_apply(hop_value closure_value, hop_value leading_list, hop_value l
     closure = hop_as_closure(hop_temp_variadic_roots[0]);
 
     if (!hop_closure_is_variadic(closure)) {
-        /* Arity is unverifiable here exactly as it is everywhere else in
-         * this runtime -- ordinary closures carry no declared-arity
-         * metadata by design (see hop_call_N). hop_dispatch_flat_call
-         * itself panics if argc exceeds what this runtime's calling
-         * convention can dispatch through this path (env_count+argc<=8),
-         * the same ceiling every other indirect call already has. */
+        /* Every closure now carries its declared exact/minimum arity (see
+         * hop_closure_arity), so validate it here exactly like hop_call_N
+         * does for its own indirect call sites, instead of silently
+         * invoking the underlying function with the wrong number of
+         * arguments. */
+        hop_check_ordinary_arity(closure, argc);
         env_count = hop_closure_env_count(closure);
         code = hop_closure_code(closure);
         return hop_dispatch_flat_call(code, env_count, hop_closure_env(closure),

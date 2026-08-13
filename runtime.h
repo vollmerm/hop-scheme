@@ -107,11 +107,21 @@ hop_value hop_alloc_vector(hop_value length, hop_value fill);
 hop_value hop_vector_length(hop_value vec_value);
 hop_value hop_vector_ref(hop_value vec_value, hop_value index);
 hop_value hop_vector_set(hop_value vec_value, hop_value index, hop_value new_value);
-hop_value hop_alloc_closure_0(void *code);
-hop_value hop_alloc_closure_1(void *code, hop_value env0);
-hop_value hop_alloc_closure_2(void *code, hop_value env0, hop_value env1);
-hop_value hop_alloc_closure_3(void *code, hop_value env0, hop_value env1, hop_value env2);
-hop_value hop_alloc_closure_n(void *code, int64_t count, hop_value *envs);
+/*
+ * arity is the closure's user-facing, exact fixed-argument count (captured
+ * env vars are not counted -- those never travel through a caller-supplied
+ * argument list). It is recorded so that hop_call_N/hop_apply can validate
+ * an indirect call site's argument count at run time, when the compiler
+ * cannot prove the call target (and hence its arity) statically -- see
+ * hop_call_N below and (hop pass cfa)'s rewrite-known-calls, which performs
+ * the equivalent check at compile time whenever the target *is* provably
+ * known.
+ */
+hop_value hop_alloc_closure_0(void *code, int64_t arity);
+hop_value hop_alloc_closure_1(void *code, hop_value env0, int64_t arity);
+hop_value hop_alloc_closure_2(void *code, hop_value env0, hop_value env1, int64_t arity);
+hop_value hop_alloc_closure_3(void *code, hop_value env0, hop_value env1, hop_value env2, int64_t arity);
+hop_value hop_alloc_closure_n(void *code, int64_t count, hop_value *envs, int64_t arity);
 /*
  * A variadic closure's underlying native function is an ordinary
  * fixed-arity function of (env-vars... fixed-params... rest-param): the

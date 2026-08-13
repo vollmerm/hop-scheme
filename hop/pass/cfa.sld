@@ -489,10 +489,26 @@
                         ;; generic call that could only fail later, at
                         ;; runtime, with a less specific message.
                         (rest-k (and (params-variadic? params)
-                                     (- (length (params-fixed params)) capture-count))))
-                   (if (and rest-k (< (length args) rest-k))
-                       (error "Too few arguments to variadic procedure" proc-name expr)
-                       `(known-call ,proc-name ,capture-count ,rest-k ,rator ,@args)))
+                                     (- (length (params-fixed params)) capture-count)))
+                        ;; The exact expected fixed-arg count regardless of
+                        ;; variadic-ness -- used below to catch a
+                        ;; non-variadic target called with the wrong number
+                        ;; of arguments. 0CFA has already proven the call
+                        ;; target here, so a mismatch (too many *or* too
+                        ;; few) is provably wrong, exactly like the
+                        ;; too-few-for-variadic case just above -- raise it
+                        ;; as a compile error instead of emitting a
+                        ;; known-call whose direct-call argument count would
+                        ;; silently disagree with the target procedure's
+                        ;; actual parameter list.
+                        (expected-count (- (length (params-fixed params)) capture-count)))
+                   (cond
+                    ((and rest-k (< (length args) rest-k))
+                     (error "Too few arguments to variadic procedure" proc-name expr))
+                    ((and (not rest-k) (not (= (length args) expected-count)))
+                     (error "Wrong number of arguments to procedure" proc-name expr))
+                    (else
+                     `(known-call ,proc-name ,capture-count ,rest-k ,rator ,@args))))
                  `(closure-call ,rator ,@args))))
           ((known-call)
            `(known-call ,(cadr expr)

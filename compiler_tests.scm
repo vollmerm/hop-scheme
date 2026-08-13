@@ -794,6 +794,32 @@
                  (primop + a (primop + b (primop car rest))))))
      (app f 1 2 3 4)))
 
+;; Regression test for the mutual letrec cluster fallback's runtime
+;; dispatch (the shared cluster-proc that even?/odd? both compile down
+;; to). Unlike test17/test18 -- where only ONE member (walk/even?) is
+;; ever called from outside the cluster, so the dispatch collapses to an
+;; unconditional jump to that member's entry label -- both even? and odd?
+;; are called here from the surrounding code, forcing the compiler to
+;; emit a real runtime branch on the cluster's entry-tag rather than
+;; falling into that single-external-member special case. If that
+;; branch were ever dropped (e.g. always jumping to the first member's
+;; entry regardless of which closure was actually invoked), odd?(3)
+;; would silently run even?'s body instead and this test's expected
+;; result would change from 11 to 21.
+(define test96
+  '(let ((step 1))
+     (letrec ((even?
+               (lambda (n)
+                 (if (primop = n 0)
+                     #t
+                     (app odd? (primop - n step)))))
+              (odd?
+               (lambda (n)
+                 (if (primop = n 0)
+                     #f
+                     (app even? (primop - n step))))))
+       (primop + (if (app even? 4) 1 0) (if (app odd? 3) 10 20)))))
+
 (define sample-tests
   (list (cons "Test 1: Simple arithmetic" test1)
         (cons "Test 2: Lambda application" test2)
@@ -888,7 +914,8 @@
         (cons "Test 92: variadic lambda, indirect call" test92)
         (cons "Test 93: all-rest lambda" test93)
         (cons "Test 94: apply spreads a list onto a variadic target" test94)
-        (cons "Test 95: minimal variadic known-call (no other indirect calls)" test95)))
+        (cons "Test 95: minimal variadic known-call (no other indirect calls)" test95)
+        (cons "Test 96: cluster fallback dispatch chain with two externally-callable members" test96)))
 
 (define named-tests
   ;; These are runnable end-to-end regression cases. test6 and test7 stay as
@@ -984,7 +1011,8 @@
          (cons 'test92 test92)
          (cons 'test93 test93)
          (cons 'test94 test94)
-         (cons 'test95 test95)))
+         (cons 'test95 test95)
+         (cons 'test96 test96)))
 
 (define (lookup-named-test name)
   (let ((binding (assoc name named-tests)))

@@ -369,26 +369,66 @@
                               (if (is-external? (car ms))
                                   (cons (car ls) result)
                                   result))))))
-            (let ((init-instrs
-                   (let loop ((rest members) (index 0) (instrs capture-instrs))
+            (let-values (((init-instrs trampoline-procedures)
+                   (let loop ((rest members) (index 0) (instrs capture-instrs) (trampolines '()))
                      (if (null? rest)
-                         instrs
+                         (values instrs trampolines)
                          (let ((box-name (car (car rest))))
                            (if (is-external? (car rest))
-                               (let ((closure-temp (fresh-temp)))
+                               (let* ((closure-temp (fresh-temp))
+                                      (member-params (caddr (car rest)))
+                                      (member-arity (list-ref member-arities index))
+                                      (pad-count (- (length shared-params) member-arity))
+                                      ;; Trailing shared-params slots beyond this
+                                      ;; member's own arity are padded with an
+                                      ;; explicit fixnum literal instead of being
+                                      ;; left unset. cluster-proc's shared-params
+                                      ;; are potential GC roots; a live root slot
+                                      ;; that received no real value could still
+                                      ;; be scanned by the collector, so it must
+                                      ;; hold something the GC can safely see. A
+                                      ;; fixnum is never traced (see
+                                      ;; hop_copy_value in runtime.c), so this is
+                                      ;; always safe.
+                                      (pad-args (make-list pad-count 0))
+                                      ;; Per-member trampoline: an ordinary
+                                      ;; closure-converted-shaped procedure
+                                      ;; (captures as leading params, then this
+                                      ;; member's own real params) that tail-calls
+                                      ;; into the shared cluster-proc, supplying
+                                      ;; the member's fixed entry-tag and explicit
+                                      ;; padding itself. Its declared arity is
+                                      ;; exactly this member's own real arity, so
+                                      ;; the closure built below uses the same
+                                      ;; ordinary closure path as any other
+                                      ;; procedure -- hop_call_N/hop_apply cannot
+                                      ;; tell it apart from a non-cluster closure.
+                                      (trampoline-name (fresh-proc))
+                                      (trampoline-params (append capture-param-names member-params))
+                                      (trampoline-body
+                                       (list `(direct-tail-call ,cluster-proc
+                                                                ,index
+                                                                ,@capture-param-names
+                                                                ,@member-params
+                                                                ,@pad-args)))
+                                      (trampoline-procedure
+                                       (make-procedure trampoline-name trampoline-params trampoline-body)))
                                  (loop (cdr rest)
                                        (+ index 1)
                                        (append instrs
                                                (list `(assign ,closure-temp
-                                                              (make-closure ,cluster-proc ,index ,@capture-vars))
-                                                     `(set-box! ,box-name ,closure-temp)))))
-                               (loop (cdr rest) index instrs)))))))
+                                                              (make-closure ,trampoline-name
+                                                                            ,member-arity
+                                                                            ,@capture-vars))
+                                                     `(set-box! ,box-name ,closure-temp)))
+                                       (cons trampoline-procedure trampolines)))
+                               (loop (cdr rest) index instrs trampolines)))))))
               (let loop ((rest members)
                          (labels member-labels)
                          (instrs (build-dispatch-instructions entry-tag
                                                               dispatch-label
                                                               dispatch-member-labels))
-                         (procedures capture-procedures))
+                         (procedures (append capture-procedures trampoline-procedures)))
                 (if (null? rest)
                     (values init-instrs
                             (append procedures
@@ -774,7 +814,21 @@
                 ;; touching the ordinary path.
                 (variadic-k (and (params-variadic? proc-params)
                                   (- (length (params-fixed proc-params))
-                                     (length free-vars)))))
+                                     (length free-vars))))
+                ;; The closure's declared, user-facing exact fixed-argument
+                ;; count for the ordinary (non-variadic) case -- captures
+                ;; excluded, mirroring variadic-k above. Recorded on every
+                ;; ordinary `make-closure` too (see (hop pass tac)'s
+                ;; convert-cluster-prefix for the mutual-recursion cluster
+                ;; closures' equivalent) so hop_call_N/hop_apply can
+                ;; validate an indirect call site's argument count at run
+                ;; time -- the one place the compiler cannot already prove
+                ;; the call target, and hence the required arity,
+                ;; statically (see (hop pass cfa)'s rewrite-known-calls for
+                ;; the compile-time equivalent).
+                (ordinary-arity (and (not variadic-k)
+                                      (- (length (params-fixed proc-params))
+                                         (length free-vars)))))
            (let ((entry-label (fresh-temp)))
              (let-values (((body-instrs body-procedures)
                            (convert-tail proc-body
@@ -797,6 +851,7 @@
                                                                           ,@fv-vars))
                                            `(assign ,result-var
                                                     (make-closure ,proc-name
+                                                                  ,ordinary-arity
                                                                   ,@fv-vars)))))
                          result-var
                          (append body-procedures
