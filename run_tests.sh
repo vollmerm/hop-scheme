@@ -12,6 +12,11 @@ generate() {
     "(begin (load \"$ROOT/compiler.scm\") (load \"$ROOT/compiler_tests.scm\") (write-named-aarch64-program '$test_name \"$asm_path\"))"
 }
 
+generate_all() {
+  csi -R r7rs -I "$ROOT" -e \
+    "(begin (load \"$ROOT/compiler.scm\") (load \"$ROOT/compiler_tests.scm\") (for-each (lambda (t) (write-named-aarch64-program (car t) (string-append \"$TMPDIR/\" (symbol->string (car t)) \".s\"))) named-tests))"
+}
+
 asm_path_for() {
   printf '%s/%s.s\n' "$TMPDIR" "$1"
 }
@@ -95,7 +100,7 @@ assert_compile_error() {
     printf 'unexpected compile success for %s\n' "$case_name" >&2
     exit 1
   fi
-  if ! grep -Eq "$expected_pattern" "$log_path"; then
+  if ! grep -Eq -e "$expected_pattern" "$log_path"; then
     printf 'missing compile error pattern for %s\n' "$case_name" >&2
     cat "$log_path" >&2
     exit 1
@@ -223,7 +228,18 @@ runtime_cases=(
   "test94|3"
   "test95|6"
   "test96|11"
+  "test97|15"
+  "test98|30"
+  "test99|12"
+  "test100|100"
+  "test101|20"
+  "test102|10"
+  "test103|30"
+  "test104|62"
+  "test105|44"
 )
+
+generate_all
 
 for case in "${runtime_cases[@]}"; do
   IFS='|' read -r test_name expected heap_bytes <<<"$case"
@@ -296,6 +312,17 @@ assert_asm_contains "test57" '_hop_safe_add' 'safe-+ preserved when operand is c
 # result of safe arith is proven fixnum, so outer safe-+ is also optimized
 assert_asm_not_contains "test58" '_hop_safe_add' 'safe-+ of safe-arith result optimized'
 
+# arbitrary-argument arithmetic constant folding & apply lowering
+assert_asm_not_contains "test97" '\badd x[0-9]+, x[0-9]+, x[0-9]+\b' 'constant-folded arbitrary-argument addition eliminated'
+assert_asm_not_contains "test97" '_hop_safe_add' 'safe-+ eliminated in constant-folded addition'
+assert_asm_not_contains "test98" '\bmul\b' 'constant-folded arbitrary-argument multiplication eliminated'
+assert_asm_not_contains "test98" '_hop_safe_mul' 'safe-* eliminated in constant-folded multiplication'
+assert_asm_not_contains "test99" '\bsub x[0-9]+, x[0-9]+, x[0-9]+\b' 'constant-folded arbitrary-argument subtraction eliminated'
+assert_asm_not_contains "test99" '_hop_safe_sub' 'safe-- eliminated in constant-folded subtraction'
+assert_asm_not_contains "test100" '_hop_safe_add' 'arbitrary-argument addition with known fixnums lowers to inline add'
+assert_asm_contains "test101" '_hop_apply' 'apply of + lowers through hop_apply'
+assert_asm_contains "test104" '_hop_apply' 'apply of - lowers through hop_apply'
+
 assert_file_output \
   "file-test1" \
   "42" \
@@ -348,5 +375,17 @@ assert_compile_error \
   "file-variadic-too-few-args" \
   'Too few arguments to variadic procedure' \
   $'(define (f a b . rest) (+ a b))\n(f 1)'
+
+# Zero-argument subtraction is a syntax error.
+assert_compile_error \
+  "file-sub-zero-args" \
+  '- requires at least 1 argument' \
+  $'(-)'
+
+# Surface arbitrary-argument arithmetic in file scope.
+assert_file_output \
+  "file-arith-variadic" \
+  "100" \
+  $'(define (sum4 a b c d) (+ a b c d))\n(sum4 10 20 30 40)'
 
 echo "compiler tests passed"

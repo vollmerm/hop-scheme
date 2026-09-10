@@ -197,12 +197,66 @@
           (let ((ps (reverse params)))
             `(lambda ,ps (primop ,(builtin-primop-canonical-name name) ,@ps)))
           (loop (+ i 1) (cons (fresh-wrap-name) params)))))
+
+  (define (make-variadic-add-wrapper)
+    (let ((args (fresh-wrap-name))
+          (loop (fresh-wrap-name))
+          (acc  (fresh-wrap-name))
+          (rest (fresh-wrap-name)))
+      `(lambda (variadic () ,args)
+         (letrec ((,loop
+                   (lambda (,acc ,rest)
+                     (if (primop null? ,rest)
+                         ,acc
+                         (app ,loop
+                              (primop safe-+ ,acc (primop car ,rest))
+                              (primop cdr ,rest))))))
+           (app ,loop 0 ,args)))))
+
+  (define (make-variadic-mul-wrapper)
+    (let ((args (fresh-wrap-name))
+          (loop (fresh-wrap-name))
+          (acc  (fresh-wrap-name))
+          (rest (fresh-wrap-name)))
+      `(lambda (variadic () ,args)
+         (letrec ((,loop
+                   (lambda (,acc ,rest)
+                     (if (primop null? ,rest)
+                         ,acc
+                         (app ,loop
+                              (primop safe-* ,acc (primop car ,rest))
+                              (primop cdr ,rest))))))
+           (app ,loop 1 ,args)))))
+
+  (define (make-variadic-sub-wrapper)
+    (let ((first (fresh-wrap-name))
+          (rest  (fresh-wrap-name))
+          (loop  (fresh-wrap-name))
+          (acc   (fresh-wrap-name))
+          (r     (fresh-wrap-name)))
+      `(lambda (variadic (,first) ,rest)
+         (if (primop null? ,rest)
+             (primop safe-- 0 ,first)
+             (letrec ((,loop
+                       (lambda (,acc ,r)
+                         (if (primop null? ,r)
+                             ,acc
+                             (app ,loop
+                                  (primop safe-- ,acc (primop car ,r))
+                                  (primop cdr ,r))))))
+               (app ,loop ,first ,rest))))))
+
   (define (canon expr)
     (cond
      ((symbol? expr)
-      (if (builtin-primop? expr)
-          (make-wrap-lambda expr (builtin-primop-arity expr))
-          expr))
+      (case expr
+        ((+) (make-variadic-add-wrapper))
+        ((*) (make-variadic-mul-wrapper))
+        ((-) (make-variadic-sub-wrapper))
+        (else
+         (if (builtin-primop? expr)
+             (make-wrap-lambda expr (builtin-primop-arity expr))
+             expr))))
      ((literal-expr? expr) expr)
      ((pair? expr)
       (let ((entry (and (symbol? (car expr)) (builtin-primop? (car expr)))))

@@ -117,6 +117,22 @@
                                   (reverse defs))
                       ,@rest))))))))
 
+  (define (desugar-arith-op op id-elem min-args args expr)
+    (let ((n (length args)))
+      (cond
+       ((< n min-args)
+        (error (string-append (symbol->string op) " requires at least " (number->string min-args) " argument" (if (= min-args 1) "" "s")) expr))
+       ((= n 0)
+        id-elem)
+       ((= n 1)
+        `(,op ,id-elem ,(desugar-expr (car args))))
+       (else
+        (let loop ((acc `(,op ,(desugar-expr (car args)) ,(desugar-expr (cadr args))))
+                   (rest (cddr args)))
+          (if (null? rest)
+              acc
+              (loop `(,op ,acc ,(desugar-expr (car rest))) (cdr rest))))))))
+
   (define (desugar-cond-clauses clauses)
     (cond
      ((null? clauses) #f)
@@ -201,15 +217,25 @@
                (desugar-expr
                 `(letrec ((,name (lambda ,(map car bindings) ,@body)))
                    (,name ,@(map cadr bindings)))))
-             (if (null? (cadr expr))
-                 ;; (let () body...) binds nothing; later passes assume lets
-                 ;; carry at least one binding, so collapse to the body.
-                 (body->expr (desugar-body (cddr expr) expr))
-                 `(let ,(map (lambda (binding)
-                               (list (car binding)
-                                     (desugar-expr (cadr binding))))
-                             (cadr expr))
-                    ,@(desugar-body (cddr expr) expr)))))
+             (cond
+              ((null? (cadr expr))
+               ;; (let () body...) binds nothing; later passes assume lets
+               ;; carry at least one binding, so collapse to the body.
+               (body->expr (desugar-body (cddr expr) expr)))
+              ((null? (cdadr expr))
+               (let ((b (caadr expr)))
+                 `(let ((,(car b) ,(desugar-expr (cadr b))))
+                    ,@(desugar-body (cddr expr) expr))))
+              (else
+               (let* ((bindings (cadr expr))
+                      (vars (map car bindings))
+                      (vals (map (lambda (b) (desugar-expr (cadr b))) bindings))
+                      (temps (map (lambda (v) (fresh-temp)) vars))
+                      (temp-bindings (map (lambda (t val) (list t val)) temps vals))
+                      (var-bindings (map (lambda (v t) (list v t)) vars temps))
+                      (body (desugar-body (cddr expr) expr)))
+                 (nest-let-bindings temp-bindings
+                                    (list (nest-let-bindings var-bindings body))))))))
 
         ((let*)
          (let ((bindings (cadr expr))
@@ -297,9 +323,18 @@
         ((box unbox car cdr pair? null? symbol? vector-length vector?)
          `(,(car expr) ,(desugar-expr (cadr expr))))
 
-        ((cons set-box! make-vector vector-ref eq? + - * = < >)
+        ((cons set-box! make-vector vector-ref eq? = < >)
          `(,(car expr) ,(desugar-expr (cadr expr))
            ,(desugar-expr (caddr expr))))
+
+        ((+)
+         (desugar-arith-op '+ 0 0 (cdr expr) expr))
+
+        ((*)
+         (desugar-arith-op '* 1 0 (cdr expr) expr))
+
+        ((-)
+         (desugar-arith-op '- 0 1 (cdr expr) expr))
 
         ((vector-set!)
          `(vector-set! ,(desugar-expr (cadr expr))

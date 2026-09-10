@@ -820,6 +820,52 @@
                      (app even? (primop - n step))))))
        (primop + (if (app even? 4) 1 0) (if (app odd? 3) 10 20)))))
 
+;; Direct arbitrary-argument addition: (+), (+ a), (+ a b c d)
+(define test97
+  '(+ (+) (+ 5) (+ 1 2 3 4)))
+
+;; Direct arbitrary-argument multiplication: (*), (* a), (* a b c)
+(define test98
+  '(+ (*) (* 5) (* 2 3 4)))
+
+;; Direct arbitrary-argument subtraction: (- a), (- a b), (- a b c d)
+(define test99
+  '(+ (- 5) (+ (- 10 3) (- 20 5 3 2))))
+
+;; Arbitrary-argument addition with variables
+(define test100
+  '(let ((a 10) (b 20) (c 30) (d 40))
+     (+ a b c d)))
+
+;; First-class apply of + with 0, 1, and N spread args
+(define test101
+  '(+ (apply + (quote ()))
+      (+ (apply + (quote (5)))
+         (apply + (quote (1 2 3 4 5))))))
+
+;; First-class apply of + with leading fixed args + spread list
+(define test102
+  '(apply + 1 2 (cons 3 (cons 4 ()))))
+
+;; First-class apply of * with 0, 1, and N spread args
+(define test103
+  '(+ (apply * (quote ()))
+      (+ (apply * (quote (5)))
+         (apply * (quote (2 3 4))))))
+
+;; First-class apply of - with unary negation, binary, and N spread args
+(define test104
+  '(+ (apply - (quote (5)))
+      (+ (apply - (quote (10 3)))
+         (apply - 100 20 (quote (15 5))))))
+
+;; Higher-order passing of +, *, and -
+(define test105
+  '(let ((f +) (g *) (h -))
+     (+ (app f 1 2 3 4)
+        (+ (app g 2 3 4)
+           (app h 20 5 3 2)))))
+
 (define sample-tests
   (list (cons "Test 1: Simple arithmetic" test1)
         (cons "Test 2: Lambda application" test2)
@@ -915,7 +961,16 @@
         (cons "Test 93: all-rest lambda" test93)
         (cons "Test 94: apply spreads a list onto a variadic target" test94)
         (cons "Test 95: minimal variadic known-call (no other indirect calls)" test95)
-        (cons "Test 96: cluster fallback dispatch chain with two externally-callable members" test96)))
+        (cons "Test 96: cluster fallback dispatch chain with two externally-callable members" test96)
+        (cons "Test 97: direct arbitrary-argument addition" test97)
+        (cons "Test 98: direct arbitrary-argument multiplication" test98)
+        (cons "Test 99: direct arbitrary-argument subtraction" test99)
+        (cons "Test 100: arbitrary-argument addition with variables" test100)
+        (cons "Test 101: first-class apply of +" test101)
+        (cons "Test 102: first-class apply of + with leading fixed args" test102)
+        (cons "Test 103: first-class apply of *" test103)
+        (cons "Test 104: first-class apply of -" test104)
+        (cons "Test 105: higher-order passing of +, *, and -" test105)))
 
 (define named-tests
   ;; These are runnable end-to-end regression cases. test6 and test7 stay as
@@ -1012,7 +1067,16 @@
          (cons 'test93 test93)
          (cons 'test94 test94)
          (cons 'test95 test95)
-         (cons 'test96 test96)))
+         (cons 'test96 test96)
+         (cons 'test97 test97)
+         (cons 'test98 test98)
+         (cons 'test99 test99)
+         (cons 'test100 test100)
+         (cons 'test101 test101)
+         (cons 'test102 test102)
+         (cons 'test103 test103)
+         (cons 'test104 test104)
+         (cons 'test105 test105)))
 
 (define (lookup-named-test name)
   (let ((binding (assoc name named-tests)))
