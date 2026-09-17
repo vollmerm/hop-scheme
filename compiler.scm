@@ -15,16 +15,11 @@
 ;;;     -> backend + allocation      (hop backend)
 ;;;     -> AArch64 assembly          (hop backend)
 
-(include "hop/utils.sld")
-(include "hop/pass/surface.sld")
-(include "hop/pass/lower.sld")
-(include "hop/pass/uniquify.sld")
-(include "hop/pass/letrec.sld")
-(include "hop/pass/closure.sld")
-(include "hop/pass/cfa.sld")
-(include "hop/pass/tac.sld")
-(include "hop/pass/cfg.sld")
-(include "hop/backend.sld")
+;; hop/includes.scm is generated from the (import ...) clauses in hop/**/*.sld
+;; by tools/gen-includes.scm (run via `make hop/includes.scm`, or the
+;; build/test/repl targets that depend on it) -- it never needs to be
+;; hand-edited when a pass file is added, removed, or rewired.
+(include "hop/includes.scm")
 
 (import (scheme base)
         (scheme read)
