@@ -17,6 +17,7 @@
           machine-procedure-used-registers
           cfg->allocated-machine-procedure
           emit-aarch64-program
+          emit-unit-aarch64-program
           display-cfg
           display-procedure-cfg
           display-machine-procedure)
@@ -1795,25 +1796,20 @@
                                    (number->string uninitialized-immediate))))
    global-labels))
 
-;; tag is #f for the single-unit case (today's unqualified names, unchanged)
-;; or a unit-tag string (see (hop pass lower)) when this file is one of
-;; several independently compiled units being linked together, so each
-;; unit's own once-per-file data labels stay distinct from every other
-;; unit's. A later link step is what's expected to merge these per-unit
-;; tables into the single hop_global_roots/hop_global_root_count pair
-;; runtime.c actually reads.
-(define (tagged-label base tag)
-  (asm-name
-   (if tag
-       (string->symbol (string-append (symbol->string base) "_" tag))
-       base)))
+(define (global-roots-label) (asm-name 'hop_global_roots))
+(define (global-root-count-label) (asm-name 'hop_global_root_count))
 
-(define (global-roots-label tag) (tagged-label 'hop_global_roots tag))
-(define (global-root-count-label tag) (tagged-label 'hop_global_root_count tag))
-
-(define (emit-global-roots port global-labels tag)
-  (let ((count-label (global-root-count-label tag))
-        (roots-label (global-roots-label tag)))
+;; Only the single self-contained emit-aarch64-program path (below) ever
+;; emits this: it's the whole program's own complete root table. A unit
+;; compiled for multi-unit linking (emit-unit-aarch64-program) does not --
+;; there, the generated link stub reconstructs one merged root table by
+;; reading every linked unit's interface file (see compiler.scm), because by
+;; then it knows every unit's global cells and can build one real array
+;; instead of each unit guessing at a naming scheme to avoid colliding with
+;; the others.
+(define (emit-global-roots port global-labels)
+  (let ((count-label (global-root-count-label))
+        (roots-label (global-roots-label)))
     (emit-asm-line port (string-append ".globl " count-label))
     (emit-asm-line port ".p2align 3")
     (emit-asm-line port (string-append count-label ":"))
@@ -1841,16 +1837,16 @@
 (define (symbol-name-label index)
   (string-append "Lsymname." (number->string index)))
 
-(define (emit-symbol-table port tag)
+(define (emit-symbol-table port)
   ;; hop_symbol_hashes[i]/hop_symbol_name_ptrs[i] are parallel arrays; the
   ;; runtime finds a symbol's name with a linear scan for a matching hash
   ;; (see hop_symbol_name in runtime.c). Interning order is most-recent-first
   ;; in the assq list; emission order doesn't matter since lookup is by
-  ;; value, not position. See emit-global-roots above for what tag is.
+  ;; value, not position. Same one-unit-only caveat as emit-global-roots.
   (let ((entries (reverse interned-symbols))
-        (count-label (tagged-label 'hop_symbol_count tag))
-        (hashes-label (tagged-label 'hop_symbol_hashes tag))
-        (name-ptrs-label (tagged-label 'hop_symbol_name_ptrs tag)))
+        (count-label (asm-name 'hop_symbol_count))
+        (hashes-label (asm-name 'hop_symbol_hashes))
+        (name-ptrs-label (asm-name 'hop_symbol_name_ptrs)))
     (emit-asm-line port (string-append ".globl " count-label))
     (emit-asm-line port ".p2align 3")
     (emit-asm-line port (string-append count-label ":"))
@@ -1882,15 +1878,11 @@
                                       "\""))
         (loop (cdr rest) (+ index 1))))))
 
-;; tag is #f for the existing single-unit callers (write-aarch64-program and
-;; friends): every label this emits keeps today's plain, unqualified name,
-;; so single-file output is byte-for-byte unchanged. A named unit (library or
-;; program compiled via the define-library/import-aware driver) passes its
-;; own unit-tag (see (hop pass lower)) instead, so its once-per-file data
-;; labels -- and, via entry-proc's own name, its entry procedure's label --
-;; don't collide with another independently compiled unit's once both are
-;; linked together.
-(define (emit-aarch64-program port entry-proc procedures global-labels #!optional (tag #f))
+;; The original, self-contained single-unit path: everything a program needs
+;; -- code, storage cells, a complete root table, and a complete
+;; symbol-printing table -- in one file with the plain unqualified names
+;; runtime.c expects, exactly as before separate compilation existed.
+(define (emit-aarch64-program port entry-proc procedures global-labels)
   (reset-interned-symbols!)
   (emit-asm-line port ".text")
   (emit-asm-line port "")
@@ -1905,7 +1897,33 @@
               (emit-procedure-descriptor port proc))
             procedures)
   (emit-global-cells port global-labels)
-  (emit-global-roots port global-labels tag)
-  (emit-symbol-table port tag))
+  (emit-global-roots port global-labels)
+  (emit-symbol-table port))
+
+;; The multi-unit path: emits code and this unit's own storage cells (using
+;; whatever label body-proc's own name already is -- e.g. a unit-qualified
+;; hop_unit_body_<id> from (hop pass lower)'s unit-body-label, not the
+;; reserved scheme_entry) but no root table or symbol-printing table. Those
+;; only make sense assembled from every unit being linked together, which a
+;; single unit's own compile can't see -- that's the generated link stub's
+;; job (see compiler.scm). Returns this unit's own (symbol . hash) interning
+;; table so the caller can save it into this unit's interface file for the
+;; link step to read later.
+(define (emit-unit-aarch64-program port body-proc procedures global-labels)
+  (reset-interned-symbols!)
+  (emit-asm-line port ".text")
+  (emit-asm-line port "")
+  (emit-machine-procedure port body-proc (machine-procedure-name body-proc))
+  (for-each (lambda (proc)
+              (emit-machine-procedure port proc (machine-procedure-name proc)))
+            procedures)
+  (emit-asm-line port ".data")
+  (emit-asm-line port "")
+  (emit-procedure-descriptor port body-proc)
+  (for-each (lambda (proc)
+              (emit-procedure-descriptor port proc))
+            procedures)
+  (emit-global-cells port global-labels)
+  (reverse interned-symbols))
 
 )) ; end define-library

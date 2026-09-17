@@ -23,8 +23,8 @@
   (export lower-source-program
           lower-unit-body
           global-cell-label
-          library-init-label
-          unit-tag)
+          mangle-library-name
+          unit-body-label)
   (import (scheme base)
           (scheme cxr)
           (hop utils))
@@ -75,20 +75,17 @@
 (define (unit-label-prefix unit-name)
   (if unit-name (string-append (mangle-library-name unit-name) "_") ""))
 
-;; A unit-qualifying tag for the handful of once-per-file data-section labels
-;; (root table, symbol-printing table) that aren't tied to any one binding --
-;; #f for a plain program, matching today's unqualified names exactly; a
-;; library's mangled name otherwise, so two libraries' own root/symbol tables
-;; don't collide once both are linked into the same executable.
-(define (unit-tag unit-name)
-  (if unit-name (mangle-library-name unit-name) #f))
-
-;; A library's private initialization-procedure label -- the equivalent of
-;; scheme_entry for a library file. Only a program gets the reserved
-;; scheme_entry name (see compiler.scm); every library gets its own, so many
-;; libraries' init procedures can coexist in one linked executable.
-(define (library-init-label unit-name)
-  (string->symbol (string-append "hop_init_" (mangle-library-name unit-name))))
+;; Every compiled unit -- library or program alike -- gets a body procedure
+;; that runs its top-level forms in order, labeled by a caller-supplied
+;; unit-id string rather than the reserved scheme_entry (compiler.scm decides
+;; what id to use -- a library's own mangled name is the natural default, a
+;; program needs some other caller-chosen identifier since it has no library
+;; name). The generated link stub (see compiler.scm) is the only place that
+;; ever defines scheme_entry itself: it calls every other unit's body
+;; procedure by this label, then the program unit's, and exposes that last
+;; call's result as scheme_entry's own return value.
+(define (unit-body-label unit-id)
+  (string->symbol (string-append "hop_unit_body_" (mangle-identifier unit-id))))
 
 ;; A top-level define's storage label. "hop_g_" keeps this namespace apart
 ;; from procedure labels and GC-descriptor labels.
