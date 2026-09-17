@@ -29,12 +29,16 @@ typedef struct {
  * low tag bits are available; hop_tag_pointer installs the object tag and
  * hop_untag_pointer removes it before dereferencing.
  *
- * Symbols are immediates, not heap objects: the compiler interns every symbol
- * it sees into a program-wide table and encodes each one as its table index
- * shifted left by HOP_FIXNUM_SHIFT with the symbol tag installed. Two symbols
- * are eq? exactly when their encoded words are equal, and the collector never
- * needs to trace them. The compiler emits hop_symbol_count/hop_symbol_names
- * alongside the generated code so the runtime can recover the printed name.
+ * Symbols are immediates, not heap objects: the compiler hashes each symbol's
+ * print name to a deterministic 61-bit value and encodes that hash shifted
+ * left by HOP_FIXNUM_SHIFT with the symbol tag installed. Two symbols are
+ * eq? exactly when their encoded words are equal, which -- because the hash
+ * is a fixed function of the name rather than a table position -- holds even
+ * across independently compiled files, and the collector never needs to
+ * trace them. The compiler emits hop_symbol_count/hop_symbol_hashes/
+ * hop_symbol_name_ptrs alongside the generated code purely so the runtime
+ * can recover a symbol's printed name (hash -> name); that table plays no
+ * part in symbol identity.
  *
  * Some values are represented as tagged immediates rather than pointers:
  *
@@ -44,6 +48,14 @@ typedef struct {
  *
  * Conditionals treat only HOP_FALSE as false. HOP_NULL and HOP_TRUE are both
  * truthy, and all tagged pointers and fixnums are truthy as well.
+ *
+ * Top-level (define ...) bindings are not slots in a shared array either:
+ * each one is its own individually labeled, statically allocated cell (see
+ * (hop pass lower)'s global-cell-label and (hop backend)'s
+ * emit-global-cells), addressed directly like a C extern global. The GC
+ * still needs to find every one of them, so the compiler also emits a
+ * hop_global_roots pointer array (one entry per cell, see emit-global-roots)
+ * alongside hop_global_root_count.
  */
 #define HOP_FIXNUM_SHIFT 3
 #define HOP_TAG_MASK 7
@@ -84,10 +96,11 @@ static inline void *hop_untag_pointer(hop_value value) {
 }
 
 extern void *hop_gc_top_frame;
-extern uint64_t hop_global_slot_count;
-extern hop_value hop_global_slots[];
+extern uint64_t hop_global_root_count;
+extern hop_value *hop_global_roots[];
 extern uint64_t hop_symbol_count;
-extern const char *hop_symbol_names[];
+extern uint64_t hop_symbol_hashes[];
+extern const char *hop_symbol_name_ptrs[];
 
 static inline hop_value hop_encode_symbol(uint64_t index) {
     return (hop_value)((index << HOP_FIXNUM_SHIFT) | HOP_SYMBOL_TAG);
@@ -149,8 +162,6 @@ hop_value hop_tail_call_5(hop_value arg0, hop_value arg1, hop_value arg2, hop_va
 hop_value hop_tail_call_6(hop_value arg0, hop_value arg1, hop_value arg2, hop_value arg3, hop_value arg4, hop_value arg5, hop_value closure_value);
 hop_value hop_tail_call_7(hop_value arg0, hop_value arg1, hop_value arg2, hop_value arg3, hop_value arg4, hop_value arg5, hop_value arg6, hop_value closure_value);
 hop_value hop_tail_call_8(hop_value arg0, hop_value arg1, hop_value arg2, hop_value arg3, hop_value arg4, hop_value arg5, hop_value arg6, hop_value arg7, hop_value closure_value);
-hop_value hop_global_ref(uint64_t index);
-hop_value hop_global_set(uint64_t index, hop_value value);
 
 /*
  * apply's argument count is only known once the spread list is walked at

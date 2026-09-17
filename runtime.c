@@ -59,8 +59,6 @@ typedef struct {
 
 static hop_heap hop_runtime_heap = {0};
 void *hop_gc_top_frame = NULL;
-extern uint64_t hop_global_slot_count;
-extern hop_value hop_global_slots[];
 
 __attribute__((noreturn)) static void hop_panic(const char *message) {
     fprintf(stderr, "%s\n", message);
@@ -245,8 +243,16 @@ static void hop_copy_temp_roots(hop_value *roots, size_t count) {
 static void hop_copy_global_roots(void) {
     uint64_t index;
 
-    for (index = 0; index < hop_global_slot_count; index += 1) {
-        hop_global_slots[index] = hop_copy_value(hop_global_slots[index]);
+    /*
+     * Each top-level binding lives in its own individually labeled cell
+     * rather than one shared array (see runtime.h), so the compiler instead
+     * emits a table of pointers to those cells -- one entry per binding --
+     * for the GC to walk. This generalizes cleanly to multiple independently
+     * compiled files: each file's cells stay wherever it declared them, and
+     * only this pointer table needs to know about all of them.
+     */
+    for (index = 0; index < hop_global_root_count; index += 1) {
+        *hop_global_roots[index] = hop_copy_value(*hop_global_roots[index]);
     }
 }
 
@@ -1281,32 +1287,22 @@ hop_value hop_apply(hop_value closure_value, hop_value leading_list, hop_value l
 }
 
 const char *hop_symbol_name(hop_value value) {
+    uint64_t hash;
     uint64_t index;
 
     if (!hop_has_tag(value, HOP_SYMBOL_TAG)) {
         hop_panic("hop_symbol_name expected symbol");
     }
-    index = hop_decode_symbol(value);
-    if (index >= hop_symbol_count) {
-        hop_panic("symbol index out of range");
+    hash = hop_decode_symbol(value);
+    /*
+     * hop_symbol_hashes/hop_symbol_name_ptrs exist only to recover a printed
+     * name; a symbol's identity is the hash itself (see runtime.h), so this
+     * is a linear search for a match rather than an index bounds check.
+     */
+    for (index = 0; index < hop_symbol_count; index += 1) {
+        if (hop_symbol_hashes[index] == hash) {
+            return hop_symbol_name_ptrs[index];
+        }
     }
-    return hop_symbol_names[index];
-}
-
-hop_value hop_global_ref(uint64_t index) {
-    if (index >= hop_global_slot_count) {
-        hop_panic("global index out of range");
-    }
-    if (hop_global_slots[index] == HOP_UNINITIALIZED) {
-        hop_panic("read of uninitialized global");
-    }
-    return hop_global_slots[index];
-}
-
-hop_value hop_global_set(uint64_t index, hop_value value) {
-    if (index >= hop_global_slot_count) {
-        hop_panic("global index out of range");
-    }
-    hop_global_slots[index] = value;
-    return value;
+    hop_panic("symbol not found in name table");
 }

@@ -1,17 +1,25 @@
 (define-library (hop pass lower)
   ;;; Pass 0: Program Lowering
   ;;; Accept either a single expression or a `(program ...)` wrapper, flatten
-  ;;; top-level begin, assign compiler-known global slots, and rewrite top-level
-  ;;; define into explicit global initialization.
+  ;;; top-level begin, assign each top-level define its own mangled storage
+  ;;; label, and rewrite top-level define into explicit global initialization.
+  ;;;
+  ;;; Globals are addressed by label, not by a dense per-program slot index:
+  ;;; each top-level define gets its own individually named cell (see
+  ;;; global-cell-label below), the same mechanism C uses for `extern`
+  ;;; globals. That's what lets a later separate-compilation pass have one
+  ;;; file's global reference resolve, at assemble/link time, against another
+  ;;; file's cell without either file needing to know the other's full set of
+  ;;; bindings or a shared numbering.
   ;;;
   ;;; This pass also lowers quote:
   ;;;   - quoted immediates ((quote 3), (quote #t), (quote ())) become the
   ;;;     immediate itself
   ;;;   - quoted symbols stay wrapped as (quote sym) and flow through the
   ;;;     pipeline as literals (see literal-expr? in (hop utils))
-  ;;;   - quoted pairs are hoisted into fresh global slots that are built with
+  ;;;   - quoted pairs are hoisted into fresh global cells that are built with
   ;;;     cons at the top of the program, so each quoted structure is
-  ;;;     constructed exactly once and every occurrence reads (global N)
+  ;;;     constructed exactly once and every occurrence reads (global label)
   (export lower-source-program)
   (import (scheme base)
           (scheme cxr)
@@ -41,19 +49,25 @@
         (list form)))
   (append-map flatten-form forms))
 
+;; A top-level define's storage label. "hop_g_" keeps this namespace apart
+;; from procedure labels, GC-descriptor labels, and (once separate compilation
+;; adds library-qualified mangling on top of this) another library's own
+;; hop_g_ labels.
+(define (global-cell-label name)
+  (string->symbol (string-append "hop_g_" (mangle-identifier name))))
+
 (define (collect-top-level-global-env forms)
-  (let loop ((rest forms) (next-slot 0) (env '()))
+  (let loop ((rest forms) (env '()))
     (if (null? rest)
         env
         (let ((form (car rest)))
           (if (top-level-define-form? form)
               (let ((name (cadr form)))
                 (if (assoc name env)
-                    (loop (cdr rest) next-slot env)
+                    (loop (cdr rest) env)
                     (loop (cdr rest)
-                          (+ next-slot 1)
-                          (cons (list name next-slot) env))))
-              (loop (cdr rest) next-slot env))))))
+                          (cons (list name (global-cell-label name)) env))))
+              (loop (cdr rest) env))))))
 
 (define (global-slot name global-env)
   (let ((binding (assoc name global-env)))
@@ -165,21 +179,30 @@
       (error "Invalid expression during global resolution" e))))
   (resolve expr local-env))
 
+;; A hoisted quoted structure's storage label. These are compiler-synthesized
+;; (never looked up by name), so a private counter-based suffix is enough to
+;; keep them distinct from each other; "hop_q_" keeps them out of the
+;; user-name-derived "hop_g_" namespace.
+(define (quote-cell-label index)
+  (string->symbol (string-append "hop_q_" (number->string index))))
+
 (define (lower-source-program source)
   (let* ((forms (flatten-top-level-forms (source->forms source)))
          (global-env (collect-top-level-global-env forms))
-         (next-quote-slot (length global-env))
+         (next-quote-index 0)
+         (quote-labels '())
          (quote-inits '()))
     (define (hoist-quote! datum)
-      ;; Quoted structure gets a compiler-assigned slot after the top-level
-      ;; defines. The initializer runs before any user form, so every read of
-      ;; the slot sees the fully built structure.
-      (let ((slot next-quote-slot))
-        (set! next-quote-slot (+ next-quote-slot 1))
+      ;; Quoted structure gets a compiler-assigned cell, initialized before
+      ;; any user form runs, so every read of the label sees the fully built
+      ;; structure.
+      (let ((label (quote-cell-label next-quote-index)))
+        (set! next-quote-index (+ next-quote-index 1))
+        (set! quote-labels (cons label quote-labels))
         (set! quote-inits
-              (cons `(set-global! ,slot ,(quoted-datum->constructor datum))
+              (cons `(set-global! ,label ,(quoted-datum->constructor datum))
                     quote-inits))
-        `(global ,slot)))
+        `(global ,label)))
     (if (null? forms)
         (error "Program requires at least one top-level form")
         (let ((resolved-forms
@@ -187,7 +210,7 @@
                       (if (top-level-define-form? form)
                           ;; Top-level define is not a local binder after this
                           ;; point; it is an ordered write into a
-                          ;; compiler-assigned slot.
+                          ;; compiler-assigned cell.
                           `(set-global! ,(global-slot (cadr form) global-env)
                                         ,(resolve-globals (caddr form)
                                                           '()
@@ -197,6 +220,6 @@
                     forms)))
           (values
            (body->expr (append (reverse quote-inits) resolved-forms))
-           next-quote-slot)))))
+           (append (map cadr global-env) (reverse quote-labels)))))))
 
 )) ; end define-library

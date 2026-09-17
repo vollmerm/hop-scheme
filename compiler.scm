@@ -52,7 +52,7 @@
   ;; lowering first, even the original "single expression" path. That keeps
   ;; the whole compiler talking about one uniform internal program shape.
   (let ((surface (desugar-surface expr)))
-   (let-values (((lowered-program global-count) (lower-source-program surface)))
+   (let-values (((lowered-program global-labels) (lower-source-program surface)))
     (let* ((uniquified (uniquify lowered-program))
            (canonicalized (canonicalize-builtins uniquified))
            (letrec-simplified (simplify-letrec canonicalized))
@@ -83,7 +83,7 @@
                  procedure-cfgs)))
              (values surface
                lowered-program
-               global-count
+               global-labels
                uniquified
                canonicalized
                letrec-simplified
@@ -95,7 +95,7 @@
               optimized-procedure-cfgs)))))))
 
 (define (compile-to-backend expr)
-  (let-values (((surface lowered-program global-count uniquified canonicalized letrec-simplified desugared closure-converted cfa-normalized
+  (let-values (((surface lowered-program global-labels uniquified canonicalized letrec-simplified desugared closure-converted cfa-normalized
                               cfa-rewritten entry-cfg procedures)
                  (compile-to-cfg expr)))
     (let ((entry-machine
@@ -109,7 +109,7 @@
                 procedures)))
       (values surface
               lowered-program
-              global-count
+              global-labels
               uniquified
               canonicalized
               letrec-simplified
@@ -123,13 +123,13 @@
               procedure-machines))))
 
 (define (write-aarch64-program expr path)
-  (let-values (((surface lowered-program global-count uniquified canonicalized letrec-simplified desugared closure-converted cfa-normalized
+  (let-values (((surface lowered-program global-labels uniquified canonicalized letrec-simplified desugared closure-converted cfa-normalized
                                cfa-rewritten entry-cfg procedures
                                 entry-machine procedure-machines)
                    (compile-to-backend expr)))
     (call-with-output-file path
       (lambda (port)
-        (emit-aarch64-program port entry-machine procedure-machines global-count)))))
+        (emit-aarch64-program port entry-machine procedure-machines global-labels)))))
 
 (define (write-aarch64-program-forms forms path)
   (write-aarch64-program (cons 'program forms) path))
@@ -153,7 +153,7 @@
   (display "=== Source Program ===\n")
   (write expr) (newline)
 
-  (let-values (((surface lowered-program global-count uniquified canonicalized letrec-simplified desugared closure-converted cfa-normalized
+  (let-values (((surface lowered-program global-labels uniquified canonicalized letrec-simplified desugared closure-converted cfa-normalized
                                cfa-rewritten entry-cfg procedures
                                 entry-machine procedure-machines)
                  (compile-to-backend expr)))
@@ -162,8 +162,8 @@
 
     (display "\n=== After Program Lowering ===\n")
     (write lowered-program) (newline)
-    (display "Global slots: ")
-    (write global-count)
+    (display "Global labels: ")
+    (write global-labels)
     (newline)
 
     (display "\n=== After Uniquify ===\n")

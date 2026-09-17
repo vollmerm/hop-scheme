@@ -1184,27 +1184,49 @@
 (define unsafe-pair-load-mode 'fast)
 
 ;;; ── Symbol interning ───────────────────────────────────────────────────────
-;;; Symbols are immediates: (index << fixnum-shift) | symbol-tag. The table
-;;; is filled lazily while code is emitted (every quoted symbol reaches the
-;;; emitter through encode-immediate), and the name table is emitted into the
-;;; data section afterwards so the runtime can print interned symbols. The
-;;; table is per-program state; emit-aarch64-program resets it.
+;;; Symbols are immediates: (hash << fixnum-shift) | symbol-tag, where hash is
+;;; a deterministic function of the symbol's print name (not a per-program
+;;; table position). Two files compiling the same symbol name independently
+;;; therefore produce the identical immediate with no coordination between
+;;; them, so eq?/case/memq on symbols keep working once files are linked
+;;; together without ever needing a runtime interning step. The table below
+;;; only exists so the runtime can recover a symbol's printed name (hash ->
+;;; name); it plays no part in identity. It's per-program state that
+;;; emit-aarch64-program resets.
 
-(define interned-symbols '())   ; assq list of (sym . index), most recent first
-(define interned-symbol-count 0)
+;; A 61-bit (2^61 - 1, a Mersenne prime) multiplicative polynomial hash over
+;; the symbol name's UTF-8 bytes. 61 bits is exactly the space available
+;; above the 3-bit tag in a 64-bit immediate. This only needs to be a fixed,
+;; well-distributed function computable identically by every independent
+;; compilation -- it does not need to be cryptographic, and the compiler
+;; itself runs on an arbitrary-precision host Scheme so overflow during the
+;; fold below isn't a concern.
+(define symbol-hash-modulus 2305843009213693951)
+(define symbol-hash-multiplier 131)
+
+(define (symbol-hash sym)
+  (let ((bytes (string->utf8 (symbol->string sym))))
+    (let loop ((index 0) (acc 1469598103934665603))
+      (if (= index (bytevector-length bytes))
+          (modulo acc symbol-hash-modulus)
+          (loop (+ index 1)
+                (modulo (+ (* acc symbol-hash-multiplier)
+                           (bytevector-u8-ref bytes index)
+                           1)
+                        symbol-hash-modulus))))))
+
+(define interned-symbols '())   ; assq list of (sym . hash), most recent first
 
 (define (reset-interned-symbols!)
-  (set! interned-symbols '())
-  (set! interned-symbol-count 0))
+  (set! interned-symbols '()))
 
 (define (intern-symbol! sym)
   (let ((entry (assq sym interned-symbols)))
     (if entry
         (cdr entry)
-        (let ((index interned-symbol-count))
-          (set! interned-symbols (cons (cons sym index) interned-symbols))
-          (set! interned-symbol-count (+ interned-symbol-count 1))
-          index))))
+        (let ((hash (symbol-hash sym)))
+          (set! interned-symbols (cons (cons sym hash) interned-symbols))
+          hash))))
 
 (define (encode-immediate value)
   (cond
@@ -1219,12 +1241,42 @@
 (define (immediate->string value)
   (number->string (encode-immediate value)))
 
+;; AArch64's `mov reg, #imm` alias only accepts a 16-bit value (optionally
+;; shifted) or a repeating-bit-pattern "logical immediate" -- not an
+;; arbitrary 64-bit constant. Symbol immediates are now a 61-bit hash (see
+;; symbol-hash above) and essentially never happen to fit either form, so
+;; every literal load goes through an explicit movz + up-to-3-movk sequence,
+;; which can represent any 64-bit pattern regardless of magnitude or sign.
+(define u64-modulus (expt 2 64))
+
+(define (u16-chunk unsigned-value shift)
+  (modulo (quotient unsigned-value (expt 2 shift)) 65536))
+
+(define (emit-load-immediate port target value)
+  (let* ((unsigned (modulo value u64-modulus))
+         (chunk1 (u16-chunk unsigned 16))
+         (chunk2 (u16-chunk unsigned 32))
+         (chunk3 (u16-chunk unsigned 48)))
+    (emit-asm-line port
+                   (string-append "    movz " target ", #"
+                                  (number->string (u16-chunk unsigned 0))))
+    (unless (= chunk1 0)
+      (emit-asm-line port
+                     (string-append "    movk " target ", #"
+                                    (number->string chunk1) ", lsl #16")))
+    (unless (= chunk2 0)
+      (emit-asm-line port
+                     (string-append "    movk " target ", #"
+                                    (number->string chunk2) ", lsl #32")))
+    (unless (= chunk3 0)
+      (emit-asm-line port
+                     (string-append "    movk " target ", #"
+                                    (number->string chunk3) ", lsl #48")))))
+
 (define (emit-load-operand port target operand proc)
   (cond
     ((literal-expr? operand)
-     (emit-asm-line port
-                    (string-append "    mov " target ", #"
-                                   (immediate->string operand))))
+     (emit-load-immediate port target (encode-immediate operand)))
     ((register-operand? operand)
      (let ((src (register-name operand)))
        (when (not (string=? target src))
@@ -1338,19 +1390,19 @@
     (else (error "Unknown safe binop op" op)))
   (emit-store-operand port "x0" dst proc))
 
-(define (emit-runtime-global-read port dst slot proc)
-  (emit-asm-line port
-                 (string-append "    mov x0, #"
-                                (number->string slot)))
-  (emit-asm-line port "    bl _hop_global_ref")
-  (emit-store-operand port "x0" dst proc))
+;; A global read/write addresses its own labeled cell directly (adrp/add,
+;; same as a procedure address) instead of going through a runtime helper --
+;; there is no per-program slot array to bounds-check against any more, so
+;; the label's assembler/linker resolution IS the lookup.
+(define (emit-runtime-global-read port dst label proc)
+  (emit-procedure-address port "x9" label)
+  (emit-asm-line port "    ldr x10, [x9]")
+  (emit-store-operand port "x10" dst proc))
 
-(define (emit-runtime-global-write port slot operand proc)
-  (emit-asm-line port
-                 (string-append "    mov x0, #"
-                                (number->string slot)))
-  (emit-load-operand port "x1" operand proc)
-  (emit-asm-line port "    bl _hop_global_set"))
+(define (emit-runtime-global-write port label operand proc)
+  (emit-procedure-address port "x9" label)
+  (emit-load-operand port "x10" operand proc)
+  (emit-asm-line port "    str x10, [x9]"))
 
 (define (gc-desc-label proc-name)
   (string-append "Lgcdesc." (symbol->string proc-name)))
@@ -1728,24 +1780,38 @@
                                                    (procedure-outgoing-bytes proc)
                                                    (procedure-saved-bytes proc))))))
 
-(define (emit-global-slots port global-count)
-  (emit-asm-line port (string-append ".globl " (asm-name 'hop_global_slot_count)))
+;; Each top-level global gets its own labeled 8-byte cell instead of a shared
+;; array slot -- see (hop pass lower)'s global-cell-label. emit-aarch64-program
+;; also builds a root table of their addresses (below) so the GC can still
+;; find and scan every one of them without a single indexed array to walk.
+(define (emit-global-cells port global-labels)
+  (for-each
+   (lambda (label)
+     (emit-asm-line port (string-append ".globl " (asm-name label)))
+     (emit-asm-line port ".p2align 3")
+     (emit-asm-line port (string-append (asm-name label) ":"))
+     (emit-asm-line port
+                    (string-append "    .quad "
+                                   (number->string uninitialized-immediate))))
+   global-labels))
+
+(define (global-roots-label) (asm-name 'hop_global_roots))
+(define (global-root-count-label) (asm-name 'hop_global_root_count))
+
+(define (emit-global-roots port global-labels)
+  (emit-asm-line port (string-append ".globl " (global-root-count-label)))
   (emit-asm-line port ".p2align 3")
-  (emit-asm-line port (string-append (asm-name 'hop_global_slot_count) ":"))
+  (emit-asm-line port (string-append (global-root-count-label) ":"))
   (emit-asm-line port
                  (string-append "    .quad "
-                                (number->string global-count)))
-  (emit-asm-line port (string-append ".globl " (asm-name 'hop_global_slots)))
+                                (number->string (length global-labels))))
+  (emit-asm-line port (string-append ".globl " (global-roots-label)))
   (emit-asm-line port ".p2align 3")
-  (emit-asm-line port (string-append (asm-name 'hop_global_slots) ":"))
-  (let loop ((index 0))
-    (if (= index global-count)
-        'done
-        (begin
-          (emit-asm-line port
-                         (string-append "    .quad "
-                                        (number->string uninitialized-immediate)))
-          (loop (+ index 1))))))
+  (emit-asm-line port (string-append (global-roots-label) ":"))
+  (for-each
+   (lambda (label)
+     (emit-asm-line port (string-append "    .quad " (asm-name label))))
+   global-labels))
 
 (define (asciz-escape text)
   (let loop ((chars (string->list text)) (result '()))
@@ -1761,35 +1827,44 @@
   (string-append "Lsymname." (number->string index)))
 
 (define (emit-symbol-table port)
-  ;; Interning order is most-recent-first in the assq list; emit the name
-  ;; pointers in index order so hop_symbol_names[index] lines up with the
-  ;; encoded immediates.
-  (let ((by-index (reverse interned-symbols)))
+  ;; hop_symbol_hashes[i]/hop_symbol_name_ptrs[i] are parallel arrays; the
+  ;; runtime finds a symbol's name with a linear scan for a matching hash
+  ;; (see hop_symbol_name in runtime.c). Interning order is most-recent-first
+  ;; in the assq list; emission order doesn't matter since lookup is by
+  ;; value, not position.
+  (let ((entries (reverse interned-symbols)))
     (emit-asm-line port (string-append ".globl " (asm-name 'hop_symbol_count)))
     (emit-asm-line port ".p2align 3")
     (emit-asm-line port (string-append (asm-name 'hop_symbol_count) ":"))
     (emit-asm-line port
-                   (string-append "    .quad "
-                                  (number->string interned-symbol-count)))
-    (emit-asm-line port (string-append ".globl " (asm-name 'hop_symbol_names)))
+                   (string-append "    .quad " (number->string (length entries))))
+    (emit-asm-line port (string-append ".globl " (asm-name 'hop_symbol_hashes)))
     (emit-asm-line port ".p2align 3")
-    (emit-asm-line port (string-append (asm-name 'hop_symbol_names) ":"))
-    (for-each (lambda (entry)
-                (emit-asm-line port
-                               (string-append "    .quad "
-                                              (symbol-name-label (cdr entry)))))
-              by-index)
-    (for-each (lambda (entry)
-                (emit-asm-line port
-                               (string-append (symbol-name-label (cdr entry)) ":"))
-                (emit-asm-line port
-                               (string-append "    .asciz \""
-                                              (asciz-escape
-                                               (symbol->string (car entry)))
-                                              "\"")))
-              by-index)))
+    (emit-asm-line port (string-append (asm-name 'hop_symbol_hashes) ":"))
+    (let loop ((rest entries) (index 0))
+      (unless (null? rest)
+        (emit-asm-line port
+                       (string-append "    .quad " (number->string (cdr (car rest)))))
+        (loop (cdr rest) (+ index 1))))
+    (emit-asm-line port (string-append ".globl " (asm-name 'hop_symbol_name_ptrs)))
+    (emit-asm-line port ".p2align 3")
+    (emit-asm-line port (string-append (asm-name 'hop_symbol_name_ptrs) ":"))
+    (let loop ((rest entries) (index 0))
+      (unless (null? rest)
+        (emit-asm-line port
+                       (string-append "    .quad " (symbol-name-label index)))
+        (loop (cdr rest) (+ index 1))))
+    (let loop ((rest entries) (index 0))
+      (unless (null? rest)
+        (emit-asm-line port (string-append (symbol-name-label index) ":"))
+        (emit-asm-line port
+                       (string-append "    .asciz \""
+                                      (asciz-escape
+                                       (symbol->string (car (car rest))))
+                                      "\""))
+        (loop (cdr rest) (+ index 1))))))
 
-(define (emit-aarch64-program port entry-proc procedures global-count)
+(define (emit-aarch64-program port entry-proc procedures global-labels)
   (reset-interned-symbols!)
   (emit-asm-line port ".text")
   (emit-asm-line port "")
@@ -1803,7 +1878,8 @@
   (for-each (lambda (proc)
               (emit-procedure-descriptor port proc))
             procedures)
-  (emit-global-slots port global-count)
+  (emit-global-cells port global-labels)
+  (emit-global-roots port global-labels)
   (emit-symbol-table port))
 
 )) ; end define-library
