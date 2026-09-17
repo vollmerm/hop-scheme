@@ -20,7 +20,11 @@
   ;;;   - quoted pairs are hoisted into fresh global cells that are built with
   ;;;     cons at the top of the program, so each quoted structure is
   ;;;     constructed exactly once and every occurrence reads (global label)
-  (export lower-source-program)
+  (export lower-source-program
+          lower-unit-body
+          global-cell-label
+          library-init-label
+          unit-tag)
   (import (scheme base)
           (scheme cxr)
           (hop utils))
@@ -49,14 +53,50 @@
         (list form)))
   (append-map flatten-form forms))
 
-;; A top-level define's storage label. "hop_g_" keeps this namespace apart
-;; from procedure labels, GC-descriptor labels, and (once separate compilation
-;; adds library-qualified mangling on top of this) another library's own
-;; hop_g_ labels.
-(define (global-cell-label name)
-  (string->symbol (string-append "hop_g_" (mangle-identifier name))))
+;; A library name is a list of symbols (R7RS also allows exact non-negative
+;; integers). Length-prefixing each component before concatenating keeps the
+;; encoding self-delimiting and therefore collision-free: (math vectors) and
+;; (mathvec tors), say, can never mangle to the same text, because the
+;; component lengths (4/7 vs. 7/4) are baked into the output itself.
+(define (mangle-library-name-component part)
+  (let ((text (mangle-identifier (if (symbol? part) part (number->string part)))))
+    (string-append (number->string (string-length text)) text)))
 
-(define (collect-top-level-global-env forms)
+(define (mangle-library-name name)
+  (apply string-append (map mangle-library-name-component name)))
+
+;; unit-name is #f for a plain program (today's single-unit compiles: no
+;; qualification needed, since nothing else can ever reference or collide
+;; with a program's own globals) or a library name list, in which case every
+;; label this unit emits -- its own top-level defines and its hoisted quotes
+;; alike -- is qualified by it. That's what lets two independently compiled
+;; libraries each have their own private top-level `helper` without their
+;; storage cells colliding once both are linked into the same executable.
+(define (unit-label-prefix unit-name)
+  (if unit-name (string-append (mangle-library-name unit-name) "_") ""))
+
+;; A unit-qualifying tag for the handful of once-per-file data-section labels
+;; (root table, symbol-printing table) that aren't tied to any one binding --
+;; #f for a plain program, matching today's unqualified names exactly; a
+;; library's mangled name otherwise, so two libraries' own root/symbol tables
+;; don't collide once both are linked into the same executable.
+(define (unit-tag unit-name)
+  (if unit-name (mangle-library-name unit-name) #f))
+
+;; A library's private initialization-procedure label -- the equivalent of
+;; scheme_entry for a library file. Only a program gets the reserved
+;; scheme_entry name (see compiler.scm); every library gets its own, so many
+;; libraries' init procedures can coexist in one linked executable.
+(define (library-init-label unit-name)
+  (string->symbol (string-append "hop_init_" (mangle-library-name unit-name))))
+
+;; A top-level define's storage label. "hop_g_" keeps this namespace apart
+;; from procedure labels and GC-descriptor labels.
+(define (global-cell-label unit-name name)
+  (string->symbol
+   (string-append "hop_g_" (unit-label-prefix unit-name) (mangle-identifier name))))
+
+(define (collect-top-level-global-env forms unit-name)
   (let loop ((rest forms) (env '()))
     (if (null? rest)
         env
@@ -66,7 +106,7 @@
                 (if (assoc name env)
                     (loop (cdr rest) env)
                     (loop (cdr rest)
-                          (cons (list name (global-cell-label name)) env))))
+                          (cons (list name (global-cell-label unit-name name)) env))))
               (loop (cdr rest) env))))))
 
 (define (global-slot name global-env)
@@ -91,7 +131,13 @@
    (else
     (error "Unsupported quoted datum" datum))))
 
-(define (resolve-globals expr local-env global-env hoist-quote!)
+;; external-resolver is consulted for a free name this unit doesn't itself
+;; define -- (lambda (name) #f) for a plain program (today's behavior: any
+;; name not locally defined just passes through unresolved, same as always),
+;; or a lookup across a unit's declared imports' exports, returning the
+;; exporting library's own (deterministically, independently computable)
+;; label for that name, or #f if no import covers it.
+(define (resolve-globals expr local-env global-env external-resolver hoist-quote!)
   (define (resolve e local-env)
     (cond
      ((symbol? e)
@@ -100,7 +146,10 @@
           (let ((binding (assoc e global-env)))
             (if binding
                 `(global ,(cadr binding))
-                e))))
+                (let ((external-label (external-resolver e)))
+                  (if external-label
+                      `(global ,external-label)
+                      e))))))
      ((literal-expr? e) e)
      ((pair? e)
       (case (car e)
@@ -180,15 +229,24 @@
   (resolve expr local-env))
 
 ;; A hoisted quoted structure's storage label. These are compiler-synthesized
-;; (never looked up by name), so a private counter-based suffix is enough to
-;; keep them distinct from each other; "hop_q_" keeps them out of the
-;; user-name-derived "hop_g_" namespace.
-(define (quote-cell-label index)
-  (string->symbol (string-append "hop_q_" (number->string index))))
+;; (never looked up by name -- a library never exports a quote-hoisted cell
+;; directly), so a private counter-based suffix is enough to keep them
+;; distinct from each other; "hop_q_" keeps them out of the user-name-derived
+;; "hop_g_" namespace. Still unit-qualified, though: two libraries each
+;; hoisting their own first quoted list would otherwise both produce
+;; hop_q_0 and collide once linked together.
+(define (quote-cell-label unit-name index)
+  (string->symbol
+   (string-append "hop_q_" (unit-label-prefix unit-name) (number->string index))))
 
-(define (lower-source-program source)
-  (let* ((forms (flatten-top-level-forms (source->forms source)))
-         (global-env (collect-top-level-global-env forms))
+;; Shared core behind both lower-source-program and lower-unit-body: resolve
+;; every top-level define into a storage cell (qualified by unit-name, or
+;; unqualified when unit-name is #f) and every free reference either to a
+;; local cell, to whatever external-resolver reports for an imported name, or
+;; -- if neither applies -- left as a bare symbol, exactly as today for a
+;; plain, importless program.
+(define (lower-forms forms unit-name external-resolver)
+  (let* ((global-env (collect-top-level-global-env forms unit-name))
          (next-quote-index 0)
          (quote-labels '())
          (quote-inits '()))
@@ -196,7 +254,7 @@
       ;; Quoted structure gets a compiler-assigned cell, initialized before
       ;; any user form runs, so every read of the label sees the fully built
       ;; structure.
-      (let ((label (quote-cell-label next-quote-index)))
+      (let ((label (quote-cell-label unit-name next-quote-index)))
         (set! next-quote-index (+ next-quote-index 1))
         (set! quote-labels (cons label quote-labels))
         (set! quote-inits
@@ -215,11 +273,37 @@
                                         ,(resolve-globals (caddr form)
                                                           '()
                                                           global-env
+                                                          external-resolver
                                                           hoist-quote!))
-                          (resolve-globals form '() global-env hoist-quote!)))
+                          (resolve-globals form '() global-env external-resolver hoist-quote!)))
                     forms)))
           (values
            (body->expr (append (reverse quote-inits) resolved-forms))
-           (append (map cadr global-env) (reverse quote-labels)))))))
+           (append (map cadr global-env) (reverse quote-labels))
+           global-env)))))
+
+(define (no-external-binding name) #f)
+
+(define (lower-source-program source)
+  (let-values (((expr labels env)
+                (lower-forms (flatten-top-level-forms (source->forms source))
+                             #f
+                             no-external-binding)))
+    (values expr labels)))
+
+;; The define-library/import-aware entry point: forms is a unit's body (a
+;; library's (begin ...) contents, or a program's forms after any leading
+;; import declarations), unit-name is that library's name (or #f for a
+;; program), and external-resolver looks a free name up across the unit's
+;; imports (see (hop pass unit) for parsing define-library/import into that
+;; shape) -- typically built by resolving each imported library's declared
+;; exports to labels via global-cell-label with THAT library's name, which a
+;; caller can always compute without needing that library's compiled output,
+;; only its declared name and export list. Returns the lowered expression,
+;; every global label this unit's own storage needs, and the local
+;; (name label) environment so a caller can cross-reference it against this
+;; unit's own export list.
+(define (lower-unit-body forms unit-name external-resolver)
+  (lower-forms (flatten-top-level-forms forms) unit-name external-resolver))
 
 )) ; end define-library

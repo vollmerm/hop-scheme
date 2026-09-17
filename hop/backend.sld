@@ -1795,23 +1795,38 @@
                                    (number->string uninitialized-immediate))))
    global-labels))
 
-(define (global-roots-label) (asm-name 'hop_global_roots))
-(define (global-root-count-label) (asm-name 'hop_global_root_count))
+;; tag is #f for the single-unit case (today's unqualified names, unchanged)
+;; or a unit-tag string (see (hop pass lower)) when this file is one of
+;; several independently compiled units being linked together, so each
+;; unit's own once-per-file data labels stay distinct from every other
+;; unit's. A later link step is what's expected to merge these per-unit
+;; tables into the single hop_global_roots/hop_global_root_count pair
+;; runtime.c actually reads.
+(define (tagged-label base tag)
+  (asm-name
+   (if tag
+       (string->symbol (string-append (symbol->string base) "_" tag))
+       base)))
 
-(define (emit-global-roots port global-labels)
-  (emit-asm-line port (string-append ".globl " (global-root-count-label)))
-  (emit-asm-line port ".p2align 3")
-  (emit-asm-line port (string-append (global-root-count-label) ":"))
-  (emit-asm-line port
-                 (string-append "    .quad "
-                                (number->string (length global-labels))))
-  (emit-asm-line port (string-append ".globl " (global-roots-label)))
-  (emit-asm-line port ".p2align 3")
-  (emit-asm-line port (string-append (global-roots-label) ":"))
-  (for-each
-   (lambda (label)
-     (emit-asm-line port (string-append "    .quad " (asm-name label))))
-   global-labels))
+(define (global-roots-label tag) (tagged-label 'hop_global_roots tag))
+(define (global-root-count-label tag) (tagged-label 'hop_global_root_count tag))
+
+(define (emit-global-roots port global-labels tag)
+  (let ((count-label (global-root-count-label tag))
+        (roots-label (global-roots-label tag)))
+    (emit-asm-line port (string-append ".globl " count-label))
+    (emit-asm-line port ".p2align 3")
+    (emit-asm-line port (string-append count-label ":"))
+    (emit-asm-line port
+                   (string-append "    .quad "
+                                  (number->string (length global-labels))))
+    (emit-asm-line port (string-append ".globl " roots-label))
+    (emit-asm-line port ".p2align 3")
+    (emit-asm-line port (string-append roots-label ":"))
+    (for-each
+     (lambda (label)
+       (emit-asm-line port (string-append "    .quad " (asm-name label))))
+     global-labels)))
 
 (define (asciz-escape text)
   (let loop ((chars (string->list text)) (result '()))
@@ -1826,29 +1841,32 @@
 (define (symbol-name-label index)
   (string-append "Lsymname." (number->string index)))
 
-(define (emit-symbol-table port)
+(define (emit-symbol-table port tag)
   ;; hop_symbol_hashes[i]/hop_symbol_name_ptrs[i] are parallel arrays; the
   ;; runtime finds a symbol's name with a linear scan for a matching hash
   ;; (see hop_symbol_name in runtime.c). Interning order is most-recent-first
   ;; in the assq list; emission order doesn't matter since lookup is by
-  ;; value, not position.
-  (let ((entries (reverse interned-symbols)))
-    (emit-asm-line port (string-append ".globl " (asm-name 'hop_symbol_count)))
+  ;; value, not position. See emit-global-roots above for what tag is.
+  (let ((entries (reverse interned-symbols))
+        (count-label (tagged-label 'hop_symbol_count tag))
+        (hashes-label (tagged-label 'hop_symbol_hashes tag))
+        (name-ptrs-label (tagged-label 'hop_symbol_name_ptrs tag)))
+    (emit-asm-line port (string-append ".globl " count-label))
     (emit-asm-line port ".p2align 3")
-    (emit-asm-line port (string-append (asm-name 'hop_symbol_count) ":"))
+    (emit-asm-line port (string-append count-label ":"))
     (emit-asm-line port
                    (string-append "    .quad " (number->string (length entries))))
-    (emit-asm-line port (string-append ".globl " (asm-name 'hop_symbol_hashes)))
+    (emit-asm-line port (string-append ".globl " hashes-label))
     (emit-asm-line port ".p2align 3")
-    (emit-asm-line port (string-append (asm-name 'hop_symbol_hashes) ":"))
+    (emit-asm-line port (string-append hashes-label ":"))
     (let loop ((rest entries) (index 0))
       (unless (null? rest)
         (emit-asm-line port
                        (string-append "    .quad " (number->string (cdr (car rest)))))
         (loop (cdr rest) (+ index 1))))
-    (emit-asm-line port (string-append ".globl " (asm-name 'hop_symbol_name_ptrs)))
+    (emit-asm-line port (string-append ".globl " name-ptrs-label))
     (emit-asm-line port ".p2align 3")
-    (emit-asm-line port (string-append (asm-name 'hop_symbol_name_ptrs) ":"))
+    (emit-asm-line port (string-append name-ptrs-label ":"))
     (let loop ((rest entries) (index 0))
       (unless (null? rest)
         (emit-asm-line port
@@ -1864,11 +1882,19 @@
                                       "\""))
         (loop (cdr rest) (+ index 1))))))
 
-(define (emit-aarch64-program port entry-proc procedures global-labels)
+;; tag is #f for the existing single-unit callers (write-aarch64-program and
+;; friends): every label this emits keeps today's plain, unqualified name,
+;; so single-file output is byte-for-byte unchanged. A named unit (library or
+;; program compiled via the define-library/import-aware driver) passes its
+;; own unit-tag (see (hop pass lower)) instead, so its once-per-file data
+;; labels -- and, via entry-proc's own name, its entry procedure's label --
+;; don't collide with another independently compiled unit's once both are
+;; linked together.
+(define (emit-aarch64-program port entry-proc procedures global-labels #!optional (tag #f))
   (reset-interned-symbols!)
   (emit-asm-line port ".text")
   (emit-asm-line port "")
-  (emit-machine-procedure port entry-proc 'scheme_entry)
+  (emit-machine-procedure port entry-proc (machine-procedure-name entry-proc))
   (for-each (lambda (proc)
               (emit-machine-procedure port proc (machine-procedure-name proc)))
             procedures)
@@ -1879,7 +1905,7 @@
               (emit-procedure-descriptor port proc))
             procedures)
   (emit-global-cells port global-labels)
-  (emit-global-roots port global-labels)
-  (emit-symbol-table port))
+  (emit-global-roots port global-labels tag)
+  (emit-symbol-table port tag))
 
 )) ; end define-library
