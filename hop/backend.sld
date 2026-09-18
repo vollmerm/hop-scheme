@@ -1785,10 +1785,21 @@
 ;; array slot -- see (hop pass lower)'s global-cell-label. emit-aarch64-program
 ;; also builds a root table of their addresses (below) so the GC can still
 ;; find and scan every one of them without a single indexed array to walk.
-(define (emit-global-cells port global-labels)
+;;
+;; Only a label in exported-labels gets .globl; every other cell (a unit's
+;; internal, non-exported defines, and every quote-hoisted literal, which is
+;; never exported) gets .private_extern instead -- still resolvable via
+;; `extern` by another translation unit at static-link time (the generated
+;; link stub always needs that, to rebuild the merged GC root table across
+;; every linked unit), but no longer visible in the final binary's
+;; exported/dynamic symbol table. Mach-O only: this project always targets
+;; `clang -arch arm64`.
+(define (emit-global-cells port global-labels exported-labels)
   (for-each
    (lambda (label)
-     (emit-asm-line port (string-append ".globl " (asm-name label)))
+     (emit-asm-line port (string-append (if (memq label exported-labels)
+                                             ".globl " ".private_extern ")
+                                         (asm-name label)))
      (emit-asm-line port ".p2align 3")
      (emit-asm-line port (string-append (asm-name label) ":"))
      (emit-asm-line port
@@ -1896,7 +1907,10 @@
   (for-each (lambda (proc)
               (emit-procedure-descriptor port proc))
             procedures)
-  (emit-global-cells port global-labels)
+  ;; No define-library exports exist in this self-contained single-unit
+  ;; path, so every cell is "exported" -- .globl for all of them, same as
+  ;; before this parameter existed.
+  (emit-global-cells port global-labels global-labels)
   (emit-global-roots port global-labels)
   (emit-symbol-table port))
 
@@ -1909,7 +1923,7 @@
 ;; job (see compiler.scm). Returns this unit's own (symbol . hash) interning
 ;; table so the caller can save it into this unit's interface file for the
 ;; link step to read later.
-(define (emit-unit-aarch64-program port body-proc procedures global-labels)
+(define (emit-unit-aarch64-program port body-proc procedures global-labels exported-labels)
   (reset-interned-symbols!)
   (emit-asm-line port ".text")
   (emit-asm-line port "")
@@ -1923,7 +1937,7 @@
   (for-each (lambda (proc)
               (emit-procedure-descriptor port proc))
             procedures)
-  (emit-global-cells port global-labels)
+  (emit-global-cells port global-labels exported-labels)
   (reverse interned-symbols))
 
 )) ; end define-library

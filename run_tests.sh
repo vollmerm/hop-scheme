@@ -134,6 +134,41 @@ assert_asm_not_contains() {
   fi
 }
 
+# Runs build-linked-program on an ordered list of source files (see
+# compiler.scm), writing generated .s/.hopi/link_stub.c into
+# $TMPDIR/$case_name.build, then assembles+links the resulting manifest into
+# an executable at exe_path_for "$case_name".
+build_multi_file_case() {
+  local case_name="$1"
+  shift
+  local out_dir exe_path source_list src
+  out_dir="$TMPDIR/$case_name.build"
+  exe_path="$(exe_path_for "$case_name")"
+  mkdir -p "$out_dir"
+  source_list=""
+  for src in "$@"; do
+    source_list+="\"$src\" "
+  done
+  csi -R r7rs -I "$ROOT" -e \
+    "(begin (load \"$ROOT/compiler.scm\") (build-linked-program (list $source_list) \"$out_dir\"))"
+  local objects=()
+  while IFS= read -r line; do
+    objects+=("$line")
+  done <"$out_dir/build_manifest.txt"
+  clang -arch arm64 -I "$ROOT" -o "$exe_path" "${objects[@]}" "$ROOT/runtime.c" "$ROOT/codegen_harness.c"
+}
+
+assert_multi_file_output() {
+  local case_name="$1"
+  local expected="$2"
+  shift 2
+  local exe_path
+  exe_path="$(exe_path_for "$case_name")"
+  build_multi_file_case "$case_name" "$@"
+  "$exe_path" "$expected" >/dev/null
+  printf 'ok %s\n' "$case_name"
+}
+
 runtime_cases=(
   "test1|6"
   "test2|6"
@@ -387,5 +422,70 @@ assert_file_output \
   "file-arith-variadic" \
   "100" \
   $'(define (sum4 a b c d) (+ a b c d))\n(sum4 10 20 30 40)'
+
+# --- Multi-file build (define-library / import / separate compilation) ----
+# Exercises build-linked-program end to end: a library unit and a program
+# unit that imports it, compiled separately and linked together via a
+# generated C stub (see compiler.scm's "Linking" and "Multi-file build
+# driver" sections).
+
+multi_lib_path="$TMPDIR/multi-lib.scm"
+multi_prog_path="$TMPDIR/multi-prog.scm"
+printf '%s\n' \
+  '(define-library (multitest)' \
+  '  (export add1)' \
+  '  (begin' \
+  '    (define (bump-by n step) (+ n step))' \
+  '    (define (add1 n) (bump-by n 1))))' \
+  >"$multi_lib_path"
+printf '%s\n' \
+  '(import (multitest))' \
+  '(add1 41)' \
+  >"$multi_prog_path"
+
+assert_multi_file_output "multi-file-basic" "42" "$multi_lib_path" "$multi_prog_path"
+
+# The exported binding (add1) keeps .globl visibility; the internal,
+# non-exported binding (bump-by) must not -- it gets .private_extern instead,
+# so it never leaks into the linked executable's public symbol table (the
+# fix in hop/backend.sld's emit-global-cells).
+multi_build_dir="$TMPDIR/multi-file-basic.build"
+if ! grep -Eq '^\.globl _hop_g_.*add1$' "$multi_build_dir"/*.s; then
+  printf 'missing .globl on exported binding in %s\n' "$multi_build_dir" >&2
+  exit 1
+fi
+if ! grep -Eq '^\.private_extern _hop_g_.*bump' "$multi_build_dir"/*.s; then
+  printf 'missing .private_extern on internal binding in %s\n' "$multi_build_dir" >&2
+  exit 1
+fi
+if grep -Eq '^\.globl _hop_g_.*bump' "$multi_build_dir"/*.s; then
+  printf 'internal binding unexpectedly kept .globl visibility in %s\n' "$multi_build_dir" >&2
+  exit 1
+fi
+printf 'ok multi-file-visibility\n'
+
+# A unit whose declared import isn't satisfied by any earlier unit in the
+# build order is a clear compile-time error, not a downstream codegen
+# failure resolving a free reference.
+multi_bad_prog_path="$TMPDIR/multi-bad-prog.scm"
+printf '%s\n' \
+  '(import (does-not-exist))' \
+  '(add1 41)' \
+  >"$multi_bad_prog_path"
+multi_bad_out_dir="$TMPDIR/multi-file-unresolved-import.build"
+multi_bad_log="$TMPDIR/multi-file-unresolved-import.log"
+mkdir -p "$multi_bad_out_dir"
+if csi -R r7rs -I "$ROOT" -e \
+  "(begin (load \"$ROOT/compiler.scm\") (build-linked-program (list \"$multi_lib_path\" \"$multi_bad_prog_path\") \"$multi_bad_out_dir\"))" \
+  >"$multi_bad_log" 2>&1; then
+  printf 'unexpected compile success for multi-file-unresolved-import\n' >&2
+  exit 1
+fi
+if ! grep -Eq 'Unresolved import' "$multi_bad_log"; then
+  printf 'missing expected error for multi-file-unresolved-import\n' >&2
+  cat "$multi_bad_log" >&2
+  exit 1
+fi
+printf 'ok multi-file-unresolved-import\n'
 
 echo "compiler tests passed"

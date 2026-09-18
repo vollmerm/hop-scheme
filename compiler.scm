@@ -275,6 +275,7 @@
     form))
 
 (define (interface-kind iface) (interface-field iface 'kind))
+(define (interface-library-name iface) (interface-field iface 'library-name))
 (define (interface-body-label iface) (interface-field iface 'body-label))
 (define (interface-exports iface) (interface-field iface 'exports))
 (define (interface-all-globals iface) (interface-field iface 'all-globals))
@@ -283,18 +284,22 @@
 (define (write-unit-aarch64-program unit imported-interfaces unit-id asm-path interface-path)
   (let-values (((global-labels global-env body-machine procedure-machines)
                 (compile-unit-to-backend unit imported-interfaces unit-id)))
-    (let ((symbols #f))
+    (let* ((exported-bindings
+            (filter (lambda (binding) (memq (car binding) (compilation-unit-exports unit))) global-env))
+           (exported-labels (map cadr exported-bindings))
+           (symbols #f))
       (call-with-output-file asm-path
         (lambda (port)
           (set! symbols
-                (emit-unit-aarch64-program port body-machine procedure-machines global-labels))))
+                (emit-unit-aarch64-program port body-machine procedure-machines
+                                            global-labels exported-labels))))
       (write-interface-file
        interface-path
        unit-id
        (compilation-unit-kind unit)
        (compilation-unit-name unit)
        (machine-procedure-name body-machine)
-       (filter (lambda (binding) (memq (car binding) (compilation-unit-exports unit))) global-env)
+       exported-bindings
        global-labels
        symbols))))
 
@@ -451,6 +456,57 @@
       (lambda (port)
         (emit-link-stub port interfaces library-interfaces (car program-interfaces)
                          all-globals merged-symbols)))))
+
+;;; ---- Multi-file build driver --------------------------------------------
+;;; Ties write-unit-aarch64-program-file and link-compiled-units together for
+;;; an explicit, caller-ordered list of source files -- still no
+;;; discovery/sorting (see the "Compilation-unit driver" comment above): a
+;;; unit's declared imports are resolved only against the interfaces of
+;;; *earlier* units in the same list, by library name, so a unit naming an
+;;; import no earlier unit provides gets a clear error naming both the
+;;; missing library and the unit that needed it, instead of a downstream
+;;; failure to resolve a free reference during codegen.
+;;;
+;;; Writes <out-dir>/<unit-id>.s and <out-dir>/<unit-id>.hopi per unit, then
+;;; <out-dir>/link_stub.c, then a manifest at <out-dir>/build_manifest.txt --
+;;; every generated .s path, in order, followed by the link stub's .c path,
+;;; one per line -- which is how a calling shell script builds its `clang`
+;;; command line without needing to parse Scheme values. out-dir must already
+;;; exist.
+(define (build-linked-program source-paths out-dir)
+  (define manifest-path (path-join out-dir "build_manifest.txt"))
+  (let loop ((rest source-paths)
+             (compiled-libraries '())  ; ((library-name . interface-path) ...)
+             (asm-paths '())
+             (interface-paths '()))
+    (if (null? rest)
+        (let ((stub-path (path-join out-dir "link_stub.c")))
+          (link-compiled-units (reverse interface-paths) stub-path)
+          (call-with-output-file manifest-path
+            (lambda (port)
+              (for-each (lambda (p) (display p port) (newline port))
+                        (append (reverse asm-paths) (list stub-path)))))
+          (values (reverse asm-paths) stub-path))
+        (let* ((path (car rest))
+               (unit (read-compilation-unit path))
+               (unit-id (default-unit-id unit path))
+               (asm-path (path-join out-dir (string-append unit-id ".s")))
+               (interface-path (path-join out-dir (string-append unit-id ".hopi")))
+               (needed-interface-paths
+                (map (lambda (import-name)
+                       (let ((found (assoc import-name compiled-libraries)))
+                         (if found
+                             (cdr found)
+                             (error "Unresolved import -- no earlier unit in the build order provides this library"
+                                    import-name path))))
+                     (compilation-unit-imports unit))))
+          (write-unit-aarch64-program-file path needed-interface-paths asm-path interface-path)
+          (loop (cdr rest)
+                (if (compilation-unit-name unit)
+                    (cons (cons (compilation-unit-name unit) interface-path) compiled-libraries)
+                    compiled-libraries)
+                (cons asm-path asm-paths)
+                (cons interface-path interface-paths))))))
 
 (define (write-aarch64-program expr path)
   (let-values (((surface lowered-program global-labels uniquified canonicalized letrec-simplified desugared closure-converted cfa-normalized
