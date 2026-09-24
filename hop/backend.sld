@@ -1785,6 +1785,19 @@
 
 (define (emit-machine-procedure port proc exported-name)
   (emit-asm-line port (string-append ".globl " (asm-name exported-name)))
+  (emit-machine-procedure-body port proc exported-name))
+
+;; Emits proc under a file-local (non-.globl) label. Used for every compiled
+;; procedure but the body in a multi-unit build: each unit's CFA names its
+;; procedures cfa.proc.N from its own counter, so two units' labels collide
+;; if both are external symbols. Nothing outside a unit ever references one
+;; of its procedure labels directly -- cross-unit calls go through global
+;; cells holding closures -- so keeping them local to the object file is
+;; enough to make them unique at link time.
+(define (emit-local-machine-procedure port proc)
+  (emit-machine-procedure-body port proc (machine-procedure-name proc)))
+
+(define (emit-machine-procedure-body port proc exported-name)
   (emit-asm-line port (string-append ".p2align 2"))
   (emit-asm-line port (string-append (asm-name exported-name) ":"))
   (let loop ((blocks (machine-procedure-blocks proc)) (first? #t))
@@ -1955,7 +1968,7 @@
   (emit-asm-line port "")
   (emit-machine-procedure port body-proc (machine-procedure-name body-proc))
   (for-each (lambda (proc)
-              (emit-machine-procedure port proc (machine-procedure-name proc)))
+              (emit-local-machine-procedure port proc))
             procedures)
   (emit-asm-line port ".data")
   (emit-asm-line port "")

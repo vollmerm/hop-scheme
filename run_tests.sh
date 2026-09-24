@@ -500,6 +500,33 @@ if grep -Eq '^\.globl _hop_g_.*bump' "$multi_build_dir"/*.s; then
 fi
 printf 'ok multi-file-visibility\n'
 
+# Both units compile procedures, and each unit's CFA numbers its own
+# procedures cfa.proc.1, cfa.proc.2, ... independently. Those labels must
+# stay file-local (no .globl) or the link fails with duplicate symbols (the
+# fix in hop/backend.sld's emit-local-machine-procedure).
+multi_procs_lib_path="$TMPDIR/multi-procs-lib.scm"
+multi_procs_prog_path="$TMPDIR/multi-procs-prog.scm"
+printf '%s\n' \
+  '(define-library (procslib)' \
+  '  (export app1)' \
+  '  (begin (define (app1 g) (g 1))))' \
+  >"$multi_procs_lib_path"
+printf '%s\n' \
+  '(import (procslib))' \
+  '(define (h x) (+ x 1))' \
+  '(app1 h)' \
+  >"$multi_procs_prog_path"
+
+assert_multi_file_output "multi-file-both-units-procs" "2" \
+  "$multi_procs_lib_path" "$multi_procs_prog_path"
+
+multi_procs_build_dir="$TMPDIR/multi-file-both-units-procs.build"
+if grep -Eq '^\.(globl|private_extern) _cfa\.proc\.[0-9]+' "$multi_procs_build_dir"/*.s; then
+  printf 'unit procedure label unexpectedly external in %s\n' "$multi_procs_build_dir" >&2
+  exit 1
+fi
+printf 'ok multi-file-local-proc-labels\n'
+
 # A unit whose declared import isn't satisfied by any earlier unit in the
 # build order is a clear compile-time error, not a downstream codegen
 # failure resolving a free reference.
