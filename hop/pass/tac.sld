@@ -618,6 +618,15 @@
                              (list `(tail-apply-call ,closure-var ,leading-list-var ,list-var)))
                      procedures))))
 
+        ;; call/cc lowers to a plain 1-argument runtime call (hop_callcc),
+        ;; in tail position too: the caller's frame is gone by then, so the
+        ;; captured continuation is correctly the caller's own.
+        ((closure-callcc)
+         (let-values (((f-instrs f-var f-procedures)
+                       (convert-value (cadr expr) #f)))
+           (values (append f-instrs (list `(tail-callcc-call ,f-var)))
+                   f-procedures)))
+
         ((known-call)
          (convert-known-call (cadr expr)
                              (caddr expr)
@@ -891,6 +900,15 @@
                                               (apply-call ,closure-var ,leading-list-var ,list-var))))
                        result-var
                        procedures)))))
+
+        ((closure-callcc)
+         (let-values (((f-instrs f-var f-procedures)
+                       (convert-value (cadr expr) #f)))
+           (let ((result-var (or dest (fresh-temp))))
+             (values (append f-instrs
+                             (list `(assign ,result-var (callcc-call ,f-var))))
+                     result-var
+                     f-procedures))))
 
         ((group-tail-call)
          (error "group-tail-call is only valid in tail position" expr))

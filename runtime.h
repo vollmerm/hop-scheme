@@ -23,6 +23,7 @@ typedef struct {
  *   ptr......011  closure pointer
  *   ptr......100  vector pointer
  *   idx......101  symbol immediate
+ *   ptr......110  continuation pointer (internal; see hop_callcc)
  *
  * Fixnums are stored by shifting the signed integer left by
  * HOP_FIXNUM_SHIFT. Heap objects are allocated at aligned addresses, so their
@@ -65,6 +66,12 @@ typedef struct {
 #define HOP_CLOSURE_TAG 3
 #define HOP_VECTOR_TAG 4
 #define HOP_SYMBOL_TAG 5
+/*
+ * Never user-visible: a continuation object is only ever referenced from
+ * env slot 0 of the closure hop_callcc hands to Scheme code, which is what
+ * user code actually sees and calls.
+ */
+#define HOP_CONT_TAG 6
 
 #define HOP_NULL 20
 #define HOP_FALSE 36
@@ -173,6 +180,19 @@ hop_value hop_tail_call_8(hop_value arg0, hop_value arg1, hop_value arg2, hop_va
  * spread argument and must be a proper list.
  */
 hop_value hop_apply(hop_value closure_value, hop_value leading_list, hop_value list_arg);
+
+/*
+ * First-class, re-entrant continuations (call/cc), implemented by copying
+ * the native stack between hop_run's frame and hop_callcc's own frame into
+ * a heap object, and copying it back (to the very same addresses) when the
+ * continuation is invoked -- see the "Continuations" section of runtime.c.
+ *
+ * hop_run must be the only way compiled code is entered: it records the
+ * stack base every capture copies up to. hop_callcc is call/cc itself; the
+ * compiler lowers (call/cc f) to a plain 1-argument call to it.
+ */
+hop_value hop_run(hop_value (*entry)(void));
+hop_value hop_callcc(hop_value f);
 
 hop_value hop_safe_add(hop_value a, hop_value b);
 hop_value hop_safe_sub(hop_value a, hop_value b);

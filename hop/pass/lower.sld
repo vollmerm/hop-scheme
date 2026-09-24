@@ -202,6 +202,8 @@
         ((apply)
          `(apply ,(resolve (cadr e) local-env)
                  ,@(map (lambda (sub) (resolve sub local-env)) (cddr e))))
+        ((callcc)
+         `(callcc ,(resolve (cadr e) local-env)))
         ((cons make-vector vector-ref)
          `(,(car e) ,(resolve (cadr e) local-env)
            ,(resolve (caddr e) local-env)))

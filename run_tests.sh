@@ -272,6 +272,14 @@ runtime_cases=(
   "test103|30"
   "test104|62"
   "test105|44"
+  "test106|42"
+  "test107|7"
+  "test108|4"
+  "test109|23"
+  "test110|155|6144"
+  "test111|7"
+  "test112|55"
+  "test113|102"
 )
 
 generate_all
@@ -358,6 +366,12 @@ assert_asm_not_contains "test100" '_hop_safe_add' 'arbitrary-argument addition w
 assert_asm_contains "test101" '_hop_apply' 'apply of + lowers through hop_apply'
 assert_asm_contains "test104" '_hop_apply' 'apply of - lowers through hop_apply'
 
+# call/cc always lowers to the single runtime entry point hop_callcc.
+assert_asm_contains "test106" '_hop_callcc' 'call/cc lowers through hop_callcc'
+assert_asm_contains "test112" 'b _hop_callcc' 'tail-position call/cc is a tail branch to hop_callcc'
+# A continuation's call site can never be resolved to a direct call.
+assert_asm_contains "test113" '_hop_(tail_)?call_1' 'continuation call stays indirect'
+
 assert_file_output \
   "file-test1" \
   "42" \
@@ -412,6 +426,16 @@ assert_compile_error \
   $'(define (f a b . rest) (+ a b))\n(f 1)'
 
 # Zero-argument subtraction is a syntax error.
+assert_compile_error \
+  "file-callcc-no-args" \
+  'call/cc requires exactly one procedure argument' \
+  $'(call/cc)'
+
+assert_compile_error \
+  "file-callcc-two-args" \
+  'call/cc requires exactly one procedure argument' \
+  $'(call/cc (lambda (k) 1) 2)'
+
 assert_compile_error \
   "file-sub-zero-args" \
   '- requires at least 1 argument' \
@@ -487,5 +511,26 @@ if ! grep -Eq 'Unresolved import' "$multi_bad_log"; then
   exit 1
 fi
 printf 'ok multi-file-unresolved-import\n'
+
+# A continuation captured in a library unit's body and re-entered from the
+# program unit's body: the resumed stack includes the generated C link
+# stub's scheme_entry frame, which then re-runs the program body.
+cc_lib_path="$TMPDIR/cc-lib.scm"
+cc_prog_path="$TMPDIR/cc-prog.scm"
+printf '%s\n' \
+  '(define-library (cclib)' \
+  '  (export saved count)' \
+  '  (begin' \
+  '    (define saved (box #f))' \
+  '    (define count (box 0))' \
+  '    (call/cc (lambda (k) (set-box! saved k) 0))' \
+  '    (set-box! count (+ (unbox count) 1))))' \
+  >"$cc_lib_path"
+printf '%s\n' \
+  '(import (cclib))' \
+  '(if (< (unbox count) 3) ((unbox saved) 0) (unbox count))' \
+  >"$cc_prog_path"
+
+assert_multi_file_output "multi-file-callcc" "3" "$cc_lib_path" "$cc_prog_path"
 
 echo "compiler tests passed"

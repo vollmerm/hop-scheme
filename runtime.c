@@ -1,3 +1,4 @@
+#include <setjmp.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,7 +42,14 @@ enum {
      * kinds means hop_closure_env, and every hot hop_call_N switch body
      * that reads it, never need to branch on variadic-ness at all.
      */
-    HOP_OBJ_CLOSURE_VARIADIC = 5
+    HOP_OBJ_CLOSURE_VARIADIC = 5,
+    /*
+     * A captured continuation: a raw copy of a slice of the native stack
+     * plus the register state needed to resume it. aux is the object's
+     * total size in words (it is variable-length and mostly untraced raw
+     * bytes); see the "Continuations" section below for the layout.
+     */
+    HOP_OBJ_CONTINUATION = 6
 };
 
 #define HOP_HEADER_TYPE_MASK ((hop_word)0xff)
@@ -59,6 +67,9 @@ typedef struct {
 
 static hop_heap hop_runtime_heap = {0};
 void *hop_gc_top_frame = NULL;
+/* The value being passed to a continuation while it is reinstated (see
+ * hop_continuation_entry); a GC root in case a collection ever intervenes. */
+static hop_value hop_cont_value = HOP_FALSE;
 
 __attribute__((noreturn)) static void hop_panic(const char *message) {
     fprintf(stderr, "%s\n", message);
@@ -147,6 +158,8 @@ static size_t hop_object_words(hop_value *object) {
         return 3 + (size_t)hop_header_aux(header);
     case HOP_OBJ_VECTOR:
         return 1 + (size_t)hop_header_aux(header);
+    case HOP_OBJ_CONTINUATION:
+        return (size_t)hop_header_aux(header);
     case HOP_OBJ_FORWARD:
         return 2;
     default:
@@ -171,7 +184,8 @@ static hop_value hop_copy_value(hop_value value) {
     if (!hop_has_tag(value, HOP_PAIR_TAG) &&
         !hop_has_tag(value, HOP_BOX_TAG) &&
         !hop_has_tag(value, HOP_CLOSURE_TAG) &&
-        !hop_has_tag(value, HOP_VECTOR_TAG)) {
+        !hop_has_tag(value, HOP_VECTOR_TAG) &&
+        !hop_has_tag(value, HOP_CONT_TAG)) {
         return value;
     }
 
@@ -199,31 +213,71 @@ static hop_value hop_copy_value(hop_value value) {
     return hop_tag_pointer(new_object, tag);
 }
 
-static void hop_copy_stack_roots(void) {
-    void *frame = hop_gc_top_frame;
+/*
+ * Continuation object layout (all offsets in words):
+ *
+ *   [0] header (HOP_OBJ_CONTINUATION, aux = total words)
+ *   [1] saved_sp        -- lowest stack address the copy starts at
+ *   [2] saved_top_frame -- hop_gc_top_frame at capture time
+ *   [3] stack_bytes     -- size of the copied stack slice
+ *   [4 .. 4+HOP_CONT_JMPBUF_WORDS)   the _setjmp register state
+ *   [4+HOP_CONT_JMPBUF_WORDS .. aux) the stack copy itself
+ *
+ * Only the compiled frames' root slots inside the stack copy hold traced
+ * Scheme values; everything else (register state, return addresses, C
+ * helper frames) is raw data the collector never touches.
+ */
+#define HOP_CONT_JMPBUF_WORDS ((sizeof(jmp_buf) + sizeof(hop_value) - 1) / sizeof(hop_value))
+#define HOP_CONT_HEADER_WORDS (4 + HOP_CONT_JMPBUF_WORDS)
 
-    /*
-     * Each compiled frame links itself into hop_gc_top_frame and stores a
-     * pointer to a tiny descriptor just above the standard x29/x30 frame
-     * record. The descriptor tells us how many stack slots hold Scheme values
-     * and how large the frame is, so we can rewrite exactly those slots.
-     */
+static uintptr_t hop_cont_saved_sp(hop_value *cont) { return (uintptr_t)cont[1]; }
+static void *hop_cont_saved_top_frame(hop_value *cont) { return (void *)(uintptr_t)cont[2]; }
+static size_t hop_cont_stack_bytes(hop_value *cont) { return (size_t)cont[3]; }
+static jmp_buf *hop_cont_jmpbuf(hop_value *cont) { return (jmp_buf *)(cont + 4); }
+static uint8_t *hop_cont_stack(hop_value *cont) { return (uint8_t *)(cont + HOP_CONT_HEADER_WORDS); }
+
+/*
+ * Walks one GC frame chain and rewrites every frame's root slots. The
+ * chain's links are the absolute addresses the frames had on the native
+ * stack; `delta` is added to every address before dereferencing it, so the
+ * same walk serves the live stack (delta 0) and a continuation's stack
+ * copy (delta = copy address - original address). [lo, hi) bounds the
+ * original addresses a frame may occupy; a frame outside it means the copy
+ * is corrupt (for the live stack, there is no bound).
+ */
+static void hop_copy_frame_chain(void *top_frame, intptr_t delta, uintptr_t lo, uintptr_t hi) {
+    uintptr_t frame = (uintptr_t)top_frame;
+
     while (frame) {
-        void *prev = *(void **)((uint8_t *)frame - 16);
-        const hop_gc_frame_desc *desc = *(const hop_gc_frame_desc **)((uint8_t *)frame - 8);
+        uint8_t *here = (uint8_t *)(frame + delta);
+        void *prev = *(void **)(here - 16);
+        const hop_gc_frame_desc *desc = *(const hop_gc_frame_desc **)(here - 8);
         hop_value *slots;
         uint64_t index;
 
         if (!desc) {
             hop_panic("missing GC frame descriptor");
         }
+        if (frame - desc->stack_size < lo || frame > hi) {
+            hop_panic("GC frame lies outside continuation stack copy");
+        }
 
-        slots = (hop_value *)((uint8_t *)frame - desc->stack_size);
+        slots = (hop_value *)(here - desc->stack_size);
         for (index = 0; index < desc->frame_slots; index += 1) {
             slots[index] = hop_copy_value(slots[index]);
         }
-        frame = prev;
+        frame = (uintptr_t)prev;
     }
+}
+
+static void hop_copy_stack_roots(void) {
+    /*
+     * Each compiled frame links itself into hop_gc_top_frame and stores a
+     * pointer to a tiny descriptor just above the standard x29/x30 frame
+     * record. The descriptor tells us how many stack slots hold Scheme values
+     * and how large the frame is, so we can rewrite exactly those slots.
+     */
+    hop_copy_frame_chain(hop_gc_top_frame, 0, 0, UINTPTR_MAX);
 }
 
 static void hop_copy_temp_roots(hop_value *roots, size_t count) {
@@ -295,6 +349,16 @@ static void hop_scan_copied_objects(void) {
                 object[1 + index] = hop_copy_value(object[1 + index]);
             }
             break;
+        case HOP_OBJ_CONTINUATION: {
+            /* Same frame walk as the live stack, but through the copy: the
+             * chain still holds the frames' original stack addresses, which
+             * is also exactly where the copy is restored to later. */
+            uintptr_t lo = hop_cont_saved_sp(object);
+            hop_copy_frame_chain(hop_cont_saved_top_frame(object),
+                                 (intptr_t)hop_cont_stack(object) - (intptr_t)lo,
+                                 lo, lo + hop_cont_stack_bytes(object));
+            break;
+        }
         default:
             hop_panic("unexpected copied object type");
         }
@@ -312,6 +376,7 @@ static void hop_collect(hop_value *temp_roots, size_t temp_root_count) {
 
     hop_copy_global_roots();
     hop_copy_stack_roots();
+    hop_cont_value = hop_copy_value(hop_cont_value);
     hop_copy_temp_roots(temp_roots, temp_root_count);
     hop_scan_copied_objects();
 
@@ -1305,4 +1370,110 @@ const char *hop_symbol_name(hop_value value) {
         }
     }
     hop_panic("symbol not found in name table");
+}
+
+/*
+ * Continuations
+ * -------------
+ *
+ * call/cc is implemented by stack copying rather than CPS conversion. A
+ * capture copies the native stack between hop_callcc's own frame and the
+ * base hop_run recorded into a heap object, together with _setjmp register
+ * state; invoking the continuation copies that slice back to the very same
+ * addresses and _longjmps into it, so hop_callcc "returns" a second time.
+ *
+ * Two properties of compiled code make this sound without any compiler
+ * cooperation beyond treating hop_callcc as an ordinary safepoint call:
+ *
+ *   - Every live Scheme value is synced to its frame's root slot before a
+ *     call and reloaded from it after, so resumed frames read their values
+ *     from the (GC-maintained) copy rather than from stale registers.
+ *   - Frame-chain links and saved x29 values are absolute addresses, which
+ *     are valid again as-is because the copy is always restored in place.
+ *
+ * Runtime C frames inside the copy (hop_call_N, hop_apply, ...) hold raw,
+ * untraced locals, but none of them reads a heap pointer after the Scheme
+ * code it called returns -- the same invariant the collector already needs.
+ */
+static uintptr_t hop_stack_base = 0;
+
+#define hop_read_sp(out) __asm__ volatile("mov %0, sp" : "=r"(out))
+
+__attribute__((noinline)) hop_value hop_run(hop_value (*entry)(void)) {
+    hop_stack_base = (uintptr_t)__builtin_frame_address(0) + 16;
+    return entry();
+}
+
+__attribute__((noreturn)) static void hop_continuation_resume(hop_value *cont);
+
+__attribute__((noinline)) static hop_value hop_continuation_entry(hop_value env0, hop_value arg) {
+    hop_value *cont = (hop_value *)hop_untag_pointer(env0);
+    uintptr_t sp;
+    uintptr_t target = hop_cont_saved_sp(cont) - 512;
+    volatile uint8_t *pad = NULL;
+
+    hop_cont_value = arg;
+    /*
+     * The copy is restored over [saved_sp, base), which may include this
+     * very frame (the continuation is being re-entered from a shallower
+     * stack than it was captured on). Move sp safely below that region
+     * first, so the frame doing the copying is never overwritten by it.
+     */
+    hop_read_sp(sp);
+    if (sp > target) {
+        pad = __builtin_alloca(sp - target);
+        pad[0] = 0;
+    }
+    hop_continuation_resume(cont);
+}
+
+__attribute__((noinline, noreturn)) static void hop_continuation_resume(hop_value *cont) {
+    memcpy((void *)hop_cont_saved_sp(cont), hop_cont_stack(cont), hop_cont_stack_bytes(cont));
+    hop_gc_top_frame = hop_cont_saved_top_frame(cont);
+    _longjmp(*hop_cont_jmpbuf(cont), 1);
+}
+
+hop_value hop_callcc(hop_value f) {
+    hop_value roots[1];
+    hop_value *cont;
+    hop_value *closure;
+    uintptr_t sp;
+    size_t stack_bytes;
+    size_t cont_words;
+
+    if (!hop_stack_base) {
+        hop_panic("call/cc: compiled code was not entered through hop_run");
+    }
+    hop_read_sp(sp);
+    stack_bytes = (size_t)(hop_stack_base - sp);
+    cont_words = HOP_CONT_HEADER_WORDS + (stack_bytes + sizeof(hop_value) - 1) / sizeof(hop_value);
+
+    /*
+     * Allocate the continuation and the closure wrapping it in one go,
+     * *before* taking the copy: the allocation is a safepoint, and a
+     * collection rewrites root slots on the live stack that the copy must
+     * reflect. Nothing allocates between the copy and handing k to f.
+     */
+    roots[0] = f;
+    cont = hop_alloc_words(cont_words + 4, roots, 1);
+    f = roots[0];
+    closure = cont + cont_words;
+
+    cont[0] = (hop_value)hop_make_header(HOP_OBJ_CONTINUATION, (hop_word)cont_words);
+    cont[1] = (hop_value)sp;
+    cont[2] = (hop_value)(uintptr_t)hop_gc_top_frame;
+    cont[3] = (hop_value)stack_bytes;
+    closure[0] = (hop_value)hop_make_header(HOP_OBJ_CLOSURE, 1);
+    closure[1] = (hop_value)(uintptr_t)hop_continuation_entry;
+    closure[2] = hop_tag_pointer(cont, HOP_CONT_TAG);
+    closure[3] = (hop_value)1;
+
+    if (_setjmp(*hop_cont_jmpbuf(cont)) != 0) {
+        /* Resumed by hop_continuation_resume: every local here may be
+         * stale (the copy predates any later collection), so only the
+         * rooted hand-off value is read. */
+        return hop_cont_value;
+    }
+    memcpy(hop_cont_stack(cont), (void *)sp, stack_bytes);
+    return hop_call_1(hop_tag_pointer(closure, HOP_CLOSURE_TAG), f);
 }

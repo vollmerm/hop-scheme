@@ -103,6 +103,10 @@
            (wrap-let-bindings
             (append op-bindings arg-bindings)
             `(closure-apply ,simple-op ,@simple-args))))
+        ((closure-callcc)
+         (let-values (((op-bindings simple-op)
+                       (normalize-simple (cadr expr))))
+           (wrap-let-bindings op-bindings `(closure-callcc ,simple-op))))
         ((self-tail-call)
          (let-values (((arg-bindings simple-args)
                        (normalize-simple-list (cdr expr))))
@@ -149,6 +153,15 @@
       (error "Invalid expression in CFA normalization" expr))))
 
   (normalize expr))
+
+;; The abstract value of every continuation call/cc creates. It is never a
+;; key in the procedures table, so a flow set containing it can never be
+;; resolved to a single known procedure by rewrite-known-calls: a call
+;; through a continuation always stays an indirect call into the runtime
+;; (hop_callcc's closure code is a C function, not a compiled procedure).
+;; Its proc-results entry collects every value passed to any continuation,
+;; since each such value "returns" from some (callcc ...) expression.
+(define continuation-marker '%continuation)
 
 (define (run-0cfa expr)
   (define procedures (make-hash-table))
@@ -215,7 +228,7 @@
                                   (body->expr (cddr lambda-expr))))
            (collect-procedures (body->expr (cddr lambda-expr)))
            (for-each collect-procedures captures)))
-        ((closure-call known-call self-tail-call closure-apply)
+        ((closure-call known-call self-tail-call closure-apply closure-callcc)
          (for-each collect-procedures (cdr expr)))
         ((group-tail-call)
          (for-each collect-procedures (cddr expr)))
@@ -301,16 +314,19 @@
                                (cddr expr))))
            (for-each
             (lambda (proc-name)
-              (let* ((meta (hash-table-ref/default procedures proc-name #f))
-                     (capture-count (car meta))
-                     (params (cadr meta))
-                     (actual-params (list-tail (params-fixed params) capture-count)))
-                (let loop ((param-rest actual-params) (arg-rest arg-sets))
-                  (if (or (null? param-rest) (null? arg-rest))
-                      'done
-                      (begin
-                        (add-flow! var-flow (car param-rest) (car arg-rest))
-                        (loop (cdr param-rest) (cdr arg-rest)))))))
+              (if (eq? proc-name continuation-marker)
+                  (if (pair? arg-sets)
+                      (add-flow! proc-results continuation-marker (car arg-sets)))
+                  (let* ((meta (hash-table-ref/default procedures proc-name #f))
+                         (capture-count (car meta))
+                         (params (cadr meta))
+                         (actual-params (list-tail (params-fixed params) capture-count)))
+                    (let loop ((param-rest actual-params) (arg-rest arg-sets))
+                      (if (or (null? param-rest) (null? arg-rest))
+                          'done
+                          (begin
+                            (add-flow! var-flow (car param-rest) (car arg-rest))
+                            (loop (cdr param-rest) (cdr arg-rest))))))))
             proc-set)
            (let loop ((rest proc-set) (result '()))
              (if (null? rest)
@@ -330,6 +346,26 @@
            (analyze-expr (cadr expr) current-proc)
            (for-each (lambda (a) (analyze-expr a current-proc)) (cddr expr))
            '()))
+        ((closure-callcc)
+         ;; Every procedure call/cc might invoke receives a continuation as
+         ;; its (first) argument; the whole expression yields either what
+         ;; that procedure returns or whatever any continuation is later
+         ;; called with.
+         (let ((proc-set (analyze-expr (cadr expr) current-proc)))
+           (for-each
+            (lambda (proc-name)
+              (let ((meta (hash-table-ref/default procedures proc-name #f)))
+                (if meta
+                    (let ((actual-params (list-tail (params-fixed (cadr meta)) (car meta))))
+                      (if (pair? actual-params)
+                          (add-flow! var-flow (car actual-params) (list continuation-marker)))))))
+            proc-set)
+           (let loop ((rest proc-set)
+                      (result (flow-ref proc-results continuation-marker)))
+             (if (null? rest)
+                 result
+                 (loop (cdr rest)
+                       (set-union result (flow-ref proc-results (car rest))))))))
         ((self-tail-call)
          (let ((meta (and current-proc (hash-table-ref/default procedures current-proc #f))))
            (if (not meta)
@@ -518,6 +554,8 @@
                         ,@(map rewrite (cdr (cddddr expr)))))
           ((closure-apply)
            `(closure-apply ,(rewrite (cadr expr)) ,@(map rewrite (cddr expr))))
+          ((closure-callcc)
+           `(closure-callcc ,(rewrite (cadr expr))))
           ((self-tail-call)
            `(self-tail-call ,@(map rewrite (cdr expr))))
           ((group-tail-call)

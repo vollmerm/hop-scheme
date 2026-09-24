@@ -38,7 +38,7 @@
       (case (car expr)
         ((begin)
          (all (lambda (e) (letrec-init-safe? e group-names)) (cdr expr)))
-        ((primop app apply)
+        ((primop app apply callcc)
          (all (lambda (e) (letrec-init-safe? e group-names)) (cdr expr)))
         ((if)
          (and (letrec-init-safe? (cadr expr) group-names)
@@ -176,6 +176,8 @@
         ((apply)
          `(apply ,(rewrite (cadr expr) env)
                  ,@(map (lambda (e) (rewrite e env)) (cddr expr))))
+        ((callcc)
+         `(callcc ,(rewrite (cadr expr) env)))
         ((cons make-vector vector-ref)
          `(,(car expr) ,(rewrite (cadr expr) env)
            ,(rewrite (caddr expr) env)))
@@ -268,7 +270,7 @@
                            (tail-recursion-safe? arg group-names #f))
                          args)))))
 
-        ((apply)
+        ((apply callcc)
          (all (lambda (e) (tail-recursion-safe? e group-names #f)) (cdr expr)))
 
         ((cons set-box!)
@@ -334,7 +336,7 @@
                                    (collect body-expr new-bound))
                                  (cddr expr)))))
 
-          ((app apply)
+          ((app apply callcc)
            (append-map (lambda (e) (collect e bound)) (cdr expr)))
 
           ((set-box!)
@@ -416,7 +418,7 @@
                                  (tail-call-targets arg group-names #f))
                                args))))
 
-        ((apply)
+        ((apply callcc)
          (append-map (lambda (e) (tail-call-targets e group-names #f)) (cdr expr)))
 
         ((set-box!)
@@ -516,7 +518,7 @@
                     #t
                     (group-entry-safe? rator group-names))
                 (all (lambda (arg) (group-entry-safe? arg group-names)) args))))
-        ((apply)
+        ((apply callcc)
          (all (lambda (e) (group-entry-safe? e group-names)) (cdr expr)))
 
         ((set-box!)
@@ -637,6 +639,9 @@
         ((apply)
          `(apply ,(rewrite (cadr expr) env current-group #f)
                  ,@(map (lambda (e) (rewrite e env current-group #f)) (cddr expr))))
+
+        ((callcc)
+         `(callcc ,(rewrite (cadr expr) env current-group #f)))
 
         ((cons)
          (error "cons in desugar-letrec: should have been canonicalized" expr))

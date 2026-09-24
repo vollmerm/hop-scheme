@@ -866,6 +866,84 @@
         (+ (app g 2 3 4)
            (app h 20 5 3 2)))))
 
+;; --- call/cc ---------------------------------------------------------------
+
+;; Upward escape: k abandons the pending (+ 10 ...) inside the receiver.
+(define test106
+  '(+ 1 (call/cc (lambda (k) (+ 10 (k 41))))))
+
+;; A receiver that never uses k returns normally through call/cc.
+(define test107
+  '(call/cc (lambda (k) (+ 3 4))))
+
+;; Early exit from several compiled frames deep in a recursive search.
+(define test108
+  '(program
+     (define (find-first pred xs)
+       (call/cc
+        (lambda (return)
+          (letrec ((walk (lambda (ys)
+                           (if (null? ys)
+                               #f
+                               (begin
+                                 (if (pred (car ys)) (return (car ys)) #f)
+                                 (walk (cdr ys)))))))
+            (walk xs)))))
+     (find-first (lambda (x) (> x 3)) '(1 2 3 4 5))))
+
+;; Re-entry after the capturing call/cc has already returned: v takes the
+;; values 0, 10, 20 on successive passes, then 20 + 3.
+(define test109
+  '(let ((saved (box #f)) (count (box 0)))
+     (let ((v (call/cc (lambda (k) (set-box! saved k) 0))))
+       (set-box! count (+ (unbox count) 1))
+       (if (< (unbox count) 3)
+           ((unbox saved) (+ v 10))
+           (+ v (unbox count))))))
+
+;; Re-entry from a much shallower stack, with heap pointers live in the
+;; captured frames and enough allocation between passes (run with a small
+;; heap) that the collector must trace and update the stack copy. Each of
+;; the 11 copied deep frames adds (car acc) after returning: 100 + 2..10
+;; = 154, plus the value 1 passed back in on the final pass.
+(define test110
+  '(program
+     (define saved (box #f))
+     (define count (box 0))
+     (define (deep n acc)
+       (if (= n 0)
+           (call/cc (lambda (k) (set-box! saved k) 0))
+           (+ (car acc) (deep (- n 1) (cons n acc)))))
+     (define (churn n acc) (if (= n 0) acc (churn (- n 1) (cons n acc))))
+     (let ((r (deep 10 (cons 100 '()))))
+       (set-box! count (+ (unbox count) 1))
+       (let ((junk (churn 60 '())))
+         (if (< (unbox count) 4)
+             ((unbox saved) (car junk))
+             r)))))
+
+;; call/cc as a first-class value.
+(define test111
+  '(let ((cc call/cc)) (+ 1 (cc (lambda (k) (k 6))))))
+
+;; call/cc in tail position of a self-tail loop captures the loop's
+;; caller's continuation.
+(define test112
+  '(program
+     (define (loop n acc)
+       (if (= n 0)
+           (call-with-current-continuation (lambda (k) (+ acc (k acc))))
+           (loop (- n 1) (+ acc n))))
+     (loop 10 0)))
+
+;; 0CFA soundness: use's parameter receives both a known lambda and a
+;; continuation, so (k 1) must stay an indirect call. Treating it as a
+;; known call to the lambda would silently produce 202.
+(define test113
+  '(program
+     (define (use k) (k 1))
+     (+ (use (lambda (x) (+ x 100))) (call/cc use))))
+
 (define sample-tests
   (list (cons "Test 1: Simple arithmetic" test1)
         (cons "Test 2: Lambda application" test2)
@@ -970,7 +1048,15 @@
         (cons "Test 102: first-class apply of + with leading fixed args" test102)
         (cons "Test 103: first-class apply of *" test103)
         (cons "Test 104: first-class apply of -" test104)
-        (cons "Test 105: higher-order passing of +, *, and -" test105)))
+        (cons "Test 105: higher-order passing of +, *, and -" test105)
+        (cons "Test 106: call/cc upward escape" test106)
+        (cons "Test 107: call/cc normal return" test107)
+        (cons "Test 108: call/cc early exit from recursive search" test108)
+        (cons "Test 109: call/cc re-entry after return" test109)
+        (cons "Test 110: call/cc re-entry with GC over the stack copy" test110)
+        (cons "Test 111: first-class call/cc" test111)
+        (cons "Test 112: call/cc in tail position" test112)
+        (cons "Test 113: continuation flow in 0CFA" test113)))
 
 (define named-tests
   ;; These are runnable end-to-end regression cases. test6 and test7 stay as
@@ -1076,7 +1162,15 @@
          (cons 'test102 test102)
          (cons 'test103 test103)
          (cons 'test104 test104)
-         (cons 'test105 test105)))
+         (cons 'test105 test105)
+         (cons 'test106 test106)
+         (cons 'test107 test107)
+         (cons 'test108 test108)
+         (cons 'test109 test109)
+         (cons 'test110 test110)
+         (cons 'test111 test111)
+         (cons 'test112 test112)
+         (cons 'test113 test113)))
 
 (define (lookup-named-test name)
   (let ((binding (assoc name named-tests)))

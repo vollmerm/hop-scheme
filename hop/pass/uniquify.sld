@@ -119,6 +119,9 @@
          `(apply ,(uniquify-expr (cadr expr) env)
                  ,@(map (lambda (e) (uniquify-expr e env)) (cddr expr))))
 
+        ((callcc)
+         `(callcc ,(uniquify-expr (cadr expr) env)))
+
         ((cons make-vector vector-ref)
          `(,(car expr) ,(uniquify-expr (cadr expr) env)
            ,(uniquify-expr (caddr expr) env)))
@@ -253,6 +256,9 @@
         ((+) (make-variadic-add-wrapper))
         ((*) (make-variadic-mul-wrapper))
         ((-) (make-variadic-sub-wrapper))
+        ((call/cc call-with-current-continuation)
+         (let ((f (fresh-wrap-name)))
+           `(lambda (,f) (callcc ,f))))
         (else
          (if (builtin-primop? expr)
              (make-wrap-lambda expr (builtin-primop-arity expr))
@@ -280,6 +286,7 @@
                   ,@(map canon (cddr expr))))
               ((app)      `(app ,(canon (cadr expr)) ,@(map canon (cddr expr))))
               ((apply)    `(apply ,(canon (cadr expr)) ,@(map canon (cddr expr))))
+              ((callcc)   `(callcc ,(canon (cadr expr))))
               ((box)      `(box ,(canon (cadr expr))))
               ((unbox)    `(unbox ,(canon (cadr expr))))
               ((set-box!) `(set-box! ,(canon (cadr expr)) ,(canon (caddr expr))))

@@ -32,7 +32,7 @@ static void hop_format_value(char *buffer, size_t size, hop_value value) {
 }
 
 int main(int argc, char **argv) {
-    hop_value result = scheme_entry();
+    hop_value result = hop_run(scheme_entry);
     char rendered[64];
 
     hop_format_value(rendered, sizeof(rendered), result);

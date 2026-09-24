@@ -87,7 +87,8 @@
     ;; (closure, leading-list, list-arg), well under the register budget --
     ;; no stack args needed regardless of how many leading args or how long
     ;; the spread list is, since both were already consed into ordinary
-    ;; list values before the call (see (hop pass tac)).
+    ;; list values before the call (see (hop pass tac)). call-callcc and
+    ;; tail-call-callcc likewise carry exactly 1 operand (the procedure).
     ((alloc-closure)
      ;; emit-alloc-closure writes captures to the same [sp, #...] outgoing
      ;; area as call argument spilling whenever it takes the general (>3
@@ -156,6 +157,8 @@
       (list `(call-known ,dst ,@(cdr rhs))))
      ((and (pair? rhs) (eq? (car rhs) 'apply-call))
       (list `(call-apply ,dst ,@(cdr rhs))))
+     ((and (pair? rhs) (eq? (car rhs) 'callcc-call))
+      (list `(call-callcc ,dst ,@(cdr rhs))))
      (else
       (error "Unknown assignment rhs during instruction selection" rhs))))
   (cond
@@ -178,6 +181,8 @@
     (list `(tail-call-known ,@(cdr instr))))
    ((eq? (car instr) 'tail-apply-call)
     (list `(tail-call-apply ,@(cdr instr))))
+   ((eq? (car instr) 'tail-callcc-call)
+    (list `(tail-call-callcc ,@(cdr instr))))
    ((eq? (car instr) 'set-box!)
     (list `(store-box ,(cadr instr) ,(caddr instr))))
    ((eq? (car instr) 'set-global!)
@@ -306,9 +311,10 @@
                  (if (symbol? (car rest))
                      (cons (car rest) result)
                      result)))))
-    ((call-apply)
+    ((call-apply call-callcc)
      ;; (call-apply dst closure leading-list list-arg) -- all three operands
-     ;; are used, dst is a def handled separately below.
+     ;; are used, dst is a def handled separately below; (call-callcc dst
+     ;; proc) has the same shape with a single operand.
      (let loop ((rest (cddr instr)) (result '()))
        (if (null? rest)
            (reverse result)
@@ -316,8 +322,8 @@
                  (if (symbol? (car rest))
                      (cons (car rest) result)
                      result)))))
-    ((tail-call-apply)
-     ;; (tail-call-apply closure leading-list list-arg)
+    ((tail-call-apply tail-call-callcc)
+     ;; (tail-call-apply closure leading-list list-arg) / (tail-call-callcc proc)
      (let loop ((rest (cdr instr)) (result '()))
        (if (null? rest)
            (reverse result)
@@ -336,11 +342,12 @@
              unsafe-load-car unsafe-load-cdr is-pair is-null is-symbol is-vector
              vector-length vector-ref vector-set!
              load-closure-env load-global alloc-closure alloc-closure-variadic
-             call call-known call-apply)
+             call call-known call-apply call-callcc)
       (list (cadr instr)))
     ((binop safe-binop)
       (list (caddr instr)))
-    ((store-box store-global branch-if jump ret tail-call tail-call-known tail-call-apply) '())
+    ((store-box store-global branch-if jump ret tail-call tail-call-known tail-call-apply
+      tail-call-callcc) '())
     (else (error "Unknown machine instruction in def analysis" instr))))
 
 (define (machine-instr-bias-source instr)
@@ -770,10 +777,10 @@
                   ,(caddr instr)
                   ,@(map (lambda (operand) (lookup-home homes operand))
                          (cdddr instr))))
-    ((call-apply)
-     `(call-apply ,(lookup-home homes (cadr instr))
-                  ,@(map (lambda (operand) (lookup-home homes operand))
-                         (cddr instr))))
+    ((call-apply call-callcc)
+     `(,(car instr) ,(lookup-home homes (cadr instr))
+                    ,@(map (lambda (operand) (lookup-home homes operand))
+                           (cddr instr))))
     ((tail-call)
      `(tail-call ,(lookup-home homes (cadr instr))
                  ,@(map (lambda (operand) (lookup-home homes operand))
@@ -782,9 +789,9 @@
      `(tail-call-known ,(cadr instr)
                        ,@(map (lambda (operand) (lookup-home homes operand))
                               (cddr instr))))
-    ((tail-call-apply)
-     `(tail-call-apply ,@(map (lambda (operand) (lookup-home homes operand))
-                              (cdr instr))))
+    ((tail-call-apply tail-call-callcc)
+     `(,(car instr) ,@(map (lambda (operand) (lookup-home homes operand))
+                           (cdr instr))))
     ((branch-if)
      `(branch-if ,(lookup-home homes (cadr instr))
                  ,(caddr instr)
@@ -802,7 +809,7 @@
   ;; jump executes, so there is nothing in this frame left to sync.
   (memq (car instr)
         '(alloc-box alloc-pair alloc-vector alloc-closure alloc-closure-variadic
-          call call-known call-apply)))
+          call call-known call-apply call-callcc)))
 
 (define (register-operand? operand)
   (and (pair? operand)
@@ -1010,6 +1017,25 @@
                      `(restore-callee-saved ,saved-registers)
                      `(deallocate-frame ,stack-size)
                      '(tail-call-label hop_apply)))))
+    ;; call/cc is an ordinary 1-argument call to the fixed runtime entry
+    ;; point hop_callcc (see runtime.c's "Continuations"). Being a
+    ;; safepoint, every live value is already synced to its root slot
+    ;; before the call and reloaded after it -- which is exactly what
+    ;; makes a later re-entry through the captured continuation (which
+    ;; "returns" from this same call again) read correct values.
+    ((call-callcc)
+     (let ((dst (cadr instr))
+           (args (cddr instr)))
+       (append (lower-arg-moves args)
+               (list '(call-label hop_callcc)
+                     `(move ,dst (arg-register ,aarch64-return-register))))))
+    ((tail-call-callcc)
+     (let ((args (cdr instr)))
+       (append (lower-arg-moves args)
+               (list '(gc-pop-frame)
+                     `(restore-callee-saved ,saved-registers)
+                     `(deallocate-frame ,stack-size)
+                     '(tail-call-label hop_callcc)))))
     ((ret)
      (list `(move-out (arg-register ,aarch64-return-register) ,(cadr instr))
            '(gc-pop-frame)

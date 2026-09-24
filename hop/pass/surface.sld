@@ -30,7 +30,8 @@
   '(quote begin if lambda let let* letrec
     cond case and or when unless not
     define set! quasiquote unquote unquote-splicing
-    primop app apply global set-global!
+    primop app apply callcc call/cc call-with-current-continuation
+    global set-global!
     box unbox set-box!
     cons car cdr pair? null? symbol? eq?
     make-vector vector-length vector-ref vector-set! vector?
@@ -313,6 +314,16 @@
          (if (< (length (cdr expr)) 2)
              (error "apply requires a procedure and at least a list argument" expr)
              `(apply ,@(map desugar-expr (cdr expr)))))
+
+        ;; call/cc is a core form rather than an ordinary builtin procedure
+        ;; because capturing a continuation is a runtime call with no
+        ;; procedure of its own to call through (see hop_callcc). A bare
+        ;; call/cc in value position is instead wrapped as a lambda by
+        ;; (hop pass uniquify)'s canonicalize-builtins.
+        ((callcc call/cc call-with-current-continuation)
+         (if (not (= (length (cdr expr)) 1))
+             (error "call/cc requires exactly one procedure argument" expr)
+             `(callcc ,(desugar-expr (cadr expr)))))
 
         ((global)
          expr)
