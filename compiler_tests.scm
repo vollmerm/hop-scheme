@@ -944,6 +944,57 @@
      (define (use k) (k 1))
      (+ (use (lambda (x) (+ x 100))) (call/cc use))))
 
+;; --- 0CFA soundness ----------------------------------------------------------
+;; In each program app1's parameter g receives one closure 0CFA can see
+;; directly plus one it can't follow. Resolving (g 1) to the visible lambda
+;; would silently yield 202 (or the wrong box contents) instead of the right
+;; answer.
+
+;; A closure reaching g through apply.
+(define test114
+  '(program
+     (define (app1 g) (g 1))
+     (+ (app1 (lambda (x) (+ x 100)))
+        (apply app1 (cons (lambda (x) (+ x 1000)) '())))))
+
+;; A closure stored in a pair and read back out.
+(define test115
+  '(program
+     (define (app1 g) (g 1))
+     (+ (app1 (lambda (x) (+ x 100)))
+        (app1 (car (cons (lambda (x) (+ x 1000)) '()))))))
+
+;; A closure stored in a vector and read back out.
+(define test116
+  '(program
+     (define (app1 g) (g 1))
+     (define v (make-vector 1 (lambda (x) (+ x 1000))))
+     (+ (app1 (lambda (x) (+ x 100))) (app1 (vector-ref v 0)))))
+
+;; A box's initial contents count, not only what set-box! stores.
+(define test117
+  '(let ((b (box (lambda (x) (+ x 1)))))
+     (if (= 1 2) (set-box! b (lambda (x) (+ x 100))) #f)
+     ((unbox b) 1)))
+
+;; A store through an alias of a box is a store to the same box.
+(define test118
+  '(let ((b (box #f)))
+     (set-box! b (lambda (x) (+ x 1)))
+     (let ((b2 b)) (set-box! b2 (lambda (x) (+ x 100))))
+     ((unbox b) 1)))
+
+;; Calls made inside mutually recursive letrec members (a group-closures
+;; cluster) still flow into their targets' parameters.
+(define test119
+  '(program
+     (define (app1 g) (g 1))
+     (define (f)
+       (letrec ((ev (lambda (n) (if (= n 0) (app1 (lambda (x) (+ x 1000))) (od (- n 1)))))
+                (od (lambda (n) (if (= n 0) 0 (ev (- n 1))))))
+         (ev 2)))
+     (+ (app1 (lambda (x) (+ x 100))) (f))))
+
 (define sample-tests
   (list (cons "Test 1: Simple arithmetic" test1)
         (cons "Test 2: Lambda application" test2)
@@ -1056,7 +1107,13 @@
         (cons "Test 110: call/cc re-entry with GC over the stack copy" test110)
         (cons "Test 111: first-class call/cc" test111)
         (cons "Test 112: call/cc in tail position" test112)
-        (cons "Test 113: continuation flow in 0CFA" test113)))
+        (cons "Test 113: continuation flow in 0CFA" test113)
+        (cons "Test 114: 0CFA closure escaping through apply" test114)
+        (cons "Test 115: 0CFA closure escaping through a pair" test115)
+        (cons "Test 116: 0CFA closure escaping through a vector" test116)
+        (cons "Test 117: 0CFA box initial contents" test117)
+        (cons "Test 118: 0CFA box aliasing" test118)
+        (cons "Test 119: 0CFA flows inside letrec group members" test119)))
 
 (define named-tests
   ;; These are runnable end-to-end regression cases. test6 and test7 stay as
@@ -1170,7 +1227,13 @@
          (cons 'test110 test110)
          (cons 'test111 test111)
          (cons 'test112 test112)
-         (cons 'test113 test113)))
+         (cons 'test113 test113)
+         (cons 'test114 test114)
+         (cons 'test115 test115)
+         (cons 'test116 test116)
+         (cons 'test117 test117)
+         (cons 'test118 test118)
+         (cons 'test119 test119)))
 
 (define (lookup-named-test name)
   (let ((binding (assoc name named-tests)))

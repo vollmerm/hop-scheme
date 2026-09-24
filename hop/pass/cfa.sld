@@ -154,25 +154,52 @@
 
   (normalize expr))
 
-;; The abstract value of every continuation call/cc creates. It is never a
-;; key in the procedures table, so a flow set containing it can never be
-;; resolved to a single known procedure by rewrite-known-calls: a call
-;; through a continuation always stays an indirect call into the runtime
-;; (hop_callcc's closure code is a C function, not a compiled procedure).
-;; Its proc-results entry collects every value passed to any continuation,
-;; since each such value "returns" from some (callcc ...) expression.
-(define continuation-marker '%continuation)
+;;; ── 0CFA ─────────────────────────────────────────────────────────────────
+;;;
+;;; Flow sets over-approximate which closures and boxes an expression may
+;;; evaluate to. Their elements are:
+;;;
+;;;   - a procedure name (cfa.proc.N): a closure made by that make-closure;
+;;;   - a box site (%box.N): a box made by that (box ...) expression;
+;;;   - unknown-value: any value the analysis cannot see into -- one read
+;;;     out of a pair or vector, returned by code in another unit, handed
+;;;     to a procedure by the runtime (apply, call/cc), and so on.
+;;;
+;;; Non-closure, non-box values are not tracked at all, so an empty set means
+;;; "definitely not a closure or box" -- which is why every source of values
+;;; the analysis can't follow must contribute unknown-value rather than
+;;; nothing. A set containing unknown-value can never resolve to a single
+;;; known procedure in rewrite-known-calls.
+;;;
+;;; The converse direction matters just as much: a closure that *escapes*
+;;; into code the analysis can't see (stored in a pair or vector, passed to
+;;; an unknown callee or through apply, stored in an exported global) can be
+;;; called from there with arbitrary arguments, so escape! gives each of its
+;;; parameters unknown-value -- and whatever it returns escapes too. An
+;;; escaped box can likewise be filled with anything, and its contents
+;;; escape.
 
-(define (run-0cfa expr)
+(define unknown-value '%unknown)
+
+;; exported-globals: the global labels another compilation unit can read (a
+;; library's exports); whatever is stored in one escapes. '() for a
+;; standalone program.
+(define (run-0cfa expr . maybe-exported-globals)
+  (define exported-globals
+    (if (pair? maybe-exported-globals) (car maybe-exported-globals) '()))
   (define procedures (make-hash-table))
   (define var-flow (make-hash-table))
-  (define box-flow (make-hash-table))
+  (define box-contents (make-hash-table))
   (define global-flow (make-hash-table))
   (define proc-results (make-hash-table))
+  (define defined-globals (make-hash-table))
+  (define escaped (make-hash-table))
+  ;; (box ...) expression (compared with eq?) -> its site name. The same
+  ;; expression objects are re-analyzed on every iteration, so each keeps
+  ;; one stable site.
+  (define box-sites (make-hash-table eq?))
+  (define box-site-count 0)
   (define changed #f)
-
-  (define (table-keys table)
-    (hash-table-keys table))
 
   (define (flow-ref table key)
     (let ((value (hash-table-ref/default table key #f)))
@@ -190,14 +217,80 @@
                 (set! changed #t)
                 #t)))))
 
-  (define (repr-name expr)
-    (cond
-     ((symbol? expr) expr)
-     ((and (pair? expr) (memq (car expr) '(local closure))) (cadr expr))
-     (else #f)))
+  (define (box-site-for expr)
+    (or (hash-table-ref/default box-sites expr #f)
+        (begin
+          (set! box-site-count (+ box-site-count 1))
+          (let ((site (string->symbol
+                       (string-append "%box." (number->string box-site-count)))))
+            (hash-table-set! box-sites expr site)
+            (hash-table-set! box-contents site '())
+            site))))
 
-  (define (box-key expr)
-    (repr-name expr))
+  (define (box-site? value)
+    (hash-table-exists? box-contents value))
+
+  (define (take-n lst n)
+    (if (= n 0) '() (cons (car lst) (take-n (cdr lst) (- n 1)))))
+
+  (define (procedure-meta value)
+    (hash-table-ref/default procedures value #f))
+
+  ;; A procedure's own (non-capture) fixed parameters. A variadic
+  ;; procedure's rest parameter is not included: it only ever holds a
+  ;; freshly consed list, never a closure or box.
+  (define (actual-params meta)
+    (list-tail (params-fixed (cadr meta)) (car meta)))
+
+  (define (escape! values)
+    (for-each
+     (lambda (value)
+       (if (not (hash-table-ref/default escaped value #f))
+           (cond
+            ((procedure-meta value)
+             => (lambda (meta)
+                  (hash-table-set! escaped value #t)
+                  (set! changed #t)
+                  (for-each (lambda (param)
+                              (add-flow! var-flow param (list unknown-value)))
+                            (actual-params meta))))
+            ((box-site? value)
+             (hash-table-set! escaped value #t)
+             (set! changed #t)
+             (add-flow! box-contents value (list unknown-value))))))
+     values))
+
+  ;; Flows arg-sets into every possible target's parameters and returns the
+  ;; union of what those targets may return. A target that isn't a known
+  ;; procedure (unknown-value, a continuation, a letrec group member) can do
+  ;; anything with its arguments, so they escape.
+  (define (flow-into-call! target-set arg-sets)
+    (let loop ((rest target-set) (result '()))
+      (if (null? rest)
+          result
+          (let ((meta (procedure-meta (car rest))))
+            (if meta
+                (begin
+                  (let zip ((params (actual-params meta)) (args arg-sets))
+                    (cond
+                     ((null? args) 'done)
+                     ;; Extra arguments land in a variadic procedure's rest
+                     ;; list -- a pair the analysis doesn't look into.
+                     ((null? params) (for-each escape! args))
+                     (else
+                      (add-flow! var-flow (car params) (car args))
+                      (zip (cdr params) (cdr args)))))
+                  (loop (cdr rest)
+                        (set-union result (flow-ref proc-results (car rest)))))
+                (begin
+                  (for-each escape! arg-sets)
+                  (loop (cdr rest) (set-union result (list unknown-value)))))))))
+
+  ;; Primops that can neither store their arguments anywhere nor produce a
+  ;; closure or box.
+  (define closure-free-primops
+    '(pair? null? symbol? vector? eq? vector-length
+      + - * = < > safe-+ safe-- safe-* safe-= safe-< safe->))
 
   (define (collect-procedures expr)
     (cond
@@ -242,6 +335,9 @@
         ((box unbox)
          (collect-procedures (cadr expr)))
         ((set-global!)
+         ;; A global this unit never stores to is defined by another unit,
+         ;; so reading it yields unknown-value (see analyze-expr's global).
+         (hash-table-set! defined-globals (cadr expr) #t)
          (collect-procedures (caddr expr)))
         ((local closure global) 'done)
         (else
@@ -249,9 +345,8 @@
      (else
       (error "Invalid expression while collecting CFA procedures" expr))))
 
-  (collect-procedures expr)
-
   (define (analyze-expr expr current-proc)
+    (define (analyze e) (analyze-expr e current-proc))
     (cond
      ((literal-expr? expr) '())
      ((symbol? expr) (flow-ref var-flow expr))
@@ -260,199 +355,186 @@
         ((local closure)
          (flow-ref var-flow (cadr expr)))
         ((global)
-         (flow-ref global-flow (cadr expr)))
+         (let ((label (cadr expr)))
+           (if (not (hash-table-ref/default defined-globals label #f))
+               (add-flow! global-flow label (list unknown-value)))
+           (flow-ref global-flow label)))
         ((begin)
          (let loop ((rest (cdr expr)) (last '()))
            (if (null? rest)
                last
-               (loop (cdr rest)
-                     (analyze-expr (car rest) current-proc)))))
+               (loop (cdr rest) (analyze (car rest))))))
         ((primop)
-         (begin
-           (for-each (lambda (subexpr)
-                       (analyze-expr subexpr current-proc))
-                     (cdr expr))
-           '()))
+         (let ((op (cadr expr))
+               (arg-sets (map analyze (cddr expr))))
+           (cond
+            ((memq op closure-free-primops) '())
+            ((memq op '(car cdr unsafe-car unsafe-cdr vector-ref))
+             (list unknown-value))
+            ((memq op '(cons make-vector vector-set!))
+             (for-each escape! arg-sets)
+             '())
+            (else
+             (for-each escape! arg-sets)
+             (list unknown-value)))))
         ((if)
-         (begin
-           (analyze-expr (cadr expr) current-proc)
-           (set-union (analyze-expr (caddr expr) current-proc)
-                      (analyze-expr (cadddr expr) current-proc))))
+         (analyze (cadr expr))
+         (set-union (analyze (caddr expr))
+                    (analyze (cadddr expr))))
         ((let)
          (for-each (lambda (binding)
-                     (let ((var (car binding))
-                           (value-set (analyze-expr (cadr binding) current-proc)))
-                       (add-flow! var-flow var value-set)))
+                     (add-flow! var-flow (car binding) (analyze (cadr binding))))
                    (cadr expr))
-         (analyze-expr (body->expr (cddr expr)) current-proc))
+         (analyze (body->expr (cddr expr))))
         ((make-closure)
          (let* ((proc-name (cadr expr))
-                (meta (hash-table-ref/default procedures proc-name #f))
-                (capture-count (car meta))
-                (params (cadr meta))
-                (captures (cdddr expr))
-                (env-params
-                 (let loop ((rest (params-fixed params)) (remaining capture-count) (result '()))
-                   (if (= remaining 0)
-                       (reverse result)
-                       (loop (cdr rest)
-                             (- remaining 1)
-                             (cons (car rest) result))))))
-           (let loop ((env-rest env-params) (capture-rest captures))
-             (if (or (null? env-rest) (null? capture-rest))
-                 'done
-                 (begin
-                   (add-flow! var-flow
-                              (car env-rest)
-                              (analyze-expr (car capture-rest) current-proc))
-                   (loop (cdr env-rest) (cdr capture-rest)))))
+                (meta (procedure-meta proc-name))
+                (env-params (take-n (params-fixed (cadr meta)) (car meta))))
+           (for-each (lambda (env-param capture)
+                       (add-flow! var-flow env-param (analyze capture)))
+                     env-params
+                     (cdddr expr))
            (list proc-name)))
         ((closure-call)
-         (let* ((proc-set (analyze-expr (cadr expr) current-proc))
-                (arg-sets (map (lambda (arg)
-                                 (analyze-expr arg current-proc))
-                               (cddr expr))))
-           (for-each
-            (lambda (proc-name)
-              (if (eq? proc-name continuation-marker)
-                  (if (pair? arg-sets)
-                      (add-flow! proc-results continuation-marker (car arg-sets)))
-                  (let* ((meta (hash-table-ref/default procedures proc-name #f))
-                         (capture-count (car meta))
-                         (params (cadr meta))
-                         (actual-params (list-tail (params-fixed params) capture-count)))
-                    (let loop ((param-rest actual-params) (arg-rest arg-sets))
-                      (if (or (null? param-rest) (null? arg-rest))
-                          'done
-                          (begin
-                            (add-flow! var-flow (car param-rest) (car arg-rest))
-                            (loop (cdr param-rest) (cdr arg-rest))))))))
-            proc-set)
-           (let loop ((rest proc-set) (result '()))
-             (if (null? rest)
-                 result
-                 (loop (cdr rest)
-                       (set-union result
-                                  (flow-ref proc-results (car rest))))))))
+         (let* ((target-set (analyze (cadr expr)))
+                (arg-sets (map analyze (cddr expr))))
+           (flow-into-call! target-set arg-sets)))
         ((closure-apply)
-         ;; The spread argument count is only known at runtime, so there is
-         ;; no sound way to zip argument flow-sets against a fixed params
-         ;; list here. Recurse for side effects (registering nested
-         ;; make-closures, propagating flow through subexpressions) but add
-         ;; no flow edges into any procedure's params, and contribute no
-         ;; value-flow of our own -- callers of apply's result are
-         ;; conservatively treated as flowing from an unknown source.
-         (begin
-           (analyze-expr (cadr expr) current-proc)
-           (for-each (lambda (a) (analyze-expr a current-proc)) (cddr expr))
-           '()))
-        ((closure-callcc)
-         ;; Every procedure call/cc might invoke receives a continuation as
-         ;; its (first) argument; the whole expression yields either what
-         ;; that procedure returns or whatever any continuation is later
-         ;; called with.
-         (let ((proc-set (analyze-expr (cadr expr) current-proc)))
-           (for-each
-            (lambda (proc-name)
-              (let ((meta (hash-table-ref/default procedures proc-name #f)))
-                (if meta
-                    (let ((actual-params (list-tail (params-fixed (cadr meta)) (car meta))))
-                      (if (pair? actual-params)
-                          (add-flow! var-flow (car actual-params) (list continuation-marker)))))))
-            proc-set)
-           (let loop ((rest proc-set)
-                      (result (flow-ref proc-results continuation-marker)))
+         ;; The spread argument count is only known at run time, so the
+         ;; arguments can't be matched up with parameters: every argument
+         ;; escapes, and every parameter of every possible target gets
+         ;; unknown-value.
+         (let* ((target-set (analyze (cadr expr)))
+                (arg-sets (map analyze (cddr expr))))
+           (for-each escape! arg-sets)
+           (let loop ((rest target-set) (result '()))
              (if (null? rest)
                  result
-                 (loop (cdr rest)
-                       (set-union result (flow-ref proc-results (car rest))))))))
-        ((self-tail-call)
-         (let ((meta (and current-proc (hash-table-ref/default procedures current-proc #f))))
-           (if (not meta)
-               '()
-               (let* ((capture-count (car meta))
-                      (params (cadr meta))
-                      (actual-params (list-tail (params-fixed params) capture-count))
-                      (actual-arg-sets
-                       (map (lambda (arg)
-                              (analyze-expr arg current-proc))
-                            (list-tail (cdr expr) capture-count))))
-                 (let loop ((param-rest actual-params) (arg-rest actual-arg-sets))
-                   (if (or (null? param-rest) (null? arg-rest))
-                       'done
+                 (let ((meta (procedure-meta (car rest))))
+                   (if meta
                        (begin
-                         (add-flow! var-flow (car param-rest) (car arg-rest))
-                         (loop (cdr param-rest) (cdr arg-rest)))))
-                 (flow-ref proc-results current-proc)))))
+                         (for-each (lambda (param)
+                                     (add-flow! var-flow param (list unknown-value)))
+                                   (actual-params meta))
+                         (loop (cdr rest)
+                               (set-union result (flow-ref proc-results (car rest)))))
+                       (loop (cdr rest) (set-union result (list unknown-value)))))))))
+        ((closure-callcc)
+         ;; The receiver is called with a continuation (a runtime closure:
+         ;; unknown-value) and call/cc yields either what the receiver
+         ;; returns or whatever any continuation is later called with --
+         ;; which, being a call to unknown-value, has already escaped.
+         (let ((target-set (analyze (cadr expr))))
+           (set-union (flow-into-call! target-set (list (list unknown-value)))
+                      (list unknown-value))))
+        ((self-tail-call)
+         (let ((meta (and current-proc (procedure-meta current-proc))))
+           (if meta
+               (flow-into-call! (list current-proc)
+                                (map analyze (list-tail (cdr expr) (car meta))))
+               (begin
+                 (for-each (lambda (arg) (escape! (analyze arg))) (cdr expr))
+                 (list unknown-value)))))
         ((group-tail-call)
-         (begin
-           (for-each (lambda (arg)
-                       (analyze-expr arg current-proc))
-                     (cddr expr))
-           '()))
+         ;; letrec group members aren't tracked procedures (see
+         ;; group-closures): calling one is like calling unknown-value.
+         (for-each (lambda (arg) (escape! (analyze arg))) (cddr expr))
+         (list unknown-value))
         ((group-closures)
-         (begin
-           (for-each (lambda (capture-spec)
-                       (analyze-expr (cadr capture-spec) current-proc))
-                     (caddr expr))
-           '()))
+         ;; (group-closures ((box-var member-name params body capture-names) ...)
+         ;;                 ((capture-param value) ...))
+         ;; Members become closures in a shared cluster procedure rather than
+         ;; entries in the procedures table, so they're modeled as
+         ;; unknown-value: their parameters can receive anything, whatever
+         ;; they return escapes, and the boxes they're stored into hold
+         ;; unknown-value. Their bodies are still analyzed, so flows inside
+         ;; them (closures they make, calls they perform) are not lost.
+         (for-each (lambda (capture-spec)
+                     (add-flow! var-flow (car capture-spec) (analyze (cadr capture-spec))))
+                   (caddr expr))
+         (for-each
+          (lambda (member)
+            (let ((box-var (car member))
+                  (params (caddr member))
+                  (body (cadddr member)))
+              (for-each (lambda (param)
+                          (add-flow! var-flow param (list unknown-value)))
+                        (params-names params))
+              (escape! (analyze-expr body #f))
+              (for-each (lambda (value)
+                          (if (box-site? value)
+                              (add-flow! box-contents value (list unknown-value))))
+                        (flow-ref var-flow box-var))))
+          (cadr expr))
+         '())
         ((box)
-         (begin
-           (analyze-expr (cadr expr) current-proc)
-           '()))
+         (let ((site (box-site-for expr)))
+           (add-flow! box-contents site (analyze (cadr expr)))
+           (list site)))
         ((unbox)
-         (let ((key (box-key (cadr expr))))
-           (analyze-expr (cadr expr) current-proc)
-           (if key
-               (flow-ref box-flow key)
-               '())))
+         (let loop ((rest (analyze (cadr expr))) (result '()))
+           (cond
+            ((null? rest) result)
+            ((box-site? (car rest))
+             (loop (cdr rest) (set-union result (flow-ref box-contents (car rest)))))
+            ((eq? (car rest) unknown-value)
+             (loop (cdr rest) (set-union result (list unknown-value))))
+            (else (loop (cdr rest) result)))))
         ((set-box!)
-         (let ((value-set (analyze-expr (caddr expr) current-proc))
-               (key (box-key (cadr expr))))
-           (analyze-expr (cadr expr) current-proc)
-           (add-flow! box-flow key value-set)
+         (let ((box-set (analyze (cadr expr)))
+               (value-set (analyze (caddr expr))))
+           (for-each (lambda (value)
+                       (cond
+                        ((box-site? value) (add-flow! box-contents value value-set))
+                        ((eq? value unknown-value) (escape! value-set))))
+                     box-set)
            value-set))
         ((set-global!)
-         (let ((value-set (analyze-expr (caddr expr) current-proc)))
+         (let ((value-set (analyze (caddr expr))))
            (add-flow! global-flow (cadr expr) value-set)
+           (if (memq (cadr expr) exported-globals)
+               (escape! value-set))
            value-set))
         (else
          (error "Unknown expression in 0CFA" (car expr)))))
      (else
       (error "Invalid expression in 0CFA" expr))))
 
+  (collect-procedures expr)
+
   (let loop ()
     (set! changed #f)
     (analyze-expr expr #f)
     (for-each
      (lambda (proc-name)
-       (let* ((meta (hash-table-ref/default procedures proc-name #f))
-              (body (caddr meta))
-              (result-set (analyze-expr body proc-name)))
-         (add-flow! proc-results proc-name result-set)))
-     (table-keys procedures))
+       (let ((body (caddr (procedure-meta proc-name))))
+         (add-flow! proc-results proc-name (analyze-expr body proc-name))))
+     (hash-table-keys procedures))
+    ;; Whatever an escaped procedure returns, or an escaped box holds, has
+    ;; escaped too -- including anything added since it first escaped.
+    (for-each
+     (lambda (value)
+       (escape! (if (procedure-meta value)
+                    (flow-ref proc-results value)
+                    (flow-ref box-contents value))))
+     (hash-table-keys escaped))
     (if changed
         (loop)
-        (list procedures var-flow box-flow global-flow proc-results))))
+        (list procedures var-flow box-contents global-flow proc-results))))
 
 (define (rewrite-known-calls expr analysis)
   (let ((procedures (car analysis))
         (var-flow (cadr analysis))
-        (box-flow (caddr analysis))
+        (box-contents (caddr analysis))
         (global-flow (cadddr analysis)))
     (define (flow-ref table key)
       (let ((value (hash-table-ref/default table key #f)))
         (if value value '())))
 
-    (define (repr-name expr)
-      (cond
-       ((symbol? expr) expr)
-       ((and (pair? expr) (memq (car expr) '(local closure))) (cadr expr))
-       (else #f)))
-
-    (define (box-key expr)
-      (repr-name expr))
-
+    ;; Mirrors run-0cfa's analyze-expr for the forms a call's operator can
+    ;; take. (After normalize-for-cfa it is always a simple expression, so
+    ;; the compound cases are only a fallback; anything unrecognized is
+    ;; unknown-value, never "no closure".)
     (define (closure-set expr)
       (cond
        ((symbol? expr) (flow-ref var-flow expr))
@@ -464,10 +546,14 @@
           ((global)
            (flow-ref global-flow (cadr expr)))
           ((unbox)
-           (let ((key (box-key (cadr expr))))
-             (if key
-                 (flow-ref box-flow key)
-                 '())))
+           (let loop ((rest (closure-set (cadr expr))) (result '()))
+             (cond
+              ((null? rest) result)
+              ((hash-table-exists? box-contents (car rest))
+               (loop (cdr rest) (set-union result (flow-ref box-contents (car rest)))))
+              ((eq? (car rest) unknown-value)
+               (loop (cdr rest) (set-union result (list unknown-value))))
+              (else (loop (cdr rest) result)))))
           ((make-closure)
            (list (cadr expr)))
           ((let)
@@ -479,8 +565,8 @@
           ((if)
            (set-union (closure-set (caddr expr))
                       (closure-set (cadddr expr))))
-          (else '())))
-       (else '())))
+          (else (list unknown-value))))
+       (else (list unknown-value))))
 
     (define (rewrite expr)
       (cond

@@ -53,13 +53,18 @@
 ;; ones, or compile-unit-to-cfg's library-qualified ones): from uniquify's
 ;; output through the optimized entry/procedure CFGs, a lowered program looks
 ;; the same either way.
-(define (uniquified->cfgs uniquified)
-  (let* ((canonicalized (canonicalize-builtins uniquified))
+;;
+;; exported-labels (optional, default '()) names the global cells another
+;; unit can read -- a library's exports. 0CFA must treat whatever is stored
+;; in them as escaping, since the importing unit can call it with anything.
+(define (uniquified->cfgs uniquified . maybe-exported-labels)
+  (let* ((exported-labels (if (pair? maybe-exported-labels) (car maybe-exported-labels) '()))
+         (canonicalized (canonicalize-builtins uniquified))
          (letrec-simplified (simplify-letrec canonicalized))
          (desugared (desugar-letrec letrec-simplified))
          (closure-converted (closure-convert desugared))
          (cfa-normalized (normalize-for-cfa closure-converted))
-         (cfa-analysis (run-0cfa cfa-normalized))
+         (cfa-analysis (run-0cfa cfa-normalized exported-labels))
          (cfa-rewritten (rewrite-known-calls cfa-normalized cfa-analysis)))
     (let-values (((tac-instrs procedures) (expr->tac cfa-rewritten)))
       (let* ((entry-cfg (build-cfg tac-instrs))
@@ -195,10 +200,14 @@
          (resolver (make-import-resolver imported-interfaces)))
     (let-values (((lowered-program global-labels global-env)
                   (lower-unit-body desugared-body (compilation-unit-name unit) resolver)))
-      (let ((uniquified (uniquify lowered-program)))
+      (let ((uniquified (uniquify lowered-program))
+            (exported-labels
+             (map cadr (filter (lambda (binding)
+                                 (memq (car binding) (compilation-unit-exports unit)))
+                               global-env))))
         (let-values (((canonicalized letrec-simplified desugared closure-converted cfa-normalized
                        cfa-rewritten optimized-entry-cfg optimized-procedure-cfgs)
-                      (uniquified->cfgs uniquified)))
+                      (uniquified->cfgs uniquified exported-labels)))
           (values desugared-program
                   lowered-program
                   global-labels

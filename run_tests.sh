@@ -280,6 +280,12 @@ runtime_cases=(
   "test111|7"
   "test112|55"
   "test113|102"
+  "test114|1102"
+  "test115|1102"
+  "test116|1102"
+  "test117|2"
+  "test118|101"
+  "test119|1102"
 )
 
 generate_all
@@ -312,9 +318,9 @@ assert_asm_not_contains "test5" 'str x9, \[sp, #(24|32|40)\]' 'eager root shadow
 # variadic known-call fast path: the overflow args are consed at compile
 # time and the call itself is still a direct label branch, exactly like an
 # ordinary fixed-arity known-call -- no runtime dispatch helper at all.
-# (test91 itself also contains sum-list's own self-recursive call, which
-# is -- independent of variadic support -- not resolved to a known-call by
-# 0CFA, so the "no generic call helper anywhere" check belongs on test95,
+# (test91 also contains sum-list's own self-recursive call, whose
+# resolution depends on 0CFA's letrec box tracking rather than on variadic
+# support, so the "no generic call helper anywhere" check belongs on test95,
 # a minimal program with nothing else that could call indirectly.)
 assert_asm_contains "test91" 'b(l)? _cfa\.proc\.[0-9]+' 'direct closure call lowering for variadic known-call'
 assert_asm_contains "test95" 'b(l)? _cfa\.proc\.[0-9]+' 'direct closure call lowering for variadic known-call'
@@ -371,6 +377,12 @@ assert_asm_contains "test106" '_hop_callcc' 'call/cc lowers through hop_callcc'
 assert_asm_contains "test112" 'b _hop_callcc' 'tail-position call/cc is a tail branch to hop_callcc'
 # A continuation's call site can never be resolved to a direct call.
 assert_asm_contains "test113" '_hop_(tail_)?call_1' 'continuation call stays indirect'
+# 0CFA soundness: a parameter that can receive a closure the analysis can't
+# follow (through apply, a pair, a vector, a letrec group member) must not
+# be resolved to the one closure it can see.
+for t in test114 test115 test116 test119; do
+  assert_asm_contains "$t" '_hop_(tail_)?call_1' 'call through escaped-closure parameter stays indirect'
+done
 
 assert_file_output \
   "file-test1" \
@@ -511,6 +523,26 @@ if ! grep -Eq 'Unresolved import' "$multi_bad_log"; then
   exit 1
 fi
 printf 'ok multi-file-unresolved-import\n'
+
+# 0CFA soundness across units: app1 is exported, so the program can call it
+# with a closure the library never sees -- inside the library, (g 1) must
+# not be resolved to the one lambda the library itself passes.
+cfa_lib_path="$TMPDIR/cfa-lib.scm"
+cfa_prog_path="$TMPDIR/cfa-prog.scm"
+printf '%s\n' \
+  '(define-library (cfalib)' \
+  '  (export app1 use add1000)' \
+  '  (begin' \
+  '    (define (app1 g) (g 1))' \
+  '    (define (add1000 x) (+ x 1000))' \
+  '    (define (use) (app1 (lambda (x) (+ x 100))))))' \
+  >"$cfa_lib_path"
+printf '%s\n' \
+  '(import (cfalib))' \
+  '(+ (use) (app1 add1000))' \
+  >"$cfa_prog_path"
+
+assert_multi_file_output "multi-file-cfa-export" "1102" "$cfa_lib_path" "$cfa_prog_path"
 
 # A continuation captured in a library unit's body and re-entered from the
 # program unit's body: the resumed stack includes the generated C link
