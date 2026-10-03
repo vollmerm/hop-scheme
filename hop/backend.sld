@@ -24,6 +24,7 @@
   (import (scheme base)
           (scheme cxr)
           (scheme write)
+          (scheme process-context)
           (hop utils)
           (hop pass tac)
           (hop pass cfg))
@@ -907,6 +908,55 @@
           homes
           root-homes)))))
 
+(define (any-block-targets-entry? blocks)
+  (let loop ((rest blocks))
+    (and (pair? rest)
+         (or (and (memv 0 (machine-block-successors (car rest))) #t)
+             (loop (cdr rest))))))
+
+;;; Debug check (HOP_CHECK_ALLOC=1): after allocation, no two variables that
+;;; are live at the same time may share a home, and no instruction's
+;;; destination may share a home with a variable that stays live past it
+;;; (even if the destination itself is never read). A violation means the
+;;; allocator's idea of liveness disagrees with the code's real control flow,
+;;; which shows up at run time as a silently wrong value.
+(define (check-register-allocation name blocks homes out-vec instruction-live-before)
+  (define (home-of var) (let ((e (assq var homes))) (and e (cdr e))))
+  ;; Liveness treats move-in as an ordinary definition, so it is only right if
+  ;; the entry block is never re-entered (see split-looping-entry-block).
+  (when (and (pair? blocks)
+             (any-block-targets-entry? blocks)
+             (let has-move-in ((instrs (machine-block-instructions (car blocks))))
+               (and (pair? instrs)
+                    (or (eq? (car (car instrs)) 'move-in)
+                        (has-move-in (cdr instrs))))))
+    (error "entry block with parameter moves is a loop target" name))
+  (let block-loop ((bs blocks) (index 0) (lbs instruction-live-before))
+    (unless (null? bs)
+      (let* ((block (car bs))
+             (instrs (machine-block-instructions block)))
+        (let instr-loop ((rest instrs) (befores (car lbs)))
+          (unless (null? rest)
+            (let* ((live-after (if (null? (cdr rest))
+                                   (vector-ref out-vec index)
+                                   (cadr befores)))
+                   (instr (car rest))
+                   (live (set-union live-after (machine-instr-defs instr))))
+              (let pairs ((xs live))
+                (unless (null? xs)
+                  (let ((home (home-of (car xs))))
+                    (when home
+                      (for-each
+                       (lambda (other)
+                         (when (equal? home (home-of other))
+                           (error "register allocation conflict"
+                                  name (machine-block-label block) instr
+                                  (car xs) other home)))
+                       (cdr xs))))
+                  (pairs (cdr xs)))))
+            (instr-loop (cdr rest) (cdr befores)))))
+      (block-loop (cdr bs) (+ index 1) (cdr lbs)))))
+
 (define (allocate-machine-procedure proc)
   (let ((blocks (machine-procedure-blocks proc)))
     (let-values (((in-vec out-vec) (compute-liveness blocks)))
@@ -917,6 +967,9 @@
                       (linear-scan-allocate
                        (collect-intervals blocks in-vec out-vec)
                        biases)))
+          (when (equal? (get-environment-variable "HOP_CHECK_ALLOC") "1")
+            (check-register-allocation (machine-procedure-name proc) blocks homes
+                                       out-vec instruction-live-before))
           (let-values (((root-homes frame-slots)
                         (allocate-root-homes homes next-slot)))
             (let* ((rewritten-blocks
