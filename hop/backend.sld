@@ -199,35 +199,40 @@
                        (basic-block-instructions block)))
    (basic-block-successors block)))
 
-;; The entry block carries the move-in of each incoming param. When a loop
-;; jumps back to the entry block (a self tail call or a letrec cluster), that
-;; move-in is not re-executed (emit-machine-block puts the prologue before the
-;; block's label), but liveness would still see every param as defined at the
-;; top of the loop. A param the loop never reassigns would then look dead on
-;; the back edge and its register could be reused. So when block 0 is a
-;; jump target, the param moves go in their own preceding block instead.
+;; True if some block jumps to block 0.
+(define (entry-is-jump-target? blocks)
+  (not (all (lambda (block) (not (memv 0 (machine-block-successors block))))
+            blocks)))
+
+(define (param-move? instr)
+  (eq? (car instr) 'move-in))
+
+;; The entry block starts with a move-in for each incoming param. When a loop
+;; jumps back to the entry block (a self tail call or a letrec cluster), those
+;; moves are not run again (emit-machine-block places the prologue before the
+;; block's label), but liveness would still see every param as redefined at
+;; the top of the loop. A param the loop never reassigns would then look dead
+;; on the back edge, and its register could be reused. So when block 0 is a
+;; jump target, the param moves go in their own block ahead of it.
 (define (split-looping-entry-block blocks)
-  (define (targets-entry? block)
-    (memv 0 (machine-block-successors block)))
   (define (shift-successors block)
     (make-machine-block (machine-block-label block)
                         (machine-block-instructions block)
                         (map (lambda (index) (+ index 1))
                              (machine-block-successors block))))
-  (if (and (pair? blocks) (not (all (lambda (b) (not (targets-entry? b))) blocks)))
+  (if (entry-is-jump-target? blocks)
       (let* ((entry (car blocks))
              (instrs (machine-block-instructions entry))
              (param-moves (let take ((rest instrs))
-                            (if (and (pair? rest) (eq? (car (car rest)) 'move-in))
+                            (if (and (pair? rest) (param-move? (car rest)))
                                 (cons (car rest) (take (cdr rest)))
-                                '())))
-             (entry-body (list-tail instrs (length param-moves))))
+                                '()))))
         (cons (make-machine-block #f param-moves '(1))
-              (cons (make-machine-block (machine-block-label entry)
-                                        entry-body
-                                        (map (lambda (index) (+ index 1))
-                                             (machine-block-successors entry)))
-                    (map shift-successors (cdr blocks)))))
+              (map shift-successors
+                   (cons (make-machine-block (machine-block-label entry)
+                                             (list-tail instrs (length param-moves))
+                                             (machine-block-successors entry))
+                         (cdr blocks)))))
       blocks))
 
 (define (select-machine-procedure name params cfg)
@@ -908,12 +913,6 @@
           homes
           root-homes)))))
 
-(define (any-block-targets-entry? blocks)
-  (let loop ((rest blocks))
-    (and (pair? rest)
-         (or (and (memv 0 (machine-block-successors (car rest))) #t)
-             (loop (cdr rest))))))
-
 ;;; Debug check (HOP_CHECK_ALLOC=1): after allocation, no two variables that
 ;;; are live at the same time may share a home, and no instruction's
 ;;; destination may share a home with a variable that stays live past it
@@ -921,41 +920,39 @@
 ;;; allocator's idea of liveness disagrees with the code's real control flow,
 ;;; which shows up at run time as a silently wrong value.
 (define (check-register-allocation name blocks homes out-vec instruction-live-before)
-  (define (home-of var) (let ((e (assq var homes))) (and e (cdr e))))
-  ;; Liveness treats move-in as an ordinary definition, so it is only right if
+  (define (home-of var)
+    (let ((entry (assq var homes)))
+      (and entry (cdr entry))))
+  (define (check-no-sharing! block instr live)
+    (let loop ((vars live))
+      (unless (null? vars)
+        (let ((home (home-of (car vars))))
+          (for-each (lambda (other)
+                      (when (and home (equal? home (home-of other)))
+                        (error "register allocation conflict"
+                               name (machine-block-label block) instr
+                               (car vars) other home)))
+                    (cdr vars)))
+        (loop (cdr vars)))))
+  ;; Liveness treats move-in as an ordinary definition, which is only right if
   ;; the entry block is never re-entered (see split-looping-entry-block).
-  (when (and (pair? blocks)
-             (any-block-targets-entry? blocks)
-             (let has-move-in ((instrs (machine-block-instructions (car blocks))))
-               (and (pair? instrs)
-                    (or (eq? (car (car instrs)) 'move-in)
-                        (has-move-in (cdr instrs))))))
+  (when (and (entry-is-jump-target? blocks)
+             (not (all (lambda (instr) (not (param-move? instr)))
+                       (machine-block-instructions (car blocks)))))
     (error "entry block with parameter moves is a loop target" name))
-  (let block-loop ((bs blocks) (index 0) (lbs instruction-live-before))
-    (unless (null? bs)
-      (let* ((block (car bs))
-             (instrs (machine-block-instructions block)))
-        (let instr-loop ((rest instrs) (befores (car lbs)))
-          (unless (null? rest)
-            (let* ((live-after (if (null? (cdr rest))
-                                   (vector-ref out-vec index)
-                                   (cadr befores)))
-                   (instr (car rest))
-                   (live (set-union live-after (machine-instr-defs instr))))
-              (let pairs ((xs live))
-                (unless (null? xs)
-                  (let ((home (home-of (car xs))))
-                    (when home
-                      (for-each
-                       (lambda (other)
-                         (when (equal? home (home-of other))
-                           (error "register allocation conflict"
-                                  name (machine-block-label block) instr
-                                  (car xs) other home)))
-                       (cdr xs))))
-                  (pairs (cdr xs)))))
-            (instr-loop (cdr rest) (cdr befores)))))
-      (block-loop (cdr bs) (+ index 1) (cdr lbs)))))
+  (for-each
+   (lambda (block live-befores live-out)
+     (for-each
+      (lambda (instr live-after)
+        (check-no-sharing! block instr
+                           (set-union live-after (machine-instr-defs instr))))
+      (machine-block-instructions block)
+      (if (null? live-befores)
+          '()
+          (append (cdr live-befores) (list live-out)))))
+   blocks
+   instruction-live-before
+   (vector->list out-vec)))
 
 (define (allocate-machine-procedure proc)
   (let ((blocks (machine-procedure-blocks proc)))

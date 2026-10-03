@@ -12,6 +12,7 @@
           literal-expr?
           quoted-symbol-expr?
           nest-let-bindings
+          sequentialize-copies
           set-union
           set-difference
           set-equal?
@@ -21,7 +22,8 @@
           params-names
           make-params)
   (import (scheme base)
-          (scheme cxr))
+          (scheme cxr)
+          (only (srfi 1) delete find))
   (begin
 
 (define (body->expr body-exprs)
@@ -106,6 +108,35 @@
     ((null? lst) #t)
     ((predicate (car lst)) (all predicate (cdr lst)))
     (else #f)))
+
+;; copies is a list of (dst . src) pairs meant to happen all at once. Returns
+;; (assign dst src) instructions that, run in order, have the same effect. A
+;; fresh temp from fresh-temp is used only to break a cycle of copies.
+(define (sequentialize-copies copies fresh-temp)
+  (define (blocked? copy pending)
+    (find (lambda (other)
+            (and (not (eq? other copy))
+                 (eq? (cdr other) (car copy))))
+          pending))
+  (let loop ((pending (filter (lambda (copy) (not (eq? (car copy) (cdr copy))))
+                              copies))
+             (code '()))
+    (if (null? pending)
+        (reverse code)
+        (let ((ready (find (lambda (copy) (not (blocked? copy pending))) pending)))
+          (if ready
+              (loop (delete ready pending eq?)
+                    (cons `(assign ,(car ready) ,(cdr ready)) code))
+              ;; Every remaining copy overwrites a source another still needs:
+              ;; park one such source in a temp to open the cycle.
+              (let ((saved (car (car pending)))
+                    (temp (fresh-temp)))
+                (loop (map (lambda (copy)
+                             (if (eq? (cdr copy) saved)
+                                 (cons (car copy) temp)
+                                 copy))
+                           pending)
+                      (cons `(assign ,temp ,saved) code))))))))
 
 (define (single-binding? binding)
   (and (pair? binding)
