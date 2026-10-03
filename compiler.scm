@@ -25,6 +25,7 @@
         (scheme read)
         (scheme write)
         (scheme file)
+        (scheme process-context)
         (hop utils)
         (hop pass surface)
         (hop pass unit)
@@ -35,6 +36,7 @@
         (hop pass cfa)
         (hop pass tac)
         (hop pass cfg)
+        (hop pass ssa)
         (hop backend))
 
 ;;; ============================================================================
@@ -47,6 +49,14 @@
 ;;;   - write-aarch64-program-file: read forms from a source file first
 ;;;   - compile-program: educational debugging view of the intermediate stages
 ;;; ============================================================================
+
+;; Experimental SSA region (see (hop pass ssa)): when the environment variable
+;; HOP_SSA is "roundtrip", every procedure's CFG is converted to SSA, verified,
+;; and converted back before the CFG optimizations run. Off by default.
+(define (maybe-ssa-round-trip params cfg)
+  (if (equal? (get-environment-variable "HOP_SSA") "roundtrip")
+      (ssa-round-trip-cfg params cfg)
+      cfg))
 
 ;; Shared by every entry point below, whichever way a lowered program's
 ;; top-level bindings got their labels (plain compile-to-cfg's unqualified
@@ -67,11 +77,13 @@
          (cfa-analysis (run-0cfa cfa-normalized exported-labels))
          (cfa-rewritten (rewrite-known-calls cfa-normalized cfa-analysis)))
     (let-values (((tac-instrs procedures) (expr->tac cfa-rewritten)))
-      (let* ((entry-cfg (build-cfg tac-instrs))
+      (let* ((entry-cfg (maybe-ssa-round-trip '() (build-cfg tac-instrs)))
              (procedure-cfgs
               (map (lambda (procedure)
                      (cons procedure
-                     (build-cfg (procedure-instructions procedure))))
+                     (maybe-ssa-round-trip
+                      (procedure-params procedure)
+                      (build-cfg (procedure-instructions procedure)))))
                    procedures))
              (optimized-entry-cfg
                (eliminate-dead-writes-cfg

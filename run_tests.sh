@@ -111,6 +111,20 @@ assert_compile_error() {
   printf 'ok %s\n' "$case_name"
 }
 
+# A generated-code shape check that fails normally aborts the run. Under
+# HOP_SSA (the experimental SSA round trip, see compiler.scm) the code shape
+# is expected to differ from the default pipeline's, so a failed shape check
+# is only reported, and the run continues so every runtime-output test still
+# gets exercised.
+shape_failure() {
+  if [[ -n "${HOP_SSA:-}" ]]; then
+    printf 'shape differs under HOP_SSA=%s: %s\n' "$HOP_SSA" "$1" >&2
+  else
+    printf '%s\n' "$1" >&2
+    exit 1
+  fi
+}
+
 assert_asm_contains() {
   local test_name="$1"
   local pattern="$2"
@@ -119,8 +133,7 @@ assert_asm_contains() {
   asm_path="$(asm_path_for "$test_name")"
   ensure_asm "$test_name"
   if ! grep -Eq "$pattern" "$asm_path"; then
-    printf 'missing %s in %s\n' "$description" "$test_name" >&2
-    exit 1
+    shape_failure "missing $description in $test_name"
   fi
 }
 
@@ -132,8 +145,7 @@ assert_asm_not_contains() {
   asm_path="$(asm_path_for "$test_name")"
   ensure_asm "$test_name"
   if grep -Eq "$pattern" "$asm_path"; then
-    printf 'unexpected %s in %s\n' "$description" "$test_name" >&2
-    exit 1
+    shape_failure "unexpected $description in $test_name"
   fi
 }
 
@@ -300,6 +312,8 @@ runtime_cases=(
   "test128|5"
   "test129|4"
 )
+
+csi -R r7rs -I "$ROOT" -s "$ROOT/ssa_tests.scm"
 
 generate_all
 
