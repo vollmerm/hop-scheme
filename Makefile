@@ -2,7 +2,7 @@ ROOT := $(CURDIR)
 SLD_FILES := $(shell find hop -name '*.sld')
 CSI := csi -R r7rs -I $(ROOT)
 
-.PHONY: build test repl example clean
+.PHONY: build test repl example dump clean
 
 # "build" for an interpreted compiler means: the generated include manifest
 # is up to date and compiler.scm loads cleanly under it.
@@ -27,6 +27,11 @@ example: hop/includes.scm
 # test fixtures in compiler_tests.scm live at the prompt.
 repl: hop/includes.scm
 	$(CSI) -e '(load "compiler.scm")' -e '(load "compiler_tests.scm")'
+
+# Prints the CFG (or STAGE=machine allocated code) for a source file or a
+# compiler_tests.scm fixture, e.g. `make dump T=test34`.
+dump: hop/includes.scm
+	@$(CSI) -s tools/dump-cfg.scm $(T) $(STAGE)
 
 clean:
 	rm -f hop/includes.scm
