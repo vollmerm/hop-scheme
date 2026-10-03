@@ -995,6 +995,10 @@
          (ev 2)))
      (+ (app1 (lambda (x) (+ x 100))) (f))))
 
+(define test123
+  '(letrec ((f (lambda (k n) (if (= n 0) k (f k (- n 1))))))
+     (f 7 3)))
+
 (define sample-tests
   (list (cons "Test 1: Simple arithmetic" test1)
         (cons "Test 2: Lambda application" test2)
@@ -1113,7 +1117,8 @@
         (cons "Test 116: 0CFA closure escaping through a vector" test116)
         (cons "Test 117: 0CFA box initial contents" test117)
         (cons "Test 118: 0CFA box aliasing" test118)
-        (cons "Test 119: 0CFA flows inside letrec group members" test119)))
+        (cons "Test 119: 0CFA flows inside letrec group members" test119)
+        (cons "Test 123: loop leaves a param untouched" test123)))
 
 (define named-tests
   ;; These are runnable end-to-end regression cases. test6 and test7 stay as
@@ -1233,7 +1238,8 @@
          (cons 'test116 test116)
          (cons 'test117 test117)
          (cons 'test118 test118)
-         (cons 'test119 test119)))
+         (cons 'test119 test119)
+         (cons 'test123 test123)))
 
 (define (lookup-named-test name)
   (let ((binding (assoc name named-tests)))

@@ -286,6 +286,7 @@ runtime_cases=(
   "test117|2"
   "test118|101"
   "test119|1102"
+  "test123|7"
 )
 
 generate_all

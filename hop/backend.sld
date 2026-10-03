@@ -198,6 +198,37 @@
                        (basic-block-instructions block)))
    (basic-block-successors block)))
 
+;; The entry block carries the move-in of each incoming param. When a loop
+;; jumps back to the entry block (a self tail call or a letrec cluster), that
+;; move-in is not re-executed (emit-machine-block puts the prologue before the
+;; block's label), but liveness would still see every param as defined at the
+;; top of the loop. A param the loop never reassigns would then look dead on
+;; the back edge and its register could be reused. So when block 0 is a
+;; jump target, the param moves go in their own preceding block instead.
+(define (split-looping-entry-block blocks)
+  (define (targets-entry? block)
+    (memv 0 (machine-block-successors block)))
+  (define (shift-successors block)
+    (make-machine-block (machine-block-label block)
+                        (machine-block-instructions block)
+                        (map (lambda (index) (+ index 1))
+                             (machine-block-successors block))))
+  (if (and (pair? blocks) (not (all (lambda (b) (not (targets-entry? b))) blocks)))
+      (let* ((entry (car blocks))
+             (instrs (machine-block-instructions entry))
+             (param-moves (let take ((rest instrs))
+                            (if (and (pair? rest) (eq? (car (car rest)) 'move-in))
+                                (cons (car rest) (take (cdr rest)))
+                                '())))
+             (entry-body (list-tail instrs (length param-moves))))
+        (cons (make-machine-block #f param-moves '(1))
+              (cons (make-machine-block (machine-block-label entry)
+                                        entry-body
+                                        (map (lambda (index) (+ index 1))
+                                             (machine-block-successors entry)))
+                    (map shift-successors (cdr blocks)))))
+      blocks))
+
 (define (select-machine-procedure name params cfg)
   (let ((param-locations (make-param-locations (params-names params))))
     (let loop ((blocks cfg)
@@ -207,7 +238,7 @@
           (make-machine-procedure name
                                   params
                                   param-locations
-                                  (reverse result)
+                                  (split-looping-entry-block (reverse result))
                                   '()
                                   '()
                                   0
