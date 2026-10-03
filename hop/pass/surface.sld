@@ -182,6 +182,47 @@
              ,(desugar-expr `(begin ,@(cdr clause)))
              ,(desugar-case-clauses tmp (cdr clauses) context))))))
 
+  ;; Quasiquote becomes cons chains over quoted constants. A template subtree
+  ;; with no unquote inside folds to one (quote datum), which lowering hoists
+  ;; like any other quoted constant; only the dynamic spine is built with
+  ;; cons. depth is the quasiquote nesting level (1 at the outermost);
+  ;; unquote only evaluates at depth 1. unquote-splicing is not supported
+  ;; because there is no append to lower it to.
+  (define (quasi-static? expr)
+    (and (pair? expr) (eq? (car expr) 'quote)))
+
+  (define (quasi-cons a d)
+    (if (and (quasi-static? a) (quasi-static? d))
+        `(quote ,(cons (cadr a) (cadr d)))
+        `(cons ,a ,d)))
+
+  (define (quasi-tagged tag inner)
+    (quasi-cons `(quote ,tag) (quasi-cons inner '(quote ()))))
+
+  (define (desugar-quasi template depth)
+    (cond
+     ((vector? template)
+      (error "quasiquote does not support vector templates" template))
+     ((not (pair? template)) `(quote ,template))
+     ((memq (car template) '(unquote quasiquote unquote-splicing))
+      (unless (and (pair? (cdr template)) (null? (cddr template)))
+        (error "Malformed quasiquote form" template))
+      (case (car template)
+        ((unquote)
+         (if (= depth 1)
+             (desugar-expr (cadr template))
+             (quasi-tagged 'unquote (desugar-quasi (cadr template) (- depth 1)))))
+        ((quasiquote)
+         (quasi-tagged 'quasiquote (desugar-quasi (cadr template) (+ depth 1))))
+        (else
+         (if (= depth 1)
+             (error "unquote-splicing is not supported" template)
+             (quasi-tagged 'unquote-splicing
+                           (desugar-quasi (cadr template) (- depth 1)))))))
+     (else
+      (quasi-cons (desugar-quasi (car template) depth)
+                  (desugar-quasi (cdr template) depth)))))
+
   (define (desugar-expr expr)
     (cond
      ((symbol? expr) expr)
@@ -301,8 +342,13 @@
         ((set!)
          (error "set! is not supported; rewrite the variable as a box" expr))
 
-        ((quasiquote unquote unquote-splicing)
-         (error "quasiquote is not supported yet" expr))
+        ((quasiquote)
+         (unless (and (pair? (cdr expr)) (null? (cddr expr)))
+           (error "quasiquote requires exactly one template" expr))
+         (desugar-quasi (cadr expr) 1))
+
+        ((unquote unquote-splicing)
+         (error "unquote outside of quasiquote" expr))
 
         ((primop)
          `(primop ,(cadr expr) ,@(map desugar-expr (cddr expr))))

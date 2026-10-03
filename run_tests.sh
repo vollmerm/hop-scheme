@@ -290,6 +290,12 @@ runtime_cases=(
   "test121|231"
   "test122|21"
   "test123|7"
+  "test124|7"
+  "test125|3"
+  "test126|3"
+  "test127|2"
+  "test128|5"
+  "test129|4"
 )
 
 generate_all
@@ -456,6 +462,16 @@ assert_compile_error \
   "file-sub-zero-args" \
   '- requires at least 1 argument' \
   $'(-)'
+
+assert_compile_error \
+  "file-unquote-splicing" \
+  'unquote-splicing is not supported' \
+  $'(define xs (cons 1 (cons 2 (quote ()))))\n(car (quasiquote (0 (unquote-splicing xs))))'
+
+assert_compile_error \
+  "file-unquote-outside" \
+  'unquote outside of quasiquote' \
+  $'(unquote 1)'
 
 # Surface arbitrary-argument arithmetic in file scope.
 assert_file_output \

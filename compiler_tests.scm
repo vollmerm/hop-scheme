@@ -1018,6 +1018,31 @@
   '(letrec ((f (lambda (k n) (if (= n 0) k (f k (- n 1))))))
      (f 7 3)))
 
+(define test124
+  '(let ((v 7))
+     (car (cdr `(header ,v payload)))))
+
+(define test125
+  '(let ((a 1) (b 2))
+     (let ((x `(req ,a (opts ,b) done)))
+       (+ (car (cdr x))
+          (car (cdr (car (cdr (cdr x)))))))))
+
+(define test126
+  '(let ((x (cons 2 (cons 3 '()))))
+     (car (cdr (cdr `(1 . ,x))))))
+
+(define test127
+  '(car (cdr `(1 2 3))))
+
+(define test128
+  '(let ((x 5))
+     (car (cdr (car (cdr (car (cdr (car (cdr (car (cdr `(a `(b ,(c ,x)))))))))))))))
+
+(define test129
+  '(let ((x 4))
+     (if (null? (cdr `(,x))) (car `(,x)) 0)))
+
 (define sample-tests
   (list (cons "Test 1: Simple arithmetic" test1)
         (cons "Test 2: Lambda application" test2)
@@ -1140,7 +1165,13 @@
         (cons "Test 120: self tail call swaps its params" test120)
         (cons "Test 121: self tail call rotates its params" test121)
         (cons "Test 122: cluster members pass swapped args" test122)
-        (cons "Test 123: loop leaves a param untouched" test123)))
+        (cons "Test 123: loop leaves a param untouched" test123)
+        (cons "Test 124: quasiquote with one unquote" test124)
+        (cons "Test 125: quasiquote with nested list structure" test125)
+        (cons "Test 126: quasiquote with dotted unquote" test126)
+        (cons "Test 127: fully static quasiquote" test127)
+        (cons "Test 128: nested quasiquote levels" test128)
+        (cons "Test 129: quasiquote of a one-element list" test129)))
 
 (define named-tests
   ;; These are runnable end-to-end regression cases. test6 and test7 stay as
@@ -1264,7 +1295,13 @@
          (cons 'test120 test120)
          (cons 'test121 test121)
          (cons 'test122 test122)
-         (cons 'test123 test123)))
+         (cons 'test123 test123)
+         (cons 'test124 test124)
+         (cons 'test125 test125)
+         (cons 'test126 test126)
+         (cons 'test127 test127)
+         (cons 'test128 test128)
+         (cons 'test129 test129)))
 
 (define (lookup-named-test name)
   (let ((binding (assoc name named-tests)))
