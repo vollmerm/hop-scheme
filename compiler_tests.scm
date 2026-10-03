@@ -995,6 +995,25 @@
          (ev 2)))
      (+ (app1 (lambda (x) (+ x 100))) (f))))
 
+(define test120
+  '(letrec ((f (lambda (a b n)
+                 (if (= n 0) (+ (* a 10) b) (f b a (- n 1))))))
+     (f 1 2 1)))
+
+(define test121
+  '(letrec ((f (lambda (a b c n)
+                 (if (= n 0)
+                     (+ (* a 100) (+ (* b 10) c))
+                     (f b c a (- n 1))))))
+     (f 1 2 3 1)))
+
+(define test122
+  '(letrec ((ev (lambda (a b n)
+                  (if (= n 0) (+ (* a 10) b) (od b a (- n 1)))))
+            (od (lambda (a b n)
+                  (if (= n 0) (+ (* a 10) b) (ev b a (- n 1))))))
+     (ev 1 2 3)))
+
 (define test123
   '(letrec ((f (lambda (k n) (if (= n 0) k (f k (- n 1))))))
      (f 7 3)))
@@ -1118,6 +1137,9 @@
         (cons "Test 117: 0CFA box initial contents" test117)
         (cons "Test 118: 0CFA box aliasing" test118)
         (cons "Test 119: 0CFA flows inside letrec group members" test119)
+        (cons "Test 120: self tail call swaps its params" test120)
+        (cons "Test 121: self tail call rotates its params" test121)
+        (cons "Test 122: cluster members pass swapped args" test122)
         (cons "Test 123: loop leaves a param untouched" test123)))
 
 (define named-tests
@@ -1239,6 +1261,9 @@
          (cons 'test117 test117)
          (cons 'test118 test118)
          (cons 'test119 test119)
+         (cons 'test120 test120)
+         (cons 'test121 test121)
+         (cons 'test122 test122)
          (cons 'test123 test123)))
 
 (define (lookup-named-test name)

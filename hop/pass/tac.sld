@@ -38,6 +38,33 @@
         (cadr expr)
         expr))
 
+  ;; Emits (assign dst src) for each pair as one parallel move: every src is
+  ;; read before any dst is written. A self tail call assigns a procedure's
+  ;; params from argument values that may themselves be those params, e.g.
+  ;; (f b a ...), so plain left-to-right assigns would clobber a param before
+  ;; a later assign reads it. Any src that is also one of the
+  ;; dsts (other than as its own no-op self-assign) is first copied to a
+  ;; fresh temp.
+  (define (parallel-assign-instrs dsts srcs)
+    (let* ((moves (filter (lambda (p) (not (eq? (car p) (cdr p))))
+                          (map cons dsts srcs)))
+           (clobbered (map car moves))
+           (saves
+            (let loop ((rest moves) (acc '()))
+              (cond
+               ((null? rest) (reverse acc))
+               ((and (symbol? (cdr (car rest)))
+                     (memq (cdr (car rest)) clobbered)
+                     (not (assq (cdr (car rest)) acc)))
+                (loop (cdr rest) (cons (cons (cdr (car rest)) (fresh-temp)) acc)))
+               (else (loop (cdr rest) acc))))))
+      (append
+       (map (lambda (save) `(assign ,(cdr save) ,(car save))) saves)
+       (map (lambda (move)
+              (let ((save (and (symbol? (cdr move)) (assq (cdr move) saves))))
+                `(assign ,(car move) ,(if save (cdr save) (cdr move)))))
+            moves))))
+
   (define (convert-list exprs)
     (let loop ((rest exprs)
                (instrs '())
@@ -572,10 +599,7 @@
                (let-values (((arg-instrs arg-vars arg-procedures)
                              (convert-list args)))
                  (values (append arg-instrs
-                                 (map (lambda (param arg)
-                                        `(assign ,param ,arg))
-                                      current-params
-                                      arg-vars)
+                                 (parallel-assign-instrs current-params arg-vars)
                                  (list `(goto ,current-entry-label)))
                          arg-procedures)))))
 

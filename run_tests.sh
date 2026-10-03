@@ -286,6 +286,9 @@ runtime_cases=(
   "test117|2"
   "test118|101"
   "test119|1102"
+  "test120|21"
+  "test121|231"
+  "test122|21"
   "test123|7"
 )
 
