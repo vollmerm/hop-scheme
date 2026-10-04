@@ -197,6 +197,24 @@
 (agrees? "counting-loop" counting-loop '((0) (5) (6)))
 (agrees? "same-constant" same-constant '((#t) (#f)))
 
+;; the control does the cleanup but learns nothing
+(define (control program)
+  (ssa->cfg (control-ssa (cfg->ssa (car program) (build-cfg (cdr program))))))
+
+(let ((cfg (control same-constant)))
+  (check "control keeps the addition" (has-primop? cfg '+))
+  (check "control does not fold" (not (assigns-literal? cfg 3))))
+(let ((cfg (control dead-arm)))
+  (check "control keeps the dead arm" (memq 'l1 (labels cfg))))
+(let ((cfg (control refine-pair)))
+  (check "control keeps the safe car" (has-primop? cfg 'car)))
+(for-each
+ (lambda (args)
+   (check "control agrees"
+          (equal? (run arithmetic args (build-cfg (cdr arithmetic)))
+                  (run arithmetic args (control arithmetic)))))
+ '((#t 5) (#f 5)))
+
 (if (zero? failures)
     (begin (display "sccp tests passed") (newline))
     (begin (display failures) (display " sccp test(s) failed") (newline) (exit 1)))

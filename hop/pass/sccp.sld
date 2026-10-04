@@ -23,7 +23,9 @@
   ;;; a known pair unsafe, turns decided branches into jumps, drops dead edges
   ;;; and blocks, and removes definitions nobody reads.
   (export sccp-cfg
-          sccp-ssa)
+          sccp-ssa
+          control-cfg
+          control-ssa)
   (import (scheme base)
           (scheme cxr)
           (only (srfi 1) append-map filter find last list-index)
@@ -559,5 +561,29 @@
 
 (define (sccp-cfg params cfg)
   (ssa->cfg (check-ssa (sccp-ssa (check-ssa (cfg->ssa params cfg))))))
+
+;; The control for measurements: the same SSA round trip and cleanup (pi nodes,
+;; copy propagation, dead definition removal) with the analysis switched off,
+;; so nothing is learned about values and no branch or block is removed.
+(define (control-ssa ssa)
+  (let ((blocks (ssa-proc-blocks ssa)))
+    (insert-pis! blocks)
+    (for-each-index
+     (lambda (b block)
+       (set-ssa-block-instrs!
+        block
+        (map (lambda (instr)
+               (let ((rhs (instr-rhs instr)))
+                 (if (and (pair? rhs) (eq? (car rhs) 'pi))
+                     `(assign ,(cadr instr) ,(caddr rhs))
+                     instr)))
+             (ssa-block-instrs block))))
+     blocks)
+    (propagate-copies! blocks)
+    (remove-dead-definitions! blocks #f)
+    ssa))
+
+(define (control-cfg params cfg)
+  (ssa->cfg (check-ssa (control-ssa (check-ssa (cfg->ssa params cfg))))))
 
 ))

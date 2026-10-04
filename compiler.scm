@@ -59,6 +59,7 @@
     (cond
      ((equal? mode "roundtrip") (ssa-round-trip-cfg params cfg))
      ((equal? mode "sccp") (sccp-cfg params cfg))
+     ((equal? mode "control") (control-cfg params cfg))
      (else cfg))))
 
 ;; Shared by every entry point below, whichever way a lowered program's
