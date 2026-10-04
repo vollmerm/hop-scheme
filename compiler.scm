@@ -54,11 +54,22 @@
 ;; Experimental SSA region (see (hop pass ssa)): when the environment variable
 ;; HOP_SSA is "roundtrip", every procedure's CFG is converted to SSA, verified,
 ;; and converted back before the CFG optimizations run. Off by default.
-(define (maybe-ssa-round-trip params cfg)
+(define (configure-shape-analysis!)
+  (let* ((depth-text (get-environment-variable "HOP_SHAPE_K"))
+         (depth (if depth-text (string->number depth-text) 0))
+         (dead-cons (get-environment-variable "HOP_DEAD_CONS")))
+    (set-shape-depth! depth)
+    (set-remove-dead-allocation!
+     (if dead-cons (equal? dead-cons "1") (> depth 0)))))
+
+;; entry? marks the program's entry procedure (processed before the others).
+(define (maybe-ssa-round-trip params cfg . maybe-entry?)
   (let ((mode (get-environment-variable "HOP_SSA")))
+    (configure-shape-analysis!)
     (cond
      ((equal? mode "roundtrip") (ssa-round-trip-cfg params cfg))
-     ((equal? mode "sccp") (sccp-cfg params cfg))
+     ((equal? mode "sccp")
+      (apply sccp-cfg params cfg maybe-entry?))
      ((equal? mode "control") (control-cfg params cfg))
      (else cfg))))
 
@@ -81,7 +92,7 @@
          (cfa-analysis (run-0cfa cfa-normalized exported-labels))
          (cfa-rewritten (rewrite-known-calls cfa-normalized cfa-analysis)))
     (let-values (((tac-instrs procedures) (expr->tac cfa-rewritten)))
-      (let* ((entry-cfg (maybe-ssa-round-trip '() (build-cfg tac-instrs)))
+      (let* ((entry-cfg (maybe-ssa-round-trip '() (build-cfg tac-instrs) #t))
              (procedure-cfgs
               (map (lambda (procedure)
                      (cons procedure

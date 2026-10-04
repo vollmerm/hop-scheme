@@ -24,6 +24,9 @@
   ;;; and blocks, and removes definitions nobody reads.
   (export sccp-cfg
           sccp-ssa
+          set-shape-depth!
+          set-remove-dead-allocation!
+          value-table-size
           control-cfg
           control-ssa)
   (import (scheme base)
@@ -118,39 +121,133 @@
      blocks)))
 
 ;;; --- Lattice ---
+;;;
+;;; Values are interned, so equal values are eq?.
+;;;
+;;;   bot       nothing yet (unreachable)
+;;;   unknown   anything
+;;;   const     a literal: number, boolean, '(), or (quote sym)
+;;;   cons      a pair whose car and cdr are described by values, each with an
+;;;             optional SSA name that is known to hold exactly that component
+;;;
+;;; The depth bound k limits how much structure a cons keeps: a cons keeps its
+;;; children only while the nesting below it is at most k deep, and a cons
+;;; beyond that is crushed to pair-value (a pair of unknown contents). The
+;;; depth counts nesting along any path, through car or cdr alike. k = 0 keeps
+;;; only "this is a pair", which is what the old unsafe-car/cdr pass knew.
+;;; Component names are dropped at k = 0.
+;;;
+;;; A component name is only valid where the name is in scope. It is: the name
+;;; was an operand of the cons that built the pair, so it dominates the pair,
+;;; and joins keep a name only when every incoming pair has it.
+
+(define shape-depth 0)
+(define (set-shape-depth! k) (set! shape-depth k))
+(define remove-dead-allocation #f)
+(define (set-remove-dead-allocation! flag) (set! remove-dead-allocation flag))
 
 (define unknown 'unknown)
 (define bot 'bot)
-(define pair-value 'pair)
-(define (const c) (list 'const c))
-(define (const? v) (and (pair? v) (eq? (car v) 'const)))
-(define (const-value v) (cadr v))
-(define nil-value (const '()))
 (define (bot? v) (eq? v bot))
+
+(define node-count 0)
+(define (next-id!) (set! node-count (+ node-count 1)) node-count)
+(define const-table (make-hash-table))
+(define cons-table (make-hash-table))
+(define (value-table-size) node-count)
+
+(define (const c)
+  (or (hash-table-ref/default const-table c #f)
+      (let ((node (vector 'const c (next-id!))))
+        (hash-table-set! const-table c node)
+        node)))
+(define (const? v) (and (vector? v) (eq? (vector-ref v 0) 'const)))
+(define (const-value v) (vector-ref v 1))
+(define nil-value (const '()))
 (define (nil? v) (and (const? v) (null? (const-value v))))
+
+;; #(cons car car-name cdr cdr-name depth id)
+(define (cons? v) (and (vector? v) (eq? (vector-ref v 0) 'cons)))
+(define (cons-car v) (vector-ref v 1))
+(define (cons-car-name v) (vector-ref v 2))
+(define (cons-cdr v) (vector-ref v 3))
+(define (cons-cdr-name v) (vector-ref v 4))
+(define (cons-depth v) (vector-ref v 5))
+(define (value-depth v) (if (cons? v) (cons-depth v) 0))
+(define (value-id v)
+  (cond ((eq? v unknown) 0)
+        ((eq? v bot) -1)
+        ((const? v) (vector-ref v 2))
+        (else (vector-ref v 6))))
+
+(define (make-cons-value a an d dn)
+  (let ((key (list (value-id a) an (value-id d) dn)))
+    (or (hash-table-ref/default cons-table key #f)
+        (let ((node (vector 'cons a an d dn
+                            (+ 1 (max (value-depth a) (value-depth d)))
+                            (next-id!))))
+          (hash-table-set! cons-table key node)
+          node))))
+
+(define pair-value (make-cons-value unknown #f unknown #f))
+
+(define (limit v k)
+  (cond
+   ((not (cons? v)) v)
+   ((or (eq? v pair-value) (<= (cons-depth v) k)) v)
+   ((<= k 0) pair-value)
+   (else
+    (make-cons-value (limit (cons-car v) (- k 1)) (cons-car-name v)
+                     (limit (cons-cdr v) (- k 1)) (cons-cdr-name v)))))
 
 (define (join a b)
   (cond
    ((bot? a) b)
    ((bot? b) a)
-   ((equal? a b) a)
+   ((eq? a b) a)
+   ((and (cons? a) (cons? b))
+    (make-cons-value (join (cons-car a) (cons-car b))
+                     (and (eq? (cons-car-name a) (cons-car-name b)) (cons-car-name a))
+                     (join (cons-cdr a) (cons-cdr b))
+                     (and (eq? (cons-cdr-name a) (cons-cdr-name b)) (cons-cdr-name a))))
    (else unknown)))
+
+(define (strip-names v)
+  (if (cons? v)
+      (make-cons-value (strip-names (cons-car v)) #f (strip-names (cons-cdr v)) #f)
+      v))
 
 ;; The constant for a literal expression, or unknown for other operands.
 (define (literal-value expr)
   (if (literal-expr? expr) (const expr) unknown))
 
-(define (truthy? v) (not (and (const? v) (eq? (const-value v) #f))))
+(define (truthy? v) (not (eq? v (const #f))))
 
 (define (bool-value b) (const (if b #t #f)))
 
 (define foldable-arithmetic
   `((+ . ,+) (- . ,-) (* . ,*) (= . ,=) (< . ,<) (> . ,>)))
 
-(define (eval-primop op args)
+;; The component of a pair value, as (value . name).
+(define (component v which)
+  (cond
+   ((bot? v) (cons bot #f))
+   ((cons? v) (if (eq? which 'car)
+                  (cons (cons-car v) (cons-car-name v))
+                  (cons (cons-cdr v) (cons-cdr-name v))))
+   (else (cons unknown #f))))
+
+;; names holds each operand's variable name, or #f for a literal.
+(define (eval-primop op args names)
   (cond
    ((memq #f (map (lambda (a) (not (bot? a))) args)) bot)
-   ((and (eq? op 'cons) (= (length args) 2)) pair-value)
+   ((and (eq? op 'cons) (= (length args) 2))
+    (let ((an (and (not (const? (car args))) (car names)))
+          (dn (and (not (const? (cadr args))) (cadr names))))
+      (limit (make-cons-value (car args) an (cadr args) dn) shape-depth)))
+   ((and (memq op '(car cdr unsafe-car unsafe-cdr)) (= (length args) 1))
+    (car (component (car args)
+                    (if (memq op '(car unsafe-car)) 'car 'cdr))))
    ((and (assq op foldable-arithmetic) (= (length args) 2))
     (if (and (const? (car args)) (const? (cadr args))
              (number? (const-value (car args)))
@@ -165,16 +262,16 @@
         unknown))
    ((and (eq? op 'null?) (= (length args) 1))
     (cond ((nil? (car args)) (bool-value #t))
-          ((or (const? (car args)) (eq? (car args) pair-value)) (bool-value #f))
+          ((or (const? (car args)) (cons? (car args))) (bool-value #f))
           (else unknown)))
    ((and (eq? op 'pair?) (= (length args) 1))
-    (cond ((eq? (car args) pair-value) (bool-value #t))
+    (cond ((cons? (car args)) (bool-value #t))
           ((const? (car args)) (bool-value #f))
           (else unknown)))
    ((and (eq? op 'symbol?) (= (length args) 1))
     (cond ((const? (car args))
            (bool-value (quoted-symbol-expr? (const-value (car args)))))
-          ((eq? (car args) pair-value) (bool-value #f))
+          ((cons? (car args)) (bool-value #f))
           (else unknown)))
    (else unknown)))
 
@@ -182,11 +279,22 @@
   (cond
    ((bot? v) bot)
    ((eq? kind 'pair)
-    (if (const? v) bot pair-value))
+    (cond ((const? v) bot) ((cons? v) v) (else pair-value)))
    (else
-    (if (or (const? v) (eq? v pair-value))
-        (if (nil? v) v bot)
-        nil-value))))
+    (cond ((nil? v) v)
+          ((or (const? v) (cons? v)) bot)
+          (else nil-value)))))
+
+;; Values the pass has learned for hoisted quote cells (hop_q_...), which are
+;; written once, by the program's entry code, before any procedure runs. Cleared
+;; when a new entry procedure is processed.
+(define quote-cell-values (make-hash-table))
+(define (reset-quote-cells!) (set! quote-cell-values (make-hash-table)))
+(define (quote-cell? label)
+  (and (symbol? label)
+       (let ((name (symbol->string label)))
+         (and (> (string-length name) 6)
+              (string=? (substring name 0 6) "hop_q_")))))
 
 ;;; --- Analysis ---
 
@@ -215,10 +323,11 @@
       (cond
        ((symbol? operand) (hash-table-ref/default values operand bot))
        (else (literal-value operand))))
+    (define (operand-name operand) (and (symbol? operand) operand))
     (define (update! var new)
       (let* ((old (hash-table-ref/default values var bot))
              (merged (join old new)))
-        (unless (equal? old merged)
+        (unless (eq? old merged)
           (hash-table-set! values var merged)
           (set! ssa-list (append (hash-table-ref/default use-sites var '())
                                  ssa-list)))))
@@ -234,9 +343,11 @@
        ((symbol? rhs) (value-of rhs))
        ((literal-expr? rhs) (const rhs))
        ((primop-rhs? rhs)
-        (eval-primop (cadr rhs) (map value-of (cddr rhs))))
+        (eval-primop (cadr rhs) (map value-of (cddr rhs)) (map operand-name (cddr rhs))))
        ((and (pair? rhs) (eq? (car rhs) 'cons))
-        (eval-primop 'cons (map value-of (cdr rhs))))
+        (eval-primop 'cons (map value-of (cdr rhs)) (map operand-name (cdr rhs))))
+       ((and (pair? rhs) (eq? (car rhs) 'global))
+        (hash-table-ref/default quote-cell-values (cadr rhs) unknown))
        ((and (pair? rhs) (eq? (car rhs) 'pi))
         (eval-pi (cadr rhs) (value-of (caddr rhs))))
        (else unknown)))
@@ -321,6 +432,25 @@
      blocks)
     (make-analysis values visited edges iterations)))
 
+;; Records what the entry code stored in each hoisted quote cell, without
+;; component names (they belong to the entry procedure).
+(define (harvest-quote-cells! analysis blocks)
+  (for-each-index
+   (lambda (b block)
+     (when (vector-ref (analysis-visited analysis) b)
+       (for-each
+        (lambda (instr)
+          (when (and (eq? (car instr) 'set-global!) (quote-cell? (cadr instr)))
+            (let ((operand (caddr instr)))
+              (hash-table-set!
+               quote-cell-values (cadr instr)
+               (strip-names
+                (if (symbol? operand)
+                    (hash-table-ref/default (analysis-values analysis) operand unknown)
+                    (literal-value operand)))))))
+        (ssa-block-instrs block))))
+   blocks))
+
 (define (ssa-proc-param-names ssa)
   (params-names (ssa-proc-params ssa)))
 
@@ -329,6 +459,8 @@
 (define (rewrite-instr analysis instr)
   (define (value-of var)
     (hash-table-ref/default (analysis-values analysis) var bot))
+  (define (operand-value operand)
+    (if (symbol? operand) (value-of operand) (literal-value operand)))
   (case (car instr)
     ((assign)
      (let ((dst (cadr instr)) (rhs (caddr instr)))
@@ -339,14 +471,19 @@
         ((and (const? (value-of dst))
               (or (symbol? rhs)
                   (and (primop-rhs? rhs)
-                       (memq (cadr rhs) '(+ - * = < > eq? null? pair? symbol?)))))
+                       (memq (cadr rhs) '(+ - * = < > eq? null? pair? symbol?
+                                          car cdr unsafe-car unsafe-cdr)))))
          `(assign ,dst ,(const-value (value-of dst))))
         ((and (primop-rhs? rhs)
-              (memq (cadr rhs) '(car cdr))
+              (memq (cadr rhs) '(car cdr unsafe-car unsafe-cdr))
               (symbol? (caddr rhs))
-              (eq? (value-of (caddr rhs)) pair-value))
-         `(assign ,dst (primop ,(if (eq? (cadr rhs) 'car) 'unsafe-car 'unsafe-cdr)
-                               ,(caddr rhs))))
+              (cons? (value-of (caddr rhs))))
+         (let* ((which (if (memq (cadr rhs) '(car unsafe-car)) 'car 'cdr))
+                (name (cdr (component (value-of (caddr rhs)) which))))
+           (if name
+               `(assign ,dst ,name)
+               `(assign ,dst (primop ,(if (eq? which 'car) 'unsafe-car 'unsafe-cdr)
+                                     ,(caddr rhs))))))
         (else instr))))
     (else instr)))
 
@@ -541,10 +678,18 @@
 
 ;; Optimizes an SSA procedure (with pi nodes inserted and removed inside).
 ;; remove-allocation? also deletes unread cons cells.
+;; entry? marks the program's entry procedure: what it stores in hoisted quote
+;; cells is recorded for the procedures processed after it.
 (define (sccp-ssa ssa . options)
-  (let ((remove-allocation? (and (pair? options) (car options)))
+  (let ((remove-allocation? (if (and (pair? options) (car options))
+                                (car options)
+                                remove-dead-allocation))
+        (entry? (and (pair? options) (pair? (cdr options)) (cadr options)))
         (blocks (ssa-proc-blocks ssa)))
     (insert-pis! blocks)
+    (when entry?
+      (reset-quote-cells!)
+      (harvest-quote-cells! (analyze ssa) blocks))
     (let ((analysis (analyze ssa)))
       (for-each-index
        (lambda (b block)
@@ -559,8 +704,10 @@
         (remove-dead-definitions! pruned remove-allocation?)
         (make-ssa-proc (ssa-proc-params ssa) pruned)))))
 
-(define (sccp-cfg params cfg)
-  (ssa->cfg (check-ssa (sccp-ssa (check-ssa (cfg->ssa params cfg))))))
+(define (sccp-cfg params cfg . maybe-entry?)
+  (ssa->cfg (check-ssa (sccp-ssa (check-ssa (cfg->ssa params cfg))
+                                 #f
+                                 (and (pair? maybe-entry?) (car maybe-entry?))))))
 
 ;; The control for measurements: the same SSA round trip and cleanup (pi nodes,
 ;; copy propagation, dead definition removal) with the analysis switched off,
