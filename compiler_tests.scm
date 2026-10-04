@@ -1089,6 +1089,18 @@
          (inc (lambda (y) (+ y 1))))
      (+ (g inc 1) (g inc 5))))
 
+(define test140
+  '(letrec ((go (lambda (n l)
+                  (if (= n 0)
+                      (car (cdr l))
+                      (go (- n 1) (cons n (cdr l)))))))
+     (go 3 (cons 0 (cons 9 '())))))
+
+(define test141
+  '(letrec ((ev (lambda (n l) (if (= n 0) (car l) (od (- n 1) (cdr l)))))
+            (od (lambda (n l) (if (= n 0) (car (cdr l)) (ev (- n 1) (cdr l))))))
+     (ev 3 (cons 1 (cons 2 (cons 3 (cons 4 (cons 5 '()))))))))
+
 (define sample-tests
   (list (cons "Test 1: Simple arithmetic" test1)
         (cons "Test 2: Lambda application" test2)
@@ -1227,7 +1239,9 @@
         (cons "Test 136: car and cdr of a quoted list" test136)
         (cons "Test 137: accessor and constructor inlined into the caller" test137)
         (cons "Test 138: inlining a callee that loops" test138)
-        (cons "Test 139: inlining a callee that tail-calls an unknown closure" test139)))
+        (cons "Test 139: inlining a callee that tail-calls an unknown closure" test139)
+        (cons "Test 140: single-use letrec loop becomes a loop of the caller" test140)
+        (cons "Test 141: mutually tail-recursive local functions with a known start" test141)))
 
 (define named-tests
   ;; These are runnable end-to-end regression cases. test6 and test7 stay as
@@ -1367,7 +1381,9 @@
          (cons 'test136 test136)
          (cons 'test137 test137)
          (cons 'test138 test138)
-         (cons 'test139 test139)))
+         (cons 'test139 test139)
+         (cons 'test140 test140)
+         (cons 'test141 test141)))
 
 (define (lookup-named-test name)
   (let ((binding (assoc name named-tests)))

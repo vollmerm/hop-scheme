@@ -321,6 +321,8 @@ runtime_cases=(
   "test137|2"
   "test138|16"
   "test139|8"
+  "test140|9"
+  "test141|5"
 )
 
 csi -R r7rs -I "$ROOT" -s "$ROOT/ssa_tests.scm"
@@ -677,12 +679,17 @@ check_inlined() {
   printf 'ok inlined %s\n' "$test_name"
 }
 
-for entry in "test130|6" "test131|5" "test133|7" "test136|5" "test137|2" "test138|16" "test139|8"; do
+for entry in "test118|101" "test130|6" "test131|5" "test133|7" "test136|5" "test137|2" "test138|16" "test139|8" "test140|9" "test141|5"; do
   check_inlined "${entry%%|*}" "${entry##*|}"
 done
-HOP_INLINE=30 HOP_PRUNE=1 HOP_SSA=sccp HOP_SHAPE_K=3 generate test137 "$TMPDIR/inlined_shape_test137.s"
-if grep -Eq '_hop_(car|cdr|alloc_pair)' "$TMPDIR/inlined_shape_test137.s"; then
-  echo "inlining test137 left a car, cdr or allocation behind" >&2; exit 1
-fi
+for t in test137 test140; do
+  HOP_INLINE=30 HOP_PRUNE=1 HOP_SSA=sccp HOP_SHAPE_K=3 generate "$t" "$TMPDIR/inlined_shape_$t.s"
+  if grep -Eq '_hop_(car|cdr|alloc_pair)' "$TMPDIR/inlined_shape_$t.s" && [[ $t == test137 ]]; then
+    echo "inlining $t left a car, cdr or allocation behind" >&2; exit 1
+  fi
+  if grep -Eq '_hop_(car|cdr)' "$TMPDIR/inlined_shape_$t.s"; then
+    echo "inlining $t left a car or cdr behind" >&2; exit 1
+  fi
+done
 
 echo "compiler tests passed"
