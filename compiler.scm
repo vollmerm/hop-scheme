@@ -35,6 +35,7 @@
         (hop pass closure)
         (hop pass cfa)
         (hop pass tac)
+        (hop pass inline)
         (hop pass cfg)
         (hop pass ssa)
         (hop pass sccp)
@@ -73,6 +74,21 @@
      ((equal? mode "control") (control-cfg params cfg))
      (else cfg))))
 
+;; HOP_INLINE=<n> inlines known procedures of at most n instructions (off when
+;; unset or 0); see (hop pass inline).
+(define (maybe-inline entry-instrs procedures exported-labels)
+  (let* ((text (get-environment-variable "HOP_INLINE"))
+         (size (and text (string->number text))))
+    (let-values (((entry inlined)
+                  (if (and size (> size 0))
+                      (inline-known-calls entry-instrs procedures size)
+                      (values entry-instrs procedures))))
+      ;; HOP_PRUNE=1 drops unread top-level definitions and the procedures
+      ;; only they reached.
+      (if (equal? (get-environment-variable "HOP_PRUNE") "1")
+          (prune-dead-procedures entry inlined exported-labels)
+          (values entry inlined)))))
+
 ;; Shared by every entry point below, whichever way a lowered program's
 ;; top-level bindings got their labels (plain compile-to-cfg's unqualified
 ;; ones, or compile-unit-to-cfg's library-qualified ones): from uniquify's
@@ -91,7 +107,8 @@
          (cfa-normalized (normalize-for-cfa closure-converted))
          (cfa-analysis (run-0cfa cfa-normalized exported-labels))
          (cfa-rewritten (rewrite-known-calls cfa-normalized cfa-analysis)))
-    (let-values (((tac-instrs procedures) (expr->tac cfa-rewritten)))
+    (let*-values (((raw-instrs raw-procedures) (expr->tac cfa-rewritten))
+                  ((tac-instrs procedures) (maybe-inline raw-instrs raw-procedures exported-labels)))
       (let* ((entry-cfg (maybe-ssa-round-trip '() (build-cfg tac-instrs) #t))
              (procedure-cfgs
               (map (lambda (procedure)
