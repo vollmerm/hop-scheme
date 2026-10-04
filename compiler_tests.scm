@@ -1073,6 +1073,22 @@
 (define test136
   '(+ (car (cdr '(1 2 3))) (car (cdr (cdr '(1 2 3))))))
 
+(define test137
+  '(let ((second (lambda (x) (car (cdr x))))
+         (two (lambda (a b) (cons a (cons b '())))))
+     (second (two 1 2))))
+
+(define test138
+  '(let ((f (lambda (n)
+              (letrec ((go (lambda (i a) (if (= i 0) a (go (- i 1) (+ a i))))))
+                (go n 0)))))
+     (+ (f 4) (f 3))))
+
+(define test139
+  '(let ((g (lambda (h x) (h x)))
+         (inc (lambda (y) (+ y 1))))
+     (+ (g inc 1) (g inc 5))))
+
 (define sample-tests
   (list (cons "Test 1: Simple arithmetic" test1)
         (cons "Test 2: Lambda application" test2)
@@ -1208,7 +1224,10 @@
         (cons "Test 133: branch refinement then car" test133)
         (cons "Test 134: dead allocation" test134)
         (cons "Test 135: eq? on distinct equal-shaped allocations" test135)
-        (cons "Test 136: car and cdr of a quoted list" test136)))
+        (cons "Test 136: car and cdr of a quoted list" test136)
+        (cons "Test 137: accessor and constructor inlined into the caller" test137)
+        (cons "Test 138: inlining a callee that loops" test138)
+        (cons "Test 139: inlining a callee that tail-calls an unknown closure" test139)))
 
 (define named-tests
   ;; These are runnable end-to-end regression cases. test6 and test7 stay as
@@ -1345,7 +1364,10 @@
          (cons 'test133 test133)
          (cons 'test134 test134)
          (cons 'test135 test135)
-         (cons 'test136 test136)))
+         (cons 'test136 test136)
+         (cons 'test137 test137)
+         (cons 'test138 test138)
+         (cons 'test139 test139)))
 
 (define (lookup-named-test name)
   (let ((binding (assoc name named-tests)))

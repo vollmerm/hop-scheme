@@ -318,6 +318,9 @@ runtime_cases=(
   "test134|7"
   "test135|1"
   "test136|5"
+  "test137|2"
+  "test138|16"
+  "test139|8"
 )
 
 csi -R r7rs -I "$ROOT" -s "$ROOT/ssa_tests.scm"
@@ -662,5 +665,24 @@ assert_shape 1 test134 '_hop_alloc_pair' no 'dead allocation'
 assert_shape 0 test134 '_hop_alloc_pair' yes 'allocation kept at k=0 (dead allocation removal off)'
 assert_shape 3 test135 '_hop_alloc_pair' yes 'allocation merged although eq? could tell them apart'
 assert_shape 3 test136 '_hop_(car|cdr)' no 'accessor on a quoted list'
+
+# Inlining (HOP_INLINE) with pruning and the cons analysis: the answers must not
+# change, and inlined accessors/constructors must disappear.
+check_inlined() {
+  local test_name="$1" expected="$2"
+  local asm_path="$TMPDIR/inlined_${test_name}.s" exe_path="$TMPDIR/inlined_${test_name}"
+  HOP_INLINE=30 HOP_PRUNE=1 HOP_SSA=sccp HOP_SHAPE_K=3 generate "$test_name" "$asm_path"
+  clang -arch arm64 -o "$exe_path" "$asm_path" "$ROOT/runtime.c" "$ROOT/codegen_harness.c"
+  "$exe_path" "$expected" >/dev/null
+  printf 'ok inlined %s\n' "$test_name"
+}
+
+for entry in "test130|6" "test131|5" "test133|7" "test136|5" "test137|2" "test138|16" "test139|8"; do
+  check_inlined "${entry%%|*}" "${entry##*|}"
+done
+HOP_INLINE=30 HOP_PRUNE=1 HOP_SSA=sccp HOP_SHAPE_K=3 generate test137 "$TMPDIR/inlined_shape_test137.s"
+if grep -Eq '_hop_(car|cdr|alloc_pair)' "$TMPDIR/inlined_shape_test137.s"; then
+  echo "inlining test137 left a car, cdr or allocation behind" >&2; exit 1
+fi
 
 echo "compiler tests passed"
