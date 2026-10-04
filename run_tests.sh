@@ -314,6 +314,7 @@ runtime_cases=(
 )
 
 csi -R r7rs -I "$ROOT" -s "$ROOT/ssa_tests.scm"
+csi -R r7rs -I "$ROOT" -s "$ROOT/sccp_tests.scm"
 
 generate_all
 
