@@ -1043,6 +1043,36 @@
   '(let ((x 4))
      (if (null? (cdr `(,x))) (car `(,x)) 0)))
 
+(define test130
+  '(let ((pick (lambda (c) (car (cdr (cdr (if c '(1 2 3) '(1 4 3))))))))
+     (+ (pick #t) (pick #f))))
+
+(define test131
+  '(let ((f (lambda (a b) (car (cdr (cons a (cons b '())))))))
+     (f 1 5)))
+
+(define test132
+  '(letrec ((go (lambda (n l)
+                  (if (= n 0)
+                      (car (cdr l))
+                      (go (- n 1) (cons n (cdr l)))))))
+     (go 3 (cons 0 (cons 9 '())))))
+
+(define test133
+  '(let ((f (lambda (x) (if (pair? x) (car x) 0))))
+     (+ (f (cons 7 1)) (f 5))))
+
+(define test134
+  '(let ((f (lambda (a) (let ((p (cons a a))) 7))))
+     (f 1)))
+
+(define test135
+  '(let ((a (cons 1 2)) (b (cons 1 2)))
+     (+ (if (eq? a b) 10 0) (if (eq? a a) 1 0))))
+
+(define test136
+  '(+ (car (cdr '(1 2 3))) (car (cdr (cdr '(1 2 3))))))
+
 (define sample-tests
   (list (cons "Test 1: Simple arithmetic" test1)
         (cons "Test 2: Lambda application" test2)
@@ -1171,7 +1201,14 @@
         (cons "Test 126: quasiquote with dotted unquote" test126)
         (cons "Test 127: fully static quasiquote" test127)
         (cons "Test 128: nested quasiquote levels" test128)
-        (cons "Test 129: quasiquote of a one-element list" test129)))
+        (cons "Test 129: quasiquote of a one-element list" test129)
+        (cons "Test 130: join of two quoted lists, then caddr" test130)
+        (cons "Test 131: car of cdr of a consed list" test131)
+        (cons "Test 132: loop that keeps a known tail" test132)
+        (cons "Test 133: branch refinement then car" test133)
+        (cons "Test 134: dead allocation" test134)
+        (cons "Test 135: eq? on distinct equal-shaped allocations" test135)
+        (cons "Test 136: car and cdr of a quoted list" test136)))
 
 (define named-tests
   ;; These are runnable end-to-end regression cases. test6 and test7 stay as
@@ -1301,7 +1338,14 @@
          (cons 'test126 test126)
          (cons 'test127 test127)
          (cons 'test128 test128)
-         (cons 'test129 test129)))
+         (cons 'test129 test129)
+         (cons 'test130 test130)
+         (cons 'test131 test131)
+         (cons 'test132 test132)
+         (cons 'test133 test133)
+         (cons 'test134 test134)
+         (cons 'test135 test135)
+         (cons 'test136 test136)))
 
 (define (lookup-named-test name)
   (let ((binding (assoc name named-tests)))

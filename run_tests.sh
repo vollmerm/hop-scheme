@@ -311,6 +311,13 @@ runtime_cases=(
   "test127|2"
   "test128|5"
   "test129|4"
+  "test130|6"
+  "test131|5"
+  "test132|9"
+  "test133|7"
+  "test134|7"
+  "test135|1"
+  "test136|5"
 )
 
 csi -R r7rs -I "$ROOT" -s "$ROOT/ssa_tests.scm"
@@ -629,5 +636,31 @@ printf '%s\n' \
   >"$cc_prog_path"
 
 assert_multi_file_output "multi-file-callcc" "3" "$cc_lib_path" "$cc_prog_path"
+
+# Structural cons analysis (HOP_SSA=sccp, depth k): compile the fixture with the
+# analysis on and check the code shape. Always fatal, whatever HOP_SSA is outside.
+assert_shape() {
+  local depth="$1" test_name="$2" pattern="$3" want="$4" description="$5"
+  local asm_path="$TMPDIR/shape_${test_name}_k${depth}.s"
+  if [[ ! -f "$asm_path" ]]; then
+    HOP_SSA=sccp HOP_SHAPE_K="$depth" generate "$test_name" "$asm_path"
+  fi
+  if grep -Eq "$pattern" "$asm_path"; then
+    [[ "$want" == "no" ]] && { printf 'unexpected %s in %s (k=%s)\n' "$description" "$test_name" "$depth" >&2; exit 1; }
+  else
+    [[ "$want" == "yes" ]] && { printf 'missing %s in %s (k=%s)\n' "$description" "$test_name" "$depth" >&2; exit 1; }
+  fi
+  return 0
+}
+
+assert_shape 3 test130 '_hop_(car|cdr)' no 'accessor call after joining two quoted lists'
+assert_shape 0 test130 '_hop_(car|cdr)' yes 'accessor kept at k=0 (pair-ness only)'
+assert_shape 3 test131 '_hop_(car|cdr)|_hop_alloc_pair' no 'accessor or allocation for car/cdr of a consed list'
+assert_shape 0 test131 '_hop_alloc_pair' yes 'allocation kept at k=0'
+assert_shape 3 test133 '_hop_car' no 'safe car after a pair? test'
+assert_shape 1 test134 '_hop_alloc_pair' no 'dead allocation'
+assert_shape 0 test134 '_hop_alloc_pair' yes 'allocation kept at k=0 (dead allocation removal off)'
+assert_shape 3 test135 '_hop_alloc_pair' yes 'allocation merged although eq? could tell them apart'
+assert_shape 3 test136 '_hop_(car|cdr)' no 'accessor on a quoted list'
 
 echo "compiler tests passed"
