@@ -15,10 +15,11 @@
   ;;; max-size are copied. Procedures are never removed, so the originals stay
   ;;; available to closures and unknown callers.
   (export inline-known-calls
+          set-inline-tiny-size!
           prune-dead-procedures)
   (import (scheme base)
           (scheme cxr)
-          (only (srfi 1) filter delete-duplicates any)
+          (only (srfi 1) filter delete-duplicates any every)
           (srfi 69)
           (hop utils)
           (hop pass tac)
@@ -116,6 +117,60 @@
                  callee-instrs))
      (if result (list `(label ,join)) '()))))
 
+;;; --- Deciding whether a call is worth inlining ---
+
+;; Procedures whose only reference anywhere is one direct call.
+(define (single-use-procedures entry-instrs procedures)
+  (let ((counts (make-hash-table))
+        (result (make-hash-table)))
+    (define (count! name amount)
+      (hash-table-update!/default counts name (lambda (n) (+ n amount)) 0))
+    (for-each
+     (lambda (instrs)
+       (for-each
+        (lambda (instr)
+          (let ((rhs (rhs-of instr)))
+            (cond
+             ((direct-callee instr) => (lambda (name) (count! name 1)))
+             ((and (pair? rhs) (memq (car rhs) '(make-closure make-variadic-closure)))
+              (count! (cadr rhs) 1000)))))
+        instrs))
+     (cons entry-instrs (map procedure-instructions procedures)))
+    (for-each (lambda (name)
+                (when (= 1 (hash-table-ref counts name)) (hash-table-set! result name #t)))
+              (hash-table-keys counts))
+    result))
+
+(define tiny-size 3)
+(define (set-inline-tiny-size! n) (set! tiny-size n))
+
+(define reader-primops '(car cdr unsafe-car unsafe-cdr pair? null?))
+
+(define (primop-of rhs)
+  (and (pair? rhs) (eq? (car rhs) 'primop) (cadr rhs)))
+
+(define (quote-cell-read? rhs)
+  (and (pair? rhs) (eq? (car rhs) 'global)
+       (let ((name (symbol->string (cadr rhs))))
+         (and (> (string-length name) 6) (string=? (substring name 0 6) "hop_q_")))))
+
+;; Does this right-hand side visibly produce a pair (or the empty list), given
+;; the variables already known to hold one?
+(define (structured-rhs? rhs structured)
+  (cond
+   ((symbol? rhs) (hash-table-exists? structured rhs))
+   ((null? rhs) #t)
+   ((not (pair? rhs)) #f)
+   ((eq? (car rhs) 'cons) #t)
+   ((eq? (primop-of rhs) 'cons) #t)
+   ((quote-cell-read? rhs) #t)
+   (else #f)))
+
+(define (note-structured! instr structured)
+  (when (and (pair? instr) (eq? (car instr) 'assign)
+             (structured-rhs? (caddr instr) structured))
+    (hash-table-set! structured (cadr instr) #t)))
+
 (define (inline-known-calls entry-instrs procedures max-size)
   (let* ((table (make-hash-table))
          (recursive #f)
@@ -123,11 +178,13 @@
          (counter 0))
     (for-each (lambda (p) (hash-table-set! table (procedure-name p) p)) procedures)
     (set! recursive (recursive-procedures table))
+    (define single-use (single-use-procedures entry-instrs procedures))
     (define (inlinable? name)
       (and (hash-table-exists? table name)
            (not (hash-table-exists? recursive name))
            (not (params-variadic? (procedure-params (hash-table-ref table name))))
-           (<= (instruction-size (expanded-body name)) max-size)))
+           (or (hash-table-exists? single-use name)
+               (<= (instruction-size (expanded-body name)) max-size))))
     (define (expanded-body name)
       (or (hash-table-ref/default expanded name #f)
           (let ((body (expand (procedure-instructions (hash-table-ref table name)))))
@@ -136,22 +193,97 @@
     (define (fresh-suffix)
       (set! counter (+ counter 1))
       (string-append "i" (number->string counter)))
+
+    ;; For each parameter of a procedure: does it (or a callee it passes the
+    ;; parameter to) read the parameter as a pair?
+    (define consumption (make-hash-table))
+    (define (consumed-params name)
+      (cond
+       ((hash-table-ref/default consumption name #f) => (lambda (c) c))
+       ((not (hash-table-exists? table name)) '())
+       (else
+        (let* ((p (hash-table-ref table name))
+               (names (params-names (procedure-params p))))
+          (hash-table-set! consumption name (map (lambda (n) #f) names))
+          (let ((result (map (lambda (n) (reads-as-pair? n (procedure-instructions p)))
+                             names)))
+            (hash-table-set! consumption name result)
+            result)))))
+    (define (reads-as-pair? var instrs)
+      (any (lambda (instr)
+             (let ((rhs (rhs-of instr)))
+               (or (and rhs (memq (primop-of rhs) reader-primops)
+                        (eq? (caddr rhs) var))
+                   (and (direct-callee instr)
+                        (let ((args (if (eq? (car instr) 'direct-tail-call)
+                                        (cddr instr)
+                                        (cddr (caddr instr)))))
+                          (any (lambda (arg consumed) (and consumed (eq? arg var)))
+                               args (consumed-params (direct-callee instr))))))))
+           instrs))
+    (define (produces-pair? name)
+      (let ((p (hash-table-ref table name))
+            (built (make-hash-table)))
+        (for-each (lambda (instr) (note-structured! instr built))
+                  (procedure-instructions p))
+        (any (lambda (instr)
+               (and (eq? (car instr) 'return)
+                    (symbol? (cadr instr))
+                    (hash-table-exists? built (cadr instr))))
+             (procedure-instructions p))))
+
+    ;; Variables of a caller's instructions that the caller later reads as pairs.
+    (define (demanded-variables instrs)
+      (let ((demanded (make-hash-table)))
+        (let pass ((n 2))
+          (for-each
+           (lambda (instr)
+             (let ((rhs (rhs-of instr)))
+               (cond
+                ((and rhs (memq (primop-of rhs) reader-primops) (symbol? (caddr rhs)))
+                 (hash-table-set! demanded (caddr rhs) #t))
+                ((and rhs (symbol? rhs) (hash-table-exists? demanded (cadr instr)))
+                 (hash-table-set! demanded rhs #t))
+                ((direct-callee instr)
+                 (for-each (lambda (arg consumed)
+                             (when (and consumed (symbol? arg))
+                               (hash-table-set! demanded arg #t)))
+                           (if (eq? (car instr) 'direct-tail-call)
+                               (cddr instr)
+                               (cddr (caddr instr)))
+                           (consumed-params (direct-callee instr)))))))
+           instrs)
+          (when (> n 1) (pass (- n 1))))
+        demanded))
+
+    (define (worth-inlining? callee args result structured demanded)
+      (or (hash-table-exists? single-use callee)
+          (<= (instruction-size (expanded-body callee)) tiny-size)
+          (any (lambda (arg consumed)
+                 (and consumed (symbol? arg) (hash-table-exists? structured arg)))
+               args (consumed-params callee))
+          (and result (hash-table-exists? demanded result) (produces-pair? callee))))
+
     (define (expand instrs)
-      (apply append
-             (map (lambda (instr)
-                    (let ((callee (direct-callee instr)))
-                      (if (and callee (inlinable? callee))
-                          (let ((p (hash-table-ref table callee)))
-                            (if (eq? (car instr) 'direct-tail-call)
-                                (inline-site (params-names (procedure-params p))
-                                             (expanded-body callee)
-                                             (cddr instr) #f (fresh-suffix))
-                                (inline-site (params-names (procedure-params p))
-                                             (expanded-body callee)
-                                             (cddr (caddr instr))
-                                             (cadr instr) (fresh-suffix))))
-                          (list instr))))
-                  instrs)))
+      (let ((demanded (demanded-variables instrs))
+            (structured (make-hash-table)))
+        (apply append
+               (map (lambda (instr)
+                      (let* ((callee (direct-callee instr))
+                             (tail? (eq? (car instr) 'direct-tail-call))
+                             (args (and callee (if tail? (cddr instr) (cddr (caddr instr)))))
+                             (result (and callee (not tail?) (cadr instr)))
+                             (out (if (and callee (inlinable? callee)
+                                           (worth-inlining? callee args result
+                                                            structured demanded))
+                                      (let ((p (hash-table-ref table callee)))
+                                        (inline-site (params-names (procedure-params p))
+                                                     (expanded-body callee)
+                                                     args result (fresh-suffix)))
+                                      (list instr))))
+                        (for-each (lambda (i) (note-structured! i structured)) out)
+                        out))
+                    instrs))))
     (values (expand entry-instrs)
             (map (lambda (p)
                    (make-procedure (procedure-name p)
@@ -210,6 +342,75 @@
                           instrs)))
         (if (= (length kept) (length instrs)) kept (loop kept))))))
 
+;; A box that is only ever written (letrec lowering makes one per recursive
+;; binding; once inlining has removed every call through it nothing unboxes it)
+;; can go together with its set-box! instructions. Aliases made by copying the
+;; box count as the same box.
+(define (drop-dead-boxes instrs)
+  (let ((defs (make-hash-table))     ; var -> list of right-hand sides
+        (candidates (make-hash-table)))
+    (for-each (lambda (instr)
+                (let ((rhs (rhs-of instr)))
+                  (when rhs
+                    (hash-table-update!/default defs (cadr instr)
+                                                (lambda (l) (cons rhs l)) '()))))
+              instrs)
+    (for-each (lambda (var)
+                (when (every (lambda (rhs) (or (symbol? rhs)
+                                               (and (pair? rhs) (eq? (car rhs) 'box))))
+                             (hash-table-ref defs var))
+                  (when (any (lambda (rhs) (and (pair? rhs) (eq? (car rhs) 'box)))
+                             (hash-table-ref defs var))
+                    (hash-table-set! candidates var #t))))
+              (hash-table-keys defs))
+    ;; Copies of candidates are candidates when every definition is a box or a
+    ;; copy of a candidate.
+    (let grow ()
+      (let ((changed? #f))
+        (for-each
+         (lambda (var)
+           (when (and (not (hash-table-exists? candidates var))
+                      (every (lambda (rhs)
+                               (or (and (symbol? rhs) (hash-table-exists? candidates rhs))
+                                   (and (pair? rhs) (eq? (car rhs) 'box))))
+                             (hash-table-ref defs var)))
+             (hash-table-set! candidates var #t)
+             (set! changed? #t)))
+         (hash-table-keys defs))
+        (when changed? (grow))))
+    ;; A candidate escapes when it is used for anything but being written
+    ;; through or being copied into another candidate.
+    (let shrink ()
+      (let ((changed? #f))
+        (for-each
+         (lambda (instr)
+           (define (escape! v)
+             (when (and (symbol? v) (hash-table-exists? candidates v))
+               (hash-table-delete! candidates v)
+               (set! changed? #t)))
+           (cond
+            ((and (eq? (car instr) 'set-box!))
+             (escape! (caddr instr)))
+            ((and (eq? (car instr) 'assign) (symbol? (caddr instr)))
+             (if (hash-table-exists? candidates (cadr instr))
+                 ;; an alias of a box that is still read is not dead either
+                 (unless (hash-table-exists? candidates (caddr instr))
+                   (escape! (cadr instr)))
+                 (escape! (caddr instr))))
+            (else
+             (let ((uses (instr-uses instr)))
+               (for-each escape! uses)))))
+         instrs)
+        (when changed? (shrink))))
+    (if (= 0 (hash-table-size candidates))
+        instrs
+        (filter (lambda (instr)
+                  (not (or (and (eq? (car instr) 'set-box!)
+                                (hash-table-exists? candidates (cadr instr)))
+                           (and (eq? (car instr) 'assign)
+                                (hash-table-exists? candidates (cadr instr))))))
+                instrs))))
+
 ;; Removes assignments of side-effect-free values that nothing reads (such as
 ;; the loads of a closure that inlining made redundant), until none are left.
 (define (drop-dead-loads instrs)
@@ -226,9 +427,12 @@
                                (or (symbol? rhs)
                                    (literal-expr? rhs)
                                    (and (pair? rhs)
-                                        (memq (car rhs) '(global closure-env-ref))))))))
+                                        (memq (car rhs) '(global closure-env-ref unbox))))))))
                  instrs)))
-      (if (= (length kept) (length instrs)) kept (drop-dead-loads kept)))))
+      (let ((without-boxes (drop-dead-boxes kept)))
+        (if (= (length without-boxes) (length instrs))
+            without-boxes
+            (drop-dead-loads without-boxes))))))
 
 (define (prune-dead-procedures raw-entry raw-procedures exported-labels)
   (let* ((entry-instrs (drop-dead-loads raw-entry))

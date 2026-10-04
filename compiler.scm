@@ -78,16 +78,22 @@
 ;; unset or 0); see (hop pass inline).
 (define (maybe-inline entry-instrs procedures exported-labels)
   (let* ((text (get-environment-variable "HOP_INLINE"))
-         (size (and text (string->number text))))
-    (let-values (((entry inlined)
-                  (if (and size (> size 0))
-                      (inline-known-calls entry-instrs procedures size)
+         (size (and text (string->number text)))
+         (prune? (equal? (get-environment-variable "HOP_PRUNE") "1")))
+    ;; HOP_PRUNE=1 drops unread top-level definitions and the procedures only
+    ;; they reached. It runs first so that inlining sees only real references,
+    ;; and again afterwards for what inlining left unreferenced.
+    (let-values (((entry0 procedures0)
+                  (if prune?
+                      (prune-dead-procedures entry-instrs procedures exported-labels)
                       (values entry-instrs procedures))))
-      ;; HOP_PRUNE=1 drops unread top-level definitions and the procedures
-      ;; only they reached.
-      (if (equal? (get-environment-variable "HOP_PRUNE") "1")
-          (prune-dead-procedures entry inlined exported-labels)
-          (values entry inlined)))))
+      (let-values (((entry1 procedures1)
+                    (if (and size (> size 0))
+                        (inline-known-calls entry0 procedures0 size)
+                        (values entry0 procedures0))))
+        (if prune?
+            (prune-dead-procedures entry1 procedures1 exported-labels)
+            (values entry1 procedures1))))))
 
 ;; Shared by every entry point below, whichever way a lowered program's
 ;; top-level bindings got their labels (plain compile-to-cfg's unqualified
