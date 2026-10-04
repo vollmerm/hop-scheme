@@ -547,52 +547,70 @@
 (define (interval-start interval) (cadr interval))
 (define (interval-end interval) (caddr interval))
 
-;; One (var start end) per variable, covering every point where it is used,
-;; defined, or live across a block boundary, in numbering order.
-(define (collect-intervals numbering block-infos in-vec out-vec)
+;; One (var start end ranges) per variable. ranges is the ascending list of
+;; (first . last) point ranges where the variable occupies its home: points
+;; where it is live before or after the instruction, or defined by it. The gaps
+;; between ranges are lifetime holes. start and end bound the whole thing.
+;; Points number instructions consecutively across blocks, in block order.
+(define (collect-intervals numbering block-infos out-vec instruction-live-before)
   (let* ((names (numbering-names numbering))
          (count (vector-length names))
-         (starts (make-vector count #f))
-         (ends (make-vector count #f)))
+         (open-starts (make-vector count #f))
+         (open-lasts (make-vector count #f))
+         (closed (make-vector count '())))
+    (define (close! id)
+      (when (vector-ref open-starts id)
+        (vector-set! closed id
+                     (cons (cons (vector-ref open-starts id)
+                                 (vector-ref open-lasts id))
+                           (vector-ref closed id)))
+        (vector-set! open-starts id #f)))
     (define (touch! id point)
-      (if (vector-ref starts id)
-          (begin
-            (when (< point (vector-ref starts id))
-              (vector-set! starts id point))
-            (when (> point (vector-ref ends id))
-              (vector-set! ends id point)))
-          (begin
-            (vector-set! starts id point)
-            (vector-set! ends id point))))
-    (let loop-blocks ((remaining block-infos) (index 0) (point 0))
+      (cond
+        ((and (vector-ref open-starts id)
+              (= (vector-ref open-lasts id) point))
+         #f)
+        ((and (vector-ref open-starts id)
+              (= (+ (vector-ref open-lasts id) 1) point))
+         (vector-set! open-lasts id point))
+        (else
+         (close! id)
+         (vector-set! open-starts id point)
+         (vector-set! open-lasts id point))))
+    (let loop-blocks ((remaining block-infos)
+                      (live-before-lists instruction-live-before)
+                      (index 0)
+                      (point 0))
       (unless (null? remaining)
-        (let ((block-start point))
-          (for-each (lambda (id) (touch! id block-start))
-                    (bitset-ids (vector-ref in-vec index)))
-          (let loop-instrs ((rest (car remaining)) (next-point point))
-            (if (null? rest)
-                (let ((block-end (if (= next-point block-start)
-                                     block-start
-                                     (- next-point 1))))
-                  (for-each (lambda (id) (touch! id block-end))
-                            (bitset-ids (vector-ref out-vec index)))
-                  (loop-blocks (cdr remaining) (+ index 1) next-point))
-                (begin
-                  (for-each (lambda (id) (touch! id next-point))
-                            (instr-info-use-ids (car rest)))
-                  (for-each (lambda (id) (touch! id next-point))
-                            (instr-info-def-ids (car rest)))
-                  (loop-instrs (cdr rest) (+ next-point 1))))))))
+        (let loop-instrs ((rest (car remaining))
+                          (befores (car live-before-lists))
+                          (next-point point))
+          (if (null? rest)
+              (loop-blocks (cdr remaining) (cdr live-before-lists)
+                           (+ index 1) next-point)
+              (let* ((live-after (if (null? (cdr befores))
+                                     (vector-ref out-vec index)
+                                     (cadr befores)))
+                     (occupied (bitset-union
+                                (bitset-union (car befores) live-after)
+                                (instr-info-def-set (car rest)))))
+                (for-each (lambda (id) (touch! id next-point))
+                          (bitset-ids occupied))
+                (loop-instrs (cdr rest) (cdr befores) (+ next-point 1)))))))
     (let loop ((id (- count 1)) (result '()))
       (if (< id 0)
           result
-          (loop (- id 1)
-                (if (vector-ref starts id)
-                    (cons (list (vector-ref names id)
-                                (vector-ref starts id)
-                                (vector-ref ends id))
-                          result)
-                    result))))))
+          (begin
+            (close! id)
+            (let ((ranges (reverse (vector-ref closed id))))
+              (loop (- id 1)
+                    (if (null? ranges)
+                        result
+                        (cons (list (vector-ref names id)
+                                    (car (car ranges))
+                                    (cdr (car (reverse ranges)))
+                                    ranges)
+                              result)))))))))
 
 ;; Stable, so intervals starting together keep their numbering order.
 (define (sort-intervals-by-start intervals)
@@ -613,21 +631,6 @@
         (machine-block-instructions block)))
      blocks)
     biases))
-
-(define (insert-active interval active)
-  (if (null? active)
-      (list interval)
-      (if (< (interval-end interval) (interval-end (car active)))
-          (cons interval active)
-          (cons (car active)
-                (insert-active interval (cdr active))))))
-
-(define (register-order register)
-  (let loop ((rest aarch64-callee-saved) (index 0))
-    (cond
-      ((null? rest) index)
-      ((eq? (car rest) register) index)
-      (else (loop (cdr rest) (+ index 1))))))
 
 ;;; ── Copy coalescing ────────────────────────────────────────────────────────
 ;;; Runs before allocation. A (move dst src) between two variables disappears
@@ -822,22 +825,6 @@
 
 ;;; ── Linear-scan allocation ─────────────────────────────────────────────────
 
-(define (insert-register register registers)
-  (if (null? registers)
-      (list register)
-      (if (< (register-order register) (register-order (car registers)))
-          (cons register registers)
-          (cons (car registers)
-                (insert-register register (cdr registers))))))
-
-(define (remove-register register registers)
-  (cond
-    ((null? registers) '())
-    ((eq? (car registers) register) (cdr registers))
-    (else
-     (cons (car registers)
-           (remove-register register (cdr registers))))))
-
 (define (lookup-bias biases var)
   (hash-table-ref/default biases var #f))
 
@@ -850,68 +837,90 @@
               #f))
         #f)))
 
+;; True when two ascending range lists share a point.
+(define (ranges-intersect? a b)
+  (cond
+    ((or (null? a) (null? b)) #f)
+    ((< (cdar a) (caar b)) (ranges-intersect? (cdr a) b))
+    ((< (cdar b) (caar a)) (ranges-intersect? a (cdr b)))
+    (else #t)))
+
+;; The ranges without their final point.
+(define (ranges-without-last-point ranges)
+  (let loop ((rest ranges))
+    (cond
+      ((null? (cdr rest))
+       (if (= (caar rest) (cdar rest))
+           '()
+           (list (cons (caar rest) (- (cdar rest) 1)))))
+      (else (cons (car rest) (loop (cdr rest)))))))
+
 ;; Fills home-table (variable -> home) and returns the same bindings as an
 ;; alist, newest first, together with the number of stack slots used.
+;;
+;; Linear scan over intervals with lifetime holes. A variable keeps one home
+;; for its whole life, but shares a register with any variable whose ranges
+;; fit in its holes. assigned maps each register to the intervals placed in
+;; it that have not yet ended; since intervals are taken in order of start,
+;; one that has ended can never conflict again.
 (define (linear-scan-allocate intervals biases home-table)
-  (let loop ((remaining (sort-intervals-by-start intervals))
-             (active '())
-             (free-registers aarch64-callee-saved)
-             (homes '())
-             (next-slot 0))
-    (define (assign! var home)
-      (hash-table-set! home-table var home)
-      (cons (cons var home) homes))
-    (if (null? remaining)
-        (values homes next-slot)
-        (let* ((current (car remaining))
-               (current-var (car current))
-               (start (interval-start current))
-               (preferred-var (lookup-bias biases current-var))
-               (preferred-register
-                (preferred-register-for current-var home-table biases)))
-          (let expire ((rest active)
-                       (still-active '())
-                       (available free-registers))
-            (if (null? rest)
-                (if (null? available)
-                    (loop (cdr remaining)
-                          still-active
-                          available
-                          (assign! current-var `(stack-slot ,next-slot))
-                          (+ next-slot 1))
-                    (let* ((register
-                            (if (and preferred-register
-                                     (memq preferred-register available))
-                                preferred-register
-                                (car available)))
-                           (remaining-registers
-                            (remove-register register available))
-                           (new-active
-                            (insert-active
-                             (list current-var
-                                   (interval-start current)
-                                   (interval-end current)
-                                   register)
-                             still-active)))
+  (let ((assigned (make-hash-table eq?)))
+    (for-each (lambda (register) (hash-table-set! assigned register '()))
+              aarch64-callee-saved)
+    (let loop ((remaining (sort-intervals-by-start intervals))
+               (homes '())
+               (next-slot 0))
+      (define (assign! var home)
+        (hash-table-set! home-table var home)
+        (cons (cons var home) homes))
+      (if (null? remaining)
+          (values homes next-slot)
+          (let* ((current (car remaining))
+                 (current-var (car current))
+                 (start (interval-start current))
+                 (current-ranges (cadddr current))
+                 (preferred-var (lookup-bias biases current-var))
+                 (preferred-register
+                  (preferred-register-for current-var home-table biases)))
+            (for-each
+             (lambda (register)
+               (hash-table-set!
+                assigned register
+                (filter (lambda (entry) (>= (interval-end entry) start))
+                        (hash-table-ref assigned register))))
+             aarch64-callee-saved)
+            ;; A copy's destination may take over its source's register when
+            ;; the source dies at the copy, so the source's last point is
+            ;; ignored.
+            (let ((free?
+                   (lambda (register)
+                     (all (lambda (entry)
+                            (not (ranges-intersect?
+                                  (if (and preferred-var
+                                           (eq? (car entry) preferred-var)
+                                           (= (interval-end entry) start))
+                                      (ranges-without-last-point (cadddr entry))
+                                      (cadddr entry))
+                                  current-ranges)))
+                          (hash-table-ref assigned register)))))
+              (let ((register
+                     (if (and preferred-register (free? preferred-register))
+                         preferred-register
+                         (let first-free ((rest aarch64-callee-saved))
+                           (cond ((null? rest) #f)
+                                 ((free? (car rest)) (car rest))
+                                 (else (first-free (cdr rest))))))))
+                (if register
+                    (begin
+                      (hash-table-set!
+                       assigned register
+                       (cons current (hash-table-ref assigned register)))
                       (loop (cdr remaining)
-                            new-active
-                            remaining-registers
                             (assign! current-var `(register ,register))
-                            next-slot)))
-                (let* ((entry (car rest))
-                       (entry-var (car entry))
-                       (end (caddr entry))
-                       (register (cadddr entry)))
-                  (if (or (< end start)
-                          (and preferred-var
-                               (eq? entry-var preferred-var)
-                               (= end start)))
-                      (expire (cdr rest)
-                              still-active
-                              (insert-register register available))
-                      (expire (cdr rest)
-                              (insert-active entry still-active)
-                              available)))))))))
+                            next-slot))
+                    (loop (cdr remaining)
+                          (assign! current-var `(stack-slot ,next-slot))
+                          (+ next-slot 1))))))))))
 
 (define (allocate-root-homes homes next-slot)
   (let loop ((rest homes) (slot next-slot) (result '()))
@@ -1203,7 +1212,8 @@
              (biases (collect-move-biases blocks)))
         (let-values (((homes next-slot)
                       (linear-scan-allocate
-                       (collect-intervals numbering block-infos in-vec out-vec)
+                       (collect-intervals numbering block-infos out-vec
+                                          instruction-live-before)
                        biases
                        home-table)))
           (when (equal? (get-environment-variable "HOP_CHECK_ALLOC") "1")
