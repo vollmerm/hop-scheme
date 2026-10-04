@@ -1,0 +1,15 @@
+; n-queens by backtracking over lists of columns
+(define (safe? q dist placed)
+  (cond ((null? placed) #t)
+        ((= (car placed) q) #f)
+        ((= (car placed) (+ q dist)) #f)
+        ((= (+ (car placed) dist) q) #f)
+        (else (safe? q (+ dist 1) (cdr placed)))))
+(define (try-col q row n placed)
+  (if (< n q)
+      0
+      (+ (if (safe? q 1 placed) (place (+ row 1) n (cons q placed)) 0)
+         (try-col (+ q 1) row n placed))))
+(define (place row n placed)
+  (if (< n row) 1 (try-col 1 row n placed)))
+(place 1 6 '())
