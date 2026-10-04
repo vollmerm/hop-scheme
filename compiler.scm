@@ -37,6 +37,7 @@
         (hop pass tac)
         (hop pass cfg)
         (hop pass ssa)
+        (hop pass sccp)
         (hop backend))
 
 ;;; ============================================================================
@@ -54,9 +55,11 @@
 ;; HOP_SSA is "roundtrip", every procedure's CFG is converted to SSA, verified,
 ;; and converted back before the CFG optimizations run. Off by default.
 (define (maybe-ssa-round-trip params cfg)
-  (if (equal? (get-environment-variable "HOP_SSA") "roundtrip")
-      (ssa-round-trip-cfg params cfg)
-      cfg))
+  (let ((mode (get-environment-variable "HOP_SSA")))
+    (cond
+     ((equal? mode "roundtrip") (ssa-round-trip-cfg params cfg))
+     ((equal? mode "sccp") (sccp-cfg params cfg))
+     (else cfg))))
 
 ;; Shared by every entry point below, whichever way a lowered program's
 ;; top-level bindings got their labels (plain compile-to-cfg's unqualified

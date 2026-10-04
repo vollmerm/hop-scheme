@@ -31,7 +31,19 @@
           verify-ssa
           check-ssa
           ssa-round-trip-cfg
+          make-ssa-proc
+          make-phi
+          phi?
+          phi-var
           set-ssa-block-instrs!
+          set-ssa-block-phis!
+          set-ssa-block-succs!
+          set-ssa-block-preds!
+          map-instr-uses
+          instr-uses
+          instr-def
+          immediate-dominators
+          dominator-children
           ssa-proc?
           ssa-proc-params
           ssa-proc-blocks
@@ -135,6 +147,8 @@
        `(,(car rhs) ,@(map-operands f (cdr rhs))))
       ((closure-env-ref)
        `(closure-env-ref ,(map-operand f (cadr rhs)) ,@(cddr rhs)))
+      ((pi)
+       `(pi ,(cadr rhs) ,@(map-operands f (cddr rhs))))
       ((make-closure make-variadic-closure)
        `(,(car rhs) ,(cadr rhs) ,(caddr rhs) ,@(map-operands f (cdddr rhs))))
       ((direct-call)
