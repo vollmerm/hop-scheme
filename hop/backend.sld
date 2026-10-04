@@ -25,6 +25,10 @@
           (scheme cxr)
           (scheme write)
           (scheme process-context)
+          (chicken bitwise)
+          (chicken sort)
+          (only (srfi 69) make-hash-table hash-table-set! hash-table-ref
+                hash-table-ref/default hash-table-exists?)
           (hop utils)
           (hop pass tac)
           (hop pass cfg))
@@ -395,188 +399,220 @@
          #f))
     (else #f)))
 
-(define (machine-block-use block)
-  (let loop ((instrs (machine-block-instructions block))
-             (defs '())
-             (uses '()))
-    (if (null? instrs)
-        uses
-        (let* ((instr (car instrs))
-               (instr-uses (set-difference (machine-instr-uses instr) defs))
-               (instr-defs (machine-instr-defs instr)))
-          (loop (cdr instrs)
-                (set-union defs instr-defs)
-                (set-union uses instr-uses))))))
+;;; Liveness and allocation work on small integers. build-numbering gives every
+;;; variable an index, and a set of variables is an exact integer with bit i
+;;; set when variable i is a member.
 
-(define (machine-block-def block)
-  (let loop ((instrs (machine-block-instructions block)) (defs '()))
-    (if (null? instrs)
-        defs
-        (loop (cdr instrs)
-              (set-union defs (machine-instr-defs (car instrs)))))))
+(define-record-type <numbering>
+  (make-numbering ids names)
+  numbering?
+  (ids numbering-ids)       ; hash table: variable -> index
+  (names numbering-names))  ; vector: index -> variable
 
-(define (compute-liveness blocks)
+(define (build-numbering blocks)
+  (let ((ids (make-hash-table eq?))
+        (order '())
+        (count 0))
+    (define (note! var)
+      (unless (hash-table-exists? ids var)
+        (hash-table-set! ids var count)
+        (set! order (cons var order))
+        (set! count (+ count 1))))
+    (for-each
+     (lambda (block)
+       (for-each (lambda (instr)
+                   (for-each note! (machine-instr-uses instr))
+                   (for-each note! (machine-instr-defs instr)))
+                 (machine-block-instructions block)))
+     blocks)
+    (make-numbering ids (list->vector (reverse order)))))
+
+(define (bitset-empty) 0)
+(define (bitset-singleton id) (arithmetic-shift 1 id))
+(define (bitset-union a b) (bitwise-ior a b))
+(define (bitset-difference a b) (bitwise-and a (bitwise-not b)))
+
+;; Member indices in ascending order.
+(define (bitset-ids set)
+  (let loop ((rest set) (id 0) (result '()))
+    (if (zero? rest)
+        (reverse result)
+        (loop (arithmetic-shift rest -1)
+              (+ id 1)
+              (if (odd? rest) (cons id result) result)))))
+
+(define (ids->bitset ids)
+  (let loop ((rest ids) (set 0))
+    (if (null? rest)
+        set
+        (loop (cdr rest) (bitset-union set (bitset-singleton (car rest)))))))
+
+(define (bitset-vars numbering set)
+  (map (lambda (id) (vector-ref (numbering-names numbering) id))
+       (bitset-ids set)))
+
+;; What an instruction reads and writes, as sorted-by-first-mention index
+;; lists and as sets. Computed once per instruction.
+(define-record-type <instr-info>
+  (make-instr-info instr use-ids def-ids use-set def-set)
+  instr-info?
+  (instr instr-info-instr)
+  (use-ids instr-info-use-ids)
+  (def-ids instr-info-def-ids)
+  (use-set instr-info-use-set)
+  (def-set instr-info-def-set))
+
+(define (analyze-instruction numbering instr)
+  (define (ids-of vars)
+    (map (lambda (var) (hash-table-ref (numbering-ids numbering) var)) vars))
+  (let ((use-ids (ids-of (machine-instr-uses instr)))
+        (def-ids (ids-of (machine-instr-defs instr))))
+    (make-instr-info instr use-ids def-ids
+                     (ids->bitset use-ids) (ids->bitset def-ids))))
+
+(define (analyze-block numbering block)
+  (map (lambda (instr) (analyze-instruction numbering instr))
+       (machine-block-instructions block)))
+
+;; Upward-exposed uses and definitions of one block.
+(define (block-use-and-def infos)
+  (let loop ((rest infos) (defs 0) (uses 0))
+    (if (null? rest)
+        (values uses defs)
+        (let ((info (car rest)))
+          (loop (cdr rest)
+                (bitset-union defs (instr-info-def-set info))
+                (bitset-union uses
+                              (bitset-difference (instr-info-use-set info)
+                                                 defs)))))))
+
+(define (compute-liveness blocks block-infos)
   (let* ((count (length blocks))
-         (use-vec (list->vector (map machine-block-use blocks)))
-         (def-vec (list->vector (map machine-block-def blocks)))
-         (in-vec (make-vector count '()))
-         (out-vec (make-vector count '())))
+         (successor-vec (list->vector (map machine-block-successors blocks)))
+         (use-vec (make-vector count 0))
+         (def-vec (make-vector count 0))
+         (in-vec (make-vector count 0))
+         (out-vec (make-vector count 0)))
+    (let fill ((rest block-infos) (i 0))
+      (unless (null? rest)
+        (let-values (((uses defs) (block-use-and-def (car rest))))
+          (vector-set! use-vec i uses)
+          (vector-set! def-vec i defs))
+        (fill (cdr rest) (+ i 1))))
     (let loop ()
       (let ((changed #f))
         (do ((i (- count 1) (- i 1)))
             ((< i 0))
-          (let* ((block (list-ref blocks i))
-                 (successors (machine-block-successors block))
-                 (new-out
-                  (let succ-loop ((rest successors) (result '()))
+          (let* ((new-out
+                  (let succ-loop ((rest (vector-ref successor-vec i)) (result 0))
                     (if (null? rest)
                         result
                         (succ-loop (cdr rest)
-                                   (set-union result
-                                              (vector-ref in-vec (car rest)))))))
+                                   (bitset-union result
+                                                 (vector-ref in-vec (car rest)))))))
                  (new-in
-                  (set-union (vector-ref use-vec i)
-                             (set-difference new-out (vector-ref def-vec i)))))
-            (if (not (set-equal? new-out (vector-ref out-vec i)))
-                (begin
-                  (vector-set! out-vec i new-out)
-                  (set! changed #t)))
-            (if (not (set-equal? new-in (vector-ref in-vec i)))
-                (begin
-                  (vector-set! in-vec i new-in)
-                  (set! changed #t)))))
+                  (bitset-union (vector-ref use-vec i)
+                                (bitset-difference new-out (vector-ref def-vec i)))))
+            (unless (= new-out (vector-ref out-vec i))
+              (vector-set! out-vec i new-out)
+              (set! changed #t))
+            (unless (= new-in (vector-ref in-vec i))
+              (vector-set! in-vec i new-in)
+              (set! changed #t))))
         (if changed
             (loop)
             (values in-vec out-vec))))))
 
-(define (compute-instruction-live-before blocks out-vec)
-  (let block-loop ((remaining blocks) (index 0) (result '()))
+;; For each block, the set live before each of its instructions.
+(define (compute-instruction-live-before block-infos out-vec)
+  (let block-loop ((remaining block-infos) (index 0) (result '()))
     (if (null? remaining)
         (reverse result)
-        (let ((instrs (machine-block-instructions (car remaining))))
-          (let instr-loop ((rest (reverse instrs))
-                           (live-after (vector-ref out-vec index))
-                           (live-befores '()))
-            (if (null? rest)
-                (block-loop (cdr remaining)
-                            (+ index 1)
-                            (cons live-befores result))
-                (let* ((instr (car rest))
-                       (defs (machine-instr-defs instr))
-                       (uses (machine-instr-uses instr))
-                       (live-before
-                        (set-union uses
-                                   (set-difference live-after defs))))
-                  (instr-loop (cdr rest)
-                              live-before
-                              (cons live-before live-befores)))))))))
+        (let instr-loop ((rest (reverse (car remaining)))
+                         (live-after (vector-ref out-vec index))
+                         (live-befores '()))
+          (if (null? rest)
+              (block-loop (cdr remaining) (+ index 1) (cons live-befores result))
+              (let* ((info (car rest))
+                     (live-before
+                      (bitset-union (instr-info-use-set info)
+                                    (bitset-difference live-after
+                                                       (instr-info-def-set info)))))
+                (instr-loop (cdr rest)
+                            live-before
+                            (cons live-before live-befores))))))))
 
-;;; ── Live interval helpers ──────────────────────────────────────────────────
+;;; ── Live intervals ─────────────────────────────────────────────────────────
 
 (define (interval-start interval) (cadr interval))
 (define (interval-end interval) (caddr interval))
 
-(define (update-interval! table var point)
-  (let ((entry (assoc var table)))
-    (if entry
-        (let ((interval (cdr entry)))
-          (set-car! interval (min (car interval) point))
-          (set-cdr! interval (max (cdr interval) point)))
-        (set! table (cons (cons var (cons point point)) table))))
-  table)
-
-(define (collect-intervals blocks in-vec out-vec)
-  (let loop-blocks ((remaining blocks)
-                    (index 0)
-                    (point 0)
-                    (intervals '()))
-    (if (null? remaining)
-        (let convert ((rest intervals) (result '()))
-          (if (null? rest)
-              result
-              (let* ((entry (car rest))
-                     (range (cdr entry)))
-                (convert (cdr rest)
-                         (cons (list (car entry) (car range) (cdr range))
-                               result)))))
-        (let* ((block (car remaining))
-               (block-start point)
-               (intervals-with-live-in
-                (let live-in-loop ((vars (vector-ref in-vec index))
-                                   (current intervals))
-                  (if (null? vars)
-                      current
-                      (live-in-loop (cdr vars)
-                                    (update-interval! current (car vars) block-start)))))
-               (instrs (machine-block-instructions block)))
-          (let loop-instrs ((rest instrs)
-                            (next-point point)
-                            (current intervals-with-live-in))
+;; One (var start end) per variable, covering every point where it is used,
+;; defined, or live across a block boundary, in numbering order.
+(define (collect-intervals numbering block-infos in-vec out-vec)
+  (let* ((names (numbering-names numbering))
+         (count (vector-length names))
+         (starts (make-vector count #f))
+         (ends (make-vector count #f)))
+    (define (touch! id point)
+      (if (vector-ref starts id)
+          (begin
+            (when (< point (vector-ref starts id))
+              (vector-set! starts id point))
+            (when (> point (vector-ref ends id))
+              (vector-set! ends id point)))
+          (begin
+            (vector-set! starts id point)
+            (vector-set! ends id point))))
+    (let loop-blocks ((remaining block-infos) (index 0) (point 0))
+      (unless (null? remaining)
+        (let ((block-start point))
+          (for-each (lambda (id) (touch! id block-start))
+                    (bitset-ids (vector-ref in-vec index)))
+          (let loop-instrs ((rest (car remaining)) (next-point point))
             (if (null? rest)
-                (let* ((block-end (if (= next-point block-start)
-                                      block-start
-                                      (- next-point 1)))
-                       (intervals-with-live-out
-                        (let live-out-loop ((vars (vector-ref out-vec index))
-                                            (updated current))
-                          (if (null? vars)
-                              updated
-                              (live-out-loop (cdr vars)
-                                             (update-interval! updated (car vars) block-end))))))
-                  (loop-blocks (cdr remaining)
-                               (+ index 1)
-                               next-point
-                               intervals-with-live-out))
-                (let* ((instr (car rest))
-                       (uses (machine-instr-uses instr))
-                       (defs (machine-instr-defs instr))
-                       (with-uses
-                        (let use-loop ((vars uses) (updated current))
-                          (if (null? vars)
-                              updated
-                              (use-loop (cdr vars)
-                                        (update-interval! updated (car vars) next-point)))))
-                       (with-defs
-                        (let def-loop ((vars defs) (updated with-uses))
-                          (if (null? vars)
-                              updated
-                              (def-loop (cdr vars)
-                                (update-interval! updated (car vars) next-point))))))
-                  (loop-instrs (cdr rest)
-                               (+ next-point 1)
-                               with-defs))))))))
+                (let ((block-end (if (= next-point block-start)
+                                     block-start
+                                     (- next-point 1))))
+                  (for-each (lambda (id) (touch! id block-end))
+                            (bitset-ids (vector-ref out-vec index)))
+                  (loop-blocks (cdr remaining) (+ index 1) next-point))
+                (begin
+                  (for-each (lambda (id) (touch! id next-point))
+                            (instr-info-use-ids (car rest)))
+                  (for-each (lambda (id) (touch! id next-point))
+                            (instr-info-def-ids (car rest)))
+                  (loop-instrs (cdr rest) (+ next-point 1))))))))
+    (let loop ((id (- count 1)) (result '()))
+      (if (< id 0)
+          result
+          (loop (- id 1)
+                (if (vector-ref starts id)
+                    (cons (list (vector-ref names id)
+                                (vector-ref starts id)
+                                (vector-ref ends id))
+                          result)
+                    result))))))
 
-(define (insert-by-start interval intervals)
-  (if (null? intervals)
-      (list interval)
-      (if (< (interval-start interval) (interval-start (car intervals)))
-          (cons interval intervals)
-          (cons (car intervals)
-                (insert-by-start interval (cdr intervals))))))
-
+;; Stable, so intervals starting together keep their numbering order.
 (define (sort-intervals-by-start intervals)
-  (let loop ((rest intervals) (result '()))
-    (if (null? rest)
-        result
-        (loop (cdr rest)
-              (insert-by-start (car rest) result)))))
+  (sort intervals
+        (lambda (a b) (< (interval-start a) (interval-start b)))))
 
+;; Maps a variable to the variable it was last copied from.
 (define (collect-move-biases blocks)
-  (let block-loop ((remaining blocks) (biases '()))
-    (if (null? remaining)
-        biases
-        (let instr-loop ((instrs (machine-block-instructions (car remaining)))
-                         (current biases))
-          (if (null? instrs)
-              (block-loop (cdr remaining) current)
-              (let* ((instr (car instrs))
-                     (defs (machine-instr-defs instr))
-                     (bias-source (machine-instr-bias-source instr)))
-                (instr-loop
-                 (cdr instrs)
-                 (if (and bias-source (pair? defs))
-                     (cons (cons (car defs) bias-source) current)
-                     current))))))))
+  (let ((biases (make-hash-table eq?)))
+    (for-each
+     (lambda (block)
+       (for-each
+        (lambda (instr)
+          (let ((bias-source (machine-instr-bias-source instr))
+                (defs (machine-instr-defs instr)))
+            (when (and bias-source (pair? defs))
+              (hash-table-set! biases (car defs) bias-source))))
+        (machine-block-instructions block)))
+     blocks)
+    biases))
 
 (define (insert-active interval active)
   (if (null? active)
@@ -592,6 +628,197 @@
       ((null? rest) index)
       ((eq? (car rest) register) index)
       (else (loop (cdr rest) (+ index 1))))))
+
+;;; ── Copy coalescing ────────────────────────────────────────────────────────
+;;; Runs before allocation. A (move dst src) between two variables disappears
+;;; when both can share one name, which happens when they never need different
+;;; values at the same time. SSA destruction leaves many such copies (phi
+;;; moves), and the allocator's one-variable hint only catches a few.
+
+;; Briggs threshold: a neighbor blocks a register once it has this many.
+(define coalesce-register-count (length aarch64-callee-saved))
+
+;; (dst . src) when instr copies one variable to another.
+(define (copy-pair instr)
+  (and (eq? (car instr) 'move)
+       (symbol? (cadr instr))
+       (symbol? (caddr instr))
+       (not (eq? (cadr instr) (caddr instr)))
+       (cons (cadr instr) (caddr instr))))
+
+;; adj[v] is the set of variables that cannot share a name with v: whatever is
+;; live just after an instruction that defines v. A copy's source is exempt
+;; there, since after the copy it holds the same value.
+(define (build-interference numbering blocks block-infos in-vec out-vec)
+  (let* ((count (vector-length (numbering-names numbering)))
+         (adj (make-vector count 0)))
+    (define (add-edge! a b)
+      (unless (= a b)
+        (vector-set! adj a (bitset-union (vector-ref adj a) (bitset-singleton b)))
+        (vector-set! adj b (bitset-union (vector-ref adj b) (bitset-singleton a)))))
+    (define (add-clique! set)
+      (let ((ids (bitset-ids set)))
+        (for-each (lambda (a) (for-each (lambda (b) (add-edge! a b)) ids)) ids)))
+    ;; Whatever is live on entry has no defining instruction to record this.
+    (unless (null? blocks)
+      (add-clique! (vector-ref in-vec 0)))
+    (let block-loop ((remaining block-infos) (index 0))
+      (unless (null? remaining)
+        (let instr-loop ((rest (reverse (car remaining)))
+                         (live-after (vector-ref out-vec index)))
+          (if (null? rest)
+              (block-loop (cdr remaining) (+ index 1))
+              (let* ((info (car rest))
+                     (copy (copy-pair (instr-info-instr info)))
+                     (others (if copy
+                                 (bitset-difference
+                                  live-after
+                                  (bitset-singleton
+                                   (hash-table-ref (numbering-ids numbering)
+                                                   (cdr copy))))
+                                 live-after))
+                     (other-ids (bitset-ids others)))
+                (for-each (lambda (d)
+                            (for-each (lambda (v) (add-edge! d v)) other-ids))
+                          (instr-info-def-ids info))
+                (instr-loop (cdr rest)
+                            (bitset-union (instr-info-use-set info)
+                                          (bitset-difference
+                                           live-after
+                                           (instr-info-def-set info)))))))))
+    adj))
+
+;; Number of loops around each block, taking every jump to an earlier or
+;; equal block index as a back edge that covers the blocks in between.
+(define (block-loop-depths blocks)
+  (let* ((count (length blocks))
+         (depths (make-vector count 0)))
+    (let loop ((rest blocks) (index 0))
+      (unless (null? rest)
+        (for-each
+         (lambda (target)
+           (when (<= target index)
+             (do ((i target (+ i 1)))
+                 ((> i index))
+               (vector-set! depths i (+ 1 (vector-ref depths i))))))
+         (machine-block-successors (car rest)))
+        (loop (cdr rest) (+ index 1))))
+    depths))
+
+(define (rename-block-variables block renames)
+  (make-machine-block
+   (machine-block-label block)
+   (append-map
+    (lambda (instr)
+      (let ((renamed (rewrite-machine-instruction instr renames)))
+        (if (and (eq? (car renamed) 'move)
+                 (equal? (cadr renamed) (caddr renamed)))
+            '()
+            (list renamed))))
+    (machine-block-instructions block))
+   (machine-block-successors block)))
+
+(define (coalesce-copies blocks)
+  (let* ((numbering (build-numbering blocks))
+         (ids (numbering-ids numbering))
+         (names (numbering-names numbering))
+         (count (vector-length names))
+         (block-infos (map (lambda (block) (analyze-block numbering block))
+                           blocks))
+         (depths (block-loop-depths blocks)))
+    (let-values (((in-vec out-vec) (compute-liveness blocks block-infos)))
+      (let* ((adj (build-interference numbering blocks block-infos
+                                      in-vec out-vec))
+             (parent (make-vector count 0))
+             (members (make-vector count 0))
+             (merged? #f))
+        (do ((i 0 (+ i 1))) ((= i count))
+          (vector-set! parent i i)
+          (vector-set! members i (bitset-singleton i)))
+        (define (find id)
+          (let ((up (vector-ref parent id)))
+            (if (= up id)
+                id
+                (let ((root (find up)))
+                  (vector-set! parent id root)
+                  root))))
+        ;; Classes adjacent to class a, as a set of class representatives.
+        (define (neighbor-classes a)
+          (ids->bitset (map find (bitset-ids (vector-ref adj a)))))
+        (define (interferes? a b)
+          (not (zero? (bitwise-and (vector-ref adj a) (vector-ref members b)))))
+        ;; Briggs: merging is safe when few neighbors have enough neighbors of
+        ;; their own to block a register, since the rest can always be colored.
+        (define (safe-to-merge? a b)
+          (let* ((a-neighbors (neighbor-classes a))
+                 (b-neighbors (neighbor-classes b))
+                 (both (bitwise-and a-neighbors b-neighbors))
+                 (significant
+                  (let loop ((rest (bitset-ids (bitset-union a-neighbors
+                                                             b-neighbors)))
+                             (total 0))
+                    (if (null? rest)
+                        total
+                        (let* ((n (car rest))
+                               (degree
+                                (- (length (bitset-ids (neighbor-classes n)))
+                                   (if (zero? (bitwise-and both
+                                                           (bitset-singleton n)))
+                                       0
+                                       1))))
+                          (loop (cdr rest)
+                                (if (>= degree coalesce-register-count)
+                                    (+ total 1)
+                                    total)))))))
+            (< significant coalesce-register-count)))
+        (define (merge! a b)
+          (vector-set! parent b a)
+          (vector-set! members a (bitset-union (vector-ref members a)
+                                               (vector-ref members b)))
+          (vector-set! adj a (bitset-union (vector-ref adj a)
+                                           (vector-ref adj b)))
+          (set! merged? #t))
+        ;; Copies in deeper loops first; stable within a depth.
+        (let ((copies
+               (let block-loop ((remaining blocks) (index 0) (result '()))
+                 (if (null? remaining)
+                     (reverse result)
+                     (block-loop
+                      (cdr remaining)
+                      (+ index 1)
+                      (let instr-loop ((rest (machine-block-instructions
+                                              (car remaining)))
+                                       (acc result))
+                        (if (null? rest)
+                            acc
+                            (let ((copy (copy-pair (car rest))))
+                              (instr-loop
+                               (cdr rest)
+                               (if copy
+                                   (cons (list (vector-ref depths index)
+                                               (hash-table-ref ids (car copy))
+                                               (hash-table-ref ids (cdr copy)))
+                                         acc)
+                                   acc))))))))))
+          (for-each
+           (lambda (copy)
+             (let ((a (find (cadr copy)))
+                   (b (find (caddr copy))))
+               (unless (or (= a b)
+                           (interferes? a b)
+                           (not (safe-to-merge? a b)))
+                 (merge! a b))))
+           (sort copies (lambda (x y) (> (car x) (car y))))))
+        (if (not merged?)
+            blocks
+            (let ((renames (make-hash-table eq?)))
+              (do ((i 0 (+ i 1))) ((= i count))
+                (unless (= (find i) i)
+                  (hash-table-set! renames
+                                   (vector-ref names i)
+                                   (vector-ref names (find i)))))
+              (map (lambda (block) (rename-block-variables block renames))
+                   blocks)))))))
 
 ;;; ── Linear-scan allocation ─────────────────────────────────────────────────
 
@@ -612,26 +839,28 @@
            (remove-register register (cdr registers))))))
 
 (define (lookup-bias biases var)
-  (let ((binding (assoc var biases)))
-    (if binding
-        (cdr binding)
-        #f)))
+  (hash-table-ref/default biases var #f))
 
-(define (preferred-register-for var homes biases)
+(define (preferred-register-for var home-table biases)
   (let ((preferred-var (lookup-bias biases var)))
     (if preferred-var
-        (let ((preferred-home (lookup-home homes preferred-var)))
+        (let ((preferred-home (lookup-home home-table preferred-var)))
           (if (and (pair? preferred-home) (eq? (car preferred-home) 'register))
               (cadr preferred-home)
               #f))
         #f)))
 
-(define (linear-scan-allocate intervals biases)
+;; Fills home-table (variable -> home) and returns the same bindings as an
+;; alist, newest first, together with the number of stack slots used.
+(define (linear-scan-allocate intervals biases home-table)
   (let loop ((remaining (sort-intervals-by-start intervals))
              (active '())
              (free-registers aarch64-callee-saved)
              (homes '())
              (next-slot 0))
+    (define (assign! var home)
+      (hash-table-set! home-table var home)
+      (cons (cons var home) homes))
     (if (null? remaining)
         (values homes next-slot)
         (let* ((current (car remaining))
@@ -639,7 +868,7 @@
                (start (interval-start current))
                (preferred-var (lookup-bias biases current-var))
                (preferred-register
-                (preferred-register-for current-var homes biases)))
+                (preferred-register-for current-var home-table biases)))
           (let expire ((rest active)
                        (still-active '())
                        (available free-registers))
@@ -648,7 +877,7 @@
                     (loop (cdr remaining)
                           still-active
                           available
-                          (cons (cons (car current) `(stack-slot ,next-slot)) homes)
+                          (assign! current-var `(stack-slot ,next-slot))
                           (+ next-slot 1))
                     (let* ((register
                             (if (and preferred-register
@@ -659,7 +888,7 @@
                             (remove-register register available))
                            (new-active
                             (insert-active
-                             (list (car current)
+                             (list current-var
                                    (interval-start current)
                                    (interval-end current)
                                    register)
@@ -667,7 +896,7 @@
                       (loop (cdr remaining)
                             new-active
                             remaining-registers
-                            (cons (cons (car current) `(register ,register)) homes)
+                            (assign! current-var `(register ,register))
                             next-slot)))
                 (let* ((entry (car rest))
                        (entry-var (car entry))
@@ -696,19 +925,19 @@
                     (cons (cons var `(stack-slot ,slot)) result))
               (loop (cdr rest) slot result))))))
 
-(define (lookup-home homes operand)
+(define (alist->home-table alist)
+  (let ((table (make-hash-table eq?)))
+    (for-each (lambda (binding) (hash-table-set! table (car binding) (cdr binding)))
+              alist)
+    table))
+
+(define (lookup-home home-table operand)
   (if (symbol? operand)
-      (let ((binding (assoc operand homes)))
-        (if binding
-            (cdr binding)
-            operand))
+      (hash-table-ref/default home-table operand operand)
       operand))
 
-(define (lookup-root-home root-homes var)
-  (let ((binding (assoc var root-homes)))
-    (if binding
-        (cdr binding)
-        #f)))
+(define (lookup-root-home root-table var)
+  (hash-table-ref/default root-table var #f))
 
 ;;; ── Home rewriting ─────────────────────────────────────────────────────────
 
@@ -885,31 +1114,38 @@
           instr
           live-before
           live-after
+          numbering
           homes
           root-homes)
   (append
    (if (safepoint-machine-instruction? instr)
-       (live-root-syncs live-before homes root-homes)
+       (live-root-syncs (bitset-vars numbering live-before) homes root-homes)
        '())
     (instruction->list (rewrite-machine-instruction instr homes))
     (if (safepoint-machine-instruction? instr)
-        (live-root-reloads live-after (cadr instr) homes root-homes)
+        (live-root-reloads (bitset-vars numbering live-after)
+                           (cadr instr) homes root-homes)
         '())))
 
-(define (rewrite-machine-block-instructions instrs live-befores homes root-homes)
+(define (rewrite-machine-block-instructions
+         instrs live-befores numbering homes root-homes)
   (if (null? instrs)
       '()
-      (let ((live-after (if (null? (cdr live-befores)) '() (cadr live-befores))))
+      (let ((live-after (if (null? (cdr live-befores))
+                            (bitset-empty)
+                            (cadr live-befores))))
         (append
          (rewrite-machine-instruction-with-safepoint-sync
           (car instrs)
           (car live-befores)
           live-after
+          numbering
           homes
           root-homes)
          (rewrite-machine-block-instructions
           (cdr instrs)
           (cdr live-befores)
+          numbering
           homes
           root-homes)))))
 
@@ -919,10 +1155,10 @@
 ;;; (even if the destination itself is never read). A violation means the
 ;;; allocator's idea of liveness disagrees with the code's real control flow,
 ;;; which shows up at run time as a silently wrong value.
-(define (check-register-allocation name blocks homes out-vec instruction-live-before)
+(define (check-register-allocation name blocks numbering home-table out-vec
+                                   instruction-live-before)
   (define (home-of var)
-    (let ((entry (assq var homes)))
-      (and entry (cdr entry))))
+    (hash-table-ref/default home-table var #f))
   (define (check-no-sharing! block instr live)
     (let loop ((vars live))
       (unless (null? vars)
@@ -945,7 +1181,8 @@
      (for-each
       (lambda (instr live-after)
         (check-no-sharing! block instr
-                           (set-union live-after (machine-instr-defs instr))))
+                           (set-union (bitset-vars numbering live-after)
+                                      (machine-instr-defs instr))))
       (machine-block-instructions block)
       (if (null? live-befores)
           '()
@@ -955,21 +1192,28 @@
    (vector->list out-vec)))
 
 (define (allocate-machine-procedure proc)
-  (let ((blocks (machine-procedure-blocks proc)))
-    (let-values (((in-vec out-vec) (compute-liveness blocks)))
+  (let* ((blocks (coalesce-copies (machine-procedure-blocks proc)))
+         (numbering (build-numbering blocks))
+         (block-infos (map (lambda (block) (analyze-block numbering block))
+                           blocks))
+         (home-table (make-hash-table eq?)))
+    (let-values (((in-vec out-vec) (compute-liveness blocks block-infos)))
       (let* ((instruction-live-before
-              (compute-instruction-live-before blocks out-vec))
+              (compute-instruction-live-before block-infos out-vec))
              (biases (collect-move-biases blocks)))
         (let-values (((homes next-slot)
                       (linear-scan-allocate
-                       (collect-intervals blocks in-vec out-vec)
-                       biases)))
+                       (collect-intervals numbering block-infos in-vec out-vec)
+                       biases
+                       home-table)))
           (when (equal? (get-environment-variable "HOP_CHECK_ALLOC") "1")
-            (check-register-allocation (machine-procedure-name proc) blocks homes
+            (check-register-allocation (machine-procedure-name proc) blocks
+                                       numbering home-table
                                        out-vec instruction-live-before))
           (let-values (((root-homes frame-slots)
                         (allocate-root-homes homes next-slot)))
-            (let* ((rewritten-blocks
+            (let* ((root-table (alist->home-table root-homes))
+                   (rewritten-blocks
                     (let loop ((remaining-blocks blocks)
                                (remaining-live-before instruction-live-before)
                                (result '()))
@@ -986,8 +1230,9 @@
                                (rewrite-machine-block-instructions
                                 (machine-block-instructions block)
                                 live-befores
-                                homes
-                                root-homes)
+                                numbering
+                                home-table
+                                root-table)
                                (machine-block-successors block))
                               result))))))
                    (used-registers
