@@ -3,10 +3,13 @@
 ;;; Each case is a hand-written CFG. Shape checks look at the optimized
 ;;; instructions; the agreement checks run the original and optimized CFGs.
 
-(load "compiler.scm")
+(import (scheme base) (scheme process-context))
 
-(import (scheme base) (scheme write) (srfi 1) (srfi 69)
-        (hop pass cfg) (hop pass ssa) (hop pass sccp))
+;; HOP_COMPILER (set by tools/scheme.sh) names the compiled compiler to load.
+(load (or (get-environment-variable "HOP_COMPILER") "compiler.scm"))
+
+(import (scheme write) (only (srfi 1) any filter-map find take) (srfi 69)
+        (hop utils) (hop pass cfg) (hop pass ssa) (hop pass sccp))
 
 (define failures 0)
 

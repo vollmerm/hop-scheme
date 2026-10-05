@@ -3,6 +3,7 @@
 ;;;
 ;;; Usage, from the repo root:
 ;;;   csi -R r7rs -I . -s tools/dump-cfg.scm <program.scm | testNN> [stage]
+;;;   guile --r7rs -L . -s tools/dump-cfg.scm <program.scm | testNN> [stage]
 ;;;   make dump T=<program.scm | testNN> [STAGE=cfg|machine]
 ;;;
 ;;; <target> is a path to a source file (a sequence of top-level forms, as
@@ -19,11 +20,12 @@
         (scheme file)
         (scheme read)
         (scheme write)
-        (chicken file)
-        (chicken process-context))
+        (scheme process-context))
 
-(load "compiler.scm")
-(load "compiler_tests.scm")
+;; HOP_COMPILER (set by tools/scheme.sh) names the compiled compiler to load.
+(load (or (get-environment-variable "HOP_COMPILER") "compiler.scm"))
+(load (string-append (or (get-environment-variable "HOP_ROOT") ".") "/compiler_tests.scm"))
+(import (hop pass tac) (hop pass cfg) (hop backend))
 
 (define (usage)
   (display "usage: dump-cfg.scm <program.scm | testNN> [cfg|machine]\n"
@@ -74,7 +76,7 @@
     (for-each display-machine-procedure
               (cons entry-machine procedure-machines))))
 
-(let ((args (command-line-arguments)))
+(let ((args (cdr (command-line))))
   (when (or (null? args) (> (length args) 2)) (usage))
   (let ((expr (target->expr (car args)))
         (stage (if (pair? (cdr args)) (cadr args) "cfg")))

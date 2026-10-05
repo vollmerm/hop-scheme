@@ -18,8 +18,11 @@
 ;; hop/includes.scm is generated from the (import ...) clauses in hop/**/*.sld
 ;; by tools/gen-includes.scm (run via `make hop/includes.scm`, or the
 ;; build/test/repl targets that depend on it) -- it never needs to be
-;; hand-edited when a pass file is added, removed, or rewired.
-(include "hop/includes.scm")
+;; hand-edited when a pass file is added, removed, or rewired. Guile does not
+;; use it: it finds each library as hop/<name>.sld on its load path instead.
+(cond-expand
+ (guile)
+ (else (include "hop/includes.scm")))
 
 (import (scheme base)
         (scheme read)

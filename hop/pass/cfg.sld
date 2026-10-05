@@ -12,6 +12,7 @@
           constant-fold-cfg
           eliminate-dead-writes-cfg)
   (import (scheme base)
+          (hop compat)
           (scheme cxr)
           (srfi 69)
           (hop utils))
@@ -38,7 +39,7 @@
 
   (define (split-into-blocks instrs)
     (let* ((len (length instrs))
-           (leaders (make-vector len #f)))
+           (leaders (make-slots len #f)))
       (do ((i 0 (+ i 1)))
           ((= i len))
         (vector-set! leaders i (is-leader? i instrs)))
@@ -139,7 +140,7 @@
     (let loop ((rest (basic-block-instructions block)) (f facts))
       (if (null? rest) f (loop (cdr rest) (transfer-instr f (car rest))))))
 
-  (define predecessors (make-vector block-count '()))
+  (define predecessors (make-slots block-count '()))
   (let loop ((i 0))
     (when (< i block-count)
       (for-each (lambda (succ)
@@ -147,8 +148,8 @@
                 (basic-block-successors (list-ref cfg i)))
       (loop (+ i 1))))
 
-  (define in-facts  (make-vector block-count '()))
-  (define out-facts (make-vector block-count '()))
+  (define in-facts  (make-slots block-count '()))
+  (define out-facts (make-slots block-count '()))
 
   (let fixed-point ((changed #t))
     (when changed
@@ -401,7 +402,7 @@
           facts
           (loop (cdr rest) (transfer-instr facts (car rest))))))
 
-  (define predecessors (make-vector block-count '()))
+  (define predecessors (make-slots block-count '()))
   (let build-preds ((i 0))
     (when (< i block-count)
       (for-each
@@ -410,8 +411,8 @@
        (basic-block-successors (list-ref cfg i)))
       (build-preds (+ i 1))))
 
-  (define in-facts  (make-vector block-count '()))
-  (define out-facts (make-vector block-count '()))
+  (define in-facts  (make-slots block-count '()))
+  (define out-facts (make-slots block-count '()))
 
   (let fixed-point ((changed #t))
     (if (not changed)
@@ -604,8 +605,8 @@
 
   (let* ((use-vec (list->vector (map tac-block-use cfg)))
          (def-vec (list->vector (map tac-block-def cfg)))
-         (in-vec  (make-vector block-count '()))
-         (out-vec (make-vector block-count '())))
+         (in-vec  (make-slots block-count '()))
+         (out-vec (make-slots block-count '())))
 
     (let fixed-point ()
       (let ((changed #f))

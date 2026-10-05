@@ -56,6 +56,7 @@
           phi-args
           display-ssa)
   (import (scheme base)
+          (hop compat)
           (scheme cxr)
           (scheme write)
           (only (srfi 1)
@@ -194,8 +195,8 @@
 (define (reachable-blocks cfg)
   (let* ((cfg-blocks (list->vector cfg))
          (count (vector-length cfg-blocks))
-         (reachable (make-vector count #f))
-         (new-index (make-vector count #f)))
+         (reachable (make-slots count #f))
+         (new-index (make-slots count #f)))
     (let visit ((i 0))
       (unless (vector-ref reachable i)
         (vector-set! reachable i #t)
@@ -255,7 +256,7 @@
 
 ;; Block indices in reverse postorder of a depth-first search from block 0.
 (define (reverse-postorder blocks)
-  (let ((visited (make-vector (vector-length blocks) #f)))
+  (let ((visited (make-slots (vector-length blocks) #f)))
     (let visit ((b 0) (order '()))
       (cond
        ((vector-ref visited b) order)
@@ -266,8 +267,8 @@
 ;; A vector giving each block's immediate dominator (block 0 is its own).
 (define (immediate-dominators blocks)
   (let* ((order (reverse-postorder blocks))
-         (rank (make-vector (vector-length blocks) #f))
-         (idom (make-vector (vector-length blocks) #f)))
+         (rank (make-slots (vector-length blocks) #f))
+         (idom (make-slots (vector-length blocks) #f)))
     (define (intersect a b)
       (cond
        ((= a b) a)
@@ -297,7 +298,7 @@
 
 ;; A vector giving each block's children in the dominator tree.
 (define (dominator-children idom)
-  (let ((children (make-vector (vector-length idom) '())))
+  (let ((children (make-slots (vector-length idom) '())))
     (do ((b 1 (+ b 1)))
         ((= b (vector-length idom)) children)
       (let ((parent (vector-ref idom b)))
@@ -306,7 +307,7 @@
 ;; A vector giving each block's dominance frontier: the join blocks that it
 ;; reaches but does not strictly dominate.
 (define (dominance-frontiers blocks idom)
-  (let ((frontier (make-vector (vector-length blocks) '())))
+  (let ((frontier (make-slots (vector-length blocks) '())))
     (for-each-block
      (lambda (b block)
        (when (> (length (ssa-block-preds block)) 1)
@@ -362,7 +363,7 @@
    block
    (append (ssa-block-phis block)
            (list (make-phi var var
-                           (make-vector (length (ssa-block-preds block)) #f))))))
+                           (make-slots (length (ssa-block-preds block)) #f))))))
 
 ;; Gives var a phi in every block of the iterated dominance frontier of its
 ;; defining blocks.

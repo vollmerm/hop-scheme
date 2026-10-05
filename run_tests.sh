@@ -2,6 +2,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
+. "$ROOT/tools/scheme.sh"
+# Everything below runs the compiler many times: use the machine-code build.
+hop_prepare_compiler
 
 # Makes the backend verify its own register allocation on every compile.
 export HOP_CHECK_ALLOC=1
@@ -11,13 +14,13 @@ trap 'rm -rf "$TMPDIR"' EXIT
 generate() {
   local test_name="$1"
   local asm_path="$2"
-  csi -R r7rs -I "$ROOT" -e \
-    "(begin (load \"$ROOT/compiler.scm\") (load \"$ROOT/compiler_tests.scm\") (write-named-aarch64-program '$test_name \"$asm_path\"))"
+  hop_eval \
+    "(begin $HOP_LOAD (load \"$ROOT/compiler_tests.scm\") (write-named-aarch64-program '$test_name \"$asm_path\"))"
 }
 
 generate_all() {
-  csi -R r7rs -I "$ROOT" -e \
-    "(begin (load \"$ROOT/compiler.scm\") (load \"$ROOT/compiler_tests.scm\") (for-each (lambda (t) (write-named-aarch64-program (car t) (string-append \"$TMPDIR/\" (symbol->string (car t)) \".s\"))) named-tests))"
+  hop_eval \
+    "(begin $HOP_LOAD (load \"$ROOT/compiler_tests.scm\") (for-each (lambda (t) (write-named-aarch64-program (car t) (string-append \"$TMPDIR/\" (symbol->string (car t)) \".s\"))) named-tests))"
 }
 
 asm_path_for() {
@@ -74,8 +77,8 @@ assert_file_output() {
   asm_path="$(asm_path_for "$case_name")"
   exe_path="$(exe_path_for "$case_name")"
   printf '%s\n' "$source_text" >"$source_path"
-  csi -R r7rs -I "$ROOT" -e \
-    "(begin (load \"$ROOT/compiler.scm\") (write-aarch64-program-file \"$source_path\" \"$asm_path\"))"
+  hop_eval \
+    "(begin $HOP_LOAD (write-aarch64-program-file \"$source_path\" \"$asm_path\"))"
   clang -arch arm64 -o "$exe_path" \
     "$asm_path" \
     "$ROOT/runtime.c" \
@@ -97,8 +100,8 @@ assert_compile_error() {
   asm_path="$(asm_path_for "$case_name")"
   log_path="$TMPDIR/$case_name.log"
   printf '%s\n' "$source_text" >"$source_path"
-  if csi -R r7rs -I "$ROOT" -e \
-    "(begin (load \"$ROOT/compiler.scm\") (write-aarch64-program-file \"$source_path\" \"$asm_path\"))" \
+  if hop_eval \
+    "(begin $HOP_LOAD (write-aarch64-program-file \"$source_path\" \"$asm_path\"))" \
     >"$log_path" 2>&1; then
     printf 'unexpected compile success for %s\n' "$case_name" >&2
     exit 1
@@ -164,8 +167,8 @@ build_multi_file_case() {
   for src in "$@"; do
     source_list+="\"$src\" "
   done
-  csi -R r7rs -I "$ROOT" -e \
-    "(begin (load \"$ROOT/compiler.scm\") (build-linked-program (list $source_list) \"$out_dir\"))"
+  hop_eval \
+    "(begin $HOP_LOAD (build-linked-program (list $source_list) \"$out_dir\"))"
   local objects=()
   while IFS= read -r line; do
     objects+=("$line")
@@ -333,8 +336,8 @@ runtime_cases=(
   "test149|18"
 )
 
-csi -R r7rs -I "$ROOT" -s "$ROOT/ssa_tests.scm"
-csi -R r7rs -I "$ROOT" -s "$ROOT/sccp_tests.scm"
+hop_script "$ROOT/ssa_tests.scm"
+hop_script "$ROOT/sccp_tests.scm"
 
 generate_all
 
@@ -596,8 +599,8 @@ printf '%s\n' \
 multi_bad_out_dir="$TMPDIR/multi-file-unresolved-import.build"
 multi_bad_log="$TMPDIR/multi-file-unresolved-import.log"
 mkdir -p "$multi_bad_out_dir"
-if csi -R r7rs -I "$ROOT" -e \
-  "(begin (load \"$ROOT/compiler.scm\") (build-linked-program (list \"$multi_lib_path\" \"$multi_bad_prog_path\") \"$multi_bad_out_dir\"))" \
+if hop_eval \
+  "(begin $HOP_LOAD (build-linked-program (list \"$multi_lib_path\" \"$multi_bad_prog_path\") \"$multi_bad_out_dir\"))" \
   >"$multi_bad_log" 2>&1; then
   printf 'unexpected compile success for multi-file-unresolved-import\n' >&2
   exit 1

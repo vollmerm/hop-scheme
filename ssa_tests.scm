@@ -1,14 +1,17 @@
 ;;; Unit tests for (hop pass ssa), run by run_tests.sh:
-;;;   csi -R r7rs -I . -s ssa_tests.scm
+;;;   csi -R r7rs -I . -s ssa_tests.scm   (or guile --r7rs -L . -s ssa_tests.scm)
 ;;; Whole-compiler coverage of the SSA round trip comes from running the main
 ;;; suite with HOP_SSA=roundtrip; these tests exercise the module directly on
 ;;; small hand-written CFGs, including irreducible loops, unreachable code,
 ;;; and parallel-copy cycles.
 
-(load "compiler.scm")
+(import (scheme base) (scheme process-context))
 
-(import (scheme base) (scheme write) (srfi 69)
-        (hop pass cfg) (hop pass ssa))
+;; HOP_COMPILER (set by tools/scheme.sh) names the compiled compiler to load.
+(load (or (get-environment-variable "HOP_COMPILER") "compiler.scm"))
+
+(import (scheme write) (srfi 69)
+        (hop utils) (hop pass cfg) (hop pass ssa))
 
 (define failures 0)
 

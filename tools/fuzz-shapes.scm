@@ -2,6 +2,7 @@
 ;;; testing of the structural cons analysis (see tools/fuzz-shapes.sh).
 ;;;
 ;;;   csi -R r7rs -I . -s tools/fuzz-shapes.scm gen DIR COUNT SEED
+;;;       (or guile --r7rs -L . -s ...; HOP_COMPILER names the compiler to load)
 ;;;       writes DIR/pN.scm (one expression) and DIR/pN.expected (its value,
 ;;;       computed by the host Scheme, which is the oracle)
 ;;;   csi -R r7rs -I . -s tools/fuzz-shapes.scm compile DIR
@@ -232,7 +233,7 @@
         (lambda (port) (write value port) (newline port))))))
 
 (define (compile-all dir)
-  (load "compiler.scm")
+  (load (or (get-environment-variable "HOP_COMPILER") "compiler.scm"))
   (let loop ((i 0))
     (let ((source (string-append dir "/p" (number->string i) ".scm")))
       (when (file-exists? source)

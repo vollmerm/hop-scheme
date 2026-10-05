@@ -14,6 +14,7 @@ set -euo pipefail
 # caller's job, same as it is for build-linked-program itself.
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
+. "$ROOT/tools/scheme.sh"
 
 usage() {
   echo "Usage: $0 -o OUTPUT_EXE SOURCE.scm [SOURCE.scm ...]" >&2
@@ -48,8 +49,8 @@ for src in "${sources[@]}"; do
   source_list+="\"$abs_src\" "
 done
 
-csi -R r7rs -I "$ROOT" -e \
-  "(begin (load \"$ROOT/compiler.scm\") (build-linked-program (list $source_list) \"$BUILD_DIR\"))"
+hop_eval \
+  "(begin $HOP_LOAD (build-linked-program (list $source_list) \"$BUILD_DIR\"))"
 
 manifest="$BUILD_DIR/build_manifest.txt"
 objects=()

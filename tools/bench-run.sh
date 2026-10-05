@@ -16,6 +16,8 @@
 # Depth sweep: BENCH_CONFIGS="off control k0 k1 k2 k3 k4 k8" BENCH_FORMAT=csv tools/bench-run.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+. "$ROOT/tools/scheme.sh"
+hop_prepare_compiler
 export HOP_CHECK_ALLOC=1
 HEAP="${HOP_HEAP_BYTES:-67108864}"
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
@@ -26,7 +28,7 @@ files=("$@"); [[ ${#files[@]} -eq 0 ]] && files=("$ROOT"/bench/*.scm)
 # keeps the program as it is.
 REPEAT="${BENCH_REPEAT:-2000}"
 scale_program() {
-  csi -R r7rs -I "$ROOT" -e "
+  hop_eval "
     (import (scheme base) (scheme file) (scheme read) (scheme write))
     (define forms (call-with-input-file \"$1\"
       (lambda (p) (let loop ((acc '())) (let ((f (read p))) (if (eof-object? f) (reverse acc) (loop (cons f acc))))))))
@@ -69,7 +71,7 @@ PY
 # Process startup costs the same for every program: measure it once on an empty
 # program and report instructions retired above it.
 echo '(+ 1 2)' > "$WORK/empty.scm"
-csi -R r7rs -I "$ROOT" -e "(begin (load \"$ROOT/compiler.scm\") (write-aarch64-program-file \"$WORK/empty.scm\" \"$WORK/empty.s\"))"
+hop_eval "(begin $HOP_LOAD (write-aarch64-program-file \"$WORK/empty.scm\" \"$WORK/empty.s\"))"
 clang -arch arm64 -o "$WORK/empty" "$WORK/empty.s" "$ROOT/runtime.c" "$ROOT/codegen_harness.c"
 BASE=$(/usr/bin/time -l "$WORK/empty" 2>&1 >/dev/null | awk '/instructions retired/ {print $1}')
 
@@ -80,7 +82,7 @@ for f in "${files[@]}"; do
   name="$(basename "$f" .scm)"
   scaled="$WORK/$name.scm"
   scale_program "$f" "$scaled"
-  expected="$(csi -R r7rs -I "$ROOT" -s "$ROOT/tools/host-eval.scm" "$scaled")"
+  expected="$(hop_script "$ROOT/tools/host-eval.scm" "$scaled")"
   for config in ${BENCH_CONFIGS:-off prune ioff i0 i1 i2 i3 i8}; do
     case "$config" in
       off) envs=(HOP_SSA=) ;;
@@ -95,8 +97,8 @@ for f in "${files[@]}"; do
       k*) envs=(HOP_SSA=sccp "HOP_SHAPE_K=${config#k}") ;;
     esac
     asm="$WORK/$name.$config.s"; exe="$WORK/$name.$config"
-    env "${envs[@]}" HOP_SSA_STATS=1 csi -R r7rs -I "$ROOT" -e \
-      "(begin (load \"$ROOT/compiler.scm\") (write-aarch64-program-file \"$scaled\" \"$asm\"))" \
+    (export "${envs[@]}" HOP_SSA_STATS=1
+     hop_eval "(begin $HOP_LOAD (write-aarch64-program-file \"$scaled\" \"$asm\"))") \
       2>"$WORK/stats.txt"
     # analysis statistics summed over the unit's procedures (zeros when the analysis is off)
     read -r iters unk strc us < <(awk '/^hop-ssa-stats/ { for (i=2;i<=NF;i++) { split($i,kv,"="); s[kv[1]]+=kv[2] } }

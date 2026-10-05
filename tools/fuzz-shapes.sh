@@ -6,6 +6,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+. "$ROOT/tools/scheme.sh"
+hop_prepare_compiler
 COUNT="${1:-40}"
 SEED="${2:-1}"
 shift $(( $# > 2 ? 2 : $# )) || true
@@ -16,7 +18,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 export HOP_CHECK_ALLOC=1
 
-csi -R r7rs -I "$ROOT" -s "$ROOT/tools/fuzz-shapes.scm" gen "$WORK" "$COUNT" "$SEED"
+hop_script "$ROOT/tools/fuzz-shapes.scm" gen "$WORK" "$COUNT" "$SEED"
 
 failures=0
 run_config() {
@@ -24,7 +26,7 @@ run_config() {
   local dir="$WORK/$label"
   mkdir -p "$dir"
   cp "$WORK"/p*.scm "$dir"/
-  env "$@" csi -R r7rs -I "$ROOT" -s "$ROOT/tools/fuzz-shapes.scm" compile "$dir"
+  (export "$@"; hop_script "$ROOT/tools/fuzz-shapes.scm" compile "$dir")
   for ((i = 0; i < COUNT; i++)); do
     clang -arch arm64 -o "$dir/p$i" "$dir/p$i.s" "$ROOT/runtime.c" "$ROOT/codegen_harness.c"
     if ! "$dir/p$i" "$(cat "$WORK/p$i.expected")" >/dev/null 2>&1; then
