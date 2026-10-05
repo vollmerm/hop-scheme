@@ -58,6 +58,6 @@ while IFS= read -r line; do
   objects+=("$line")
 done <"$manifest"
 
-clang -arch arm64 -I "$ROOT" -o "$output" "${objects[@]}" "$ROOT/runtime.c" "$ROOT/codegen_harness.c"
+clang -arch arm64 ${HOP_CFLAGS:--O2} -I "$ROOT" -o "$output" "${objects[@]}" "$ROOT/runtime.c" "$ROOT/codegen_harness.c"
 
 echo "Built $output"

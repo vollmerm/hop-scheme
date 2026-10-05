@@ -12,6 +12,7 @@
 #   sK               aK plus inlining small readers and scalar replacement (HOP_SROA)
 #   ioff             pruning and inlining, no SSA
 # HOP_INLINE_SIZE (default 60) is the inlining size limit.
+# HOP_CFLAGS (default -O2) are the C compiler flags used to build the runtime.
 # BENCH_FORMAT=csv prints comma-separated rows (with a header) instead of the table.
 # Depth sweep: BENCH_CONFIGS="off control k0 k1 k2 k3 k4 k8" BENCH_FORMAT=csv tools/bench-run.sh
 set -euo pipefail
@@ -72,7 +73,7 @@ PY
 # program and report instructions retired above it.
 echo '(+ 1 2)' > "$WORK/empty.scm"
 hop_eval "(begin $HOP_LOAD (write-aarch64-program-file \"$WORK/empty.scm\" \"$WORK/empty.s\"))"
-clang -arch arm64 -o "$WORK/empty" "$WORK/empty.s" "$ROOT/runtime.c" "$ROOT/codegen_harness.c"
+clang -arch arm64 ${HOP_CFLAGS:--O2} -o "$WORK/empty" "$WORK/empty.s" "$ROOT/runtime.c" "$ROOT/codegen_harness.c"
 BASE=$(/usr/bin/time -l "$WORK/empty" 2>&1 >/dev/null | awk '/instructions retired/ {print $1}')
 
 CSV=0; [[ "${BENCH_FORMAT:-}" == csv ]] && CSV=1
@@ -103,7 +104,7 @@ for f in "${files[@]}"; do
     # analysis statistics summed over the unit's procedures (zeros when the analysis is off)
     read -r iters unk strc us < <(awk '/^hop-ssa-stats/ { for (i=2;i<=NF;i++) { split($i,kv,"="); s[kv[1]]+=kv[2] } }
       END { printf "%d %d %d %d\n", s["iters"], s["unknown"], s["struct"]+s["pair"], s["us"] }' "$WORK/stats.txt")
-    clang -arch arm64 -o "$exe" "$asm" "$ROOT/runtime.c" "$ROOT/codegen_harness.c"
+    clang -arch arm64 ${HOP_CFLAGS:--O2} -o "$exe" "$asm" "$ROOT/runtime.c" "$ROOT/codegen_harness.c"
     if ! HOP_HEAP_BYTES="$HEAP" "$exe" "$expected" >/dev/null 2>&1; then
       echo "WRONG RESULT: $name $config (expected $expected)" >&2; exit 1
     fi

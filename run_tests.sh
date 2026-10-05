@@ -46,7 +46,7 @@ build_executable() {
   asm_path="$(asm_path_for "$test_name")"
   exe_path="$(exe_path_for "$test_name")"
   ensure_asm "$test_name"
-  clang -arch arm64 -o "$exe_path" \
+  clang -arch arm64 ${HOP_CFLAGS:--O2} -o "$exe_path" \
     "$asm_path" \
     "$ROOT/runtime.c" \
     "$ROOT/codegen_harness.c"
@@ -79,7 +79,7 @@ assert_file_output() {
   printf '%s\n' "$source_text" >"$source_path"
   hop_eval \
     "(begin $HOP_LOAD (write-aarch64-program-file \"$source_path\" \"$asm_path\"))"
-  clang -arch arm64 -o "$exe_path" \
+  clang -arch arm64 ${HOP_CFLAGS:--O2} -o "$exe_path" \
     "$asm_path" \
     "$ROOT/runtime.c" \
     "$ROOT/codegen_harness.c"
@@ -173,7 +173,7 @@ build_multi_file_case() {
   while IFS= read -r line; do
     objects+=("$line")
   done <"$out_dir/build_manifest.txt"
-  clang -arch arm64 -I "$ROOT" -o "$exe_path" "${objects[@]}" "$ROOT/runtime.c" "$ROOT/codegen_harness.c"
+  clang -arch arm64 ${HOP_CFLAGS:--O2} -I "$ROOT" -o "$exe_path" "${objects[@]}" "$ROOT/runtime.c" "$ROOT/codegen_harness.c"
 }
 
 assert_multi_file_output() {
@@ -685,7 +685,7 @@ check_inlined() {
   local test_name="$1" expected="$2"
   local asm_path="$TMPDIR/inlined_${test_name}.s" exe_path="$TMPDIR/inlined_${test_name}"
   HOP_INLINE=30 HOP_PRUNE=1 HOP_SSA=sccp HOP_SHAPE_K=3 generate "$test_name" "$asm_path"
-  clang -arch arm64 -o "$exe_path" "$asm_path" "$ROOT/runtime.c" "$ROOT/codegen_harness.c"
+  clang -arch arm64 ${HOP_CFLAGS:--O2} -o "$exe_path" "$asm_path" "$ROOT/runtime.c" "$ROOT/codegen_harness.c"
   "$exe_path" "$expected" >/dev/null
   printf 'ok inlined %s\n' "$test_name"
 }
@@ -709,7 +709,7 @@ check_ipa() {
   local test_name="$1" expected="$2"
   local asm_path="$TMPDIR/ipa_${test_name}.s" exe_path="$TMPDIR/ipa_${test_name}"
   HOP_IPA=1 HOP_PRUNE=1 HOP_SSA=sccp HOP_SHAPE_K=3 generate "$test_name" "$asm_path"
-  clang -arch arm64 -o "$exe_path" "$asm_path" "$ROOT/runtime.c" "$ROOT/codegen_harness.c"
+  clang -arch arm64 ${HOP_CFLAGS:--O2} -o "$exe_path" "$asm_path" "$ROOT/runtime.c" "$ROOT/codegen_harness.c"
   "$exe_path" "$expected" >/dev/null
   if grep -Eq '_hop_car' "$asm_path"; then
     echo "ipa left a car in $test_name" >&2; exit 1
@@ -729,7 +729,7 @@ check_sroa() {
   local test_name="$1" expected="$2"
   local asm_path="$TMPDIR/sroa_${test_name}.s" exe_path="$TMPDIR/sroa_${test_name}"
   HOP_SROA=1 HOP_IPA=1 HOP_PRUNE=1 HOP_INLINE=30 HOP_INLINE_READERS=8 HOP_SSA=sccp HOP_SHAPE_K=3 generate "$test_name" "$asm_path"
-  clang -arch arm64 -o "$exe_path" "$asm_path" "$ROOT/runtime.c" "$ROOT/codegen_harness.c"
+  clang -arch arm64 ${HOP_CFLAGS:--O2} -o "$exe_path" "$asm_path" "$ROOT/runtime.c" "$ROOT/codegen_harness.c"
   "$exe_path" "$expected" >/dev/null
   printf 'ok sroa %s\n' "$test_name"
 }
@@ -739,7 +739,7 @@ done
 sroa_allocs() { HOP_STATS=1 "$TMPDIR/sroa_$1" 2>&1 >/dev/null | sed -n 's/.*allocs=\([0-9]*\).*/\1/p'; }
 plain_allocs() {
   HOP_SROA=0 HOP_INLINE_READERS=0 HOP_IPA=1 HOP_PRUNE=1 HOP_INLINE=30 HOP_SSA=sccp HOP_SHAPE_K=3 generate "$1" "$TMPDIR/plain_$1.s"
-  clang -arch arm64 -o "$TMPDIR/plain_$1" "$TMPDIR/plain_$1.s" "$ROOT/runtime.c" "$ROOT/codegen_harness.c"
+  clang -arch arm64 ${HOP_CFLAGS:--O2} -o "$TMPDIR/plain_$1" "$TMPDIR/plain_$1.s" "$ROOT/runtime.c" "$ROOT/codegen_harness.c"
   HOP_STATS=1 "$TMPDIR/plain_$1" 2>&1 >/dev/null | sed -n 's/.*allocs=\([0-9]*\).*/\1/p'
 }
 sroa_n=$(sroa_allocs test144); plain_n=$(plain_allocs test144)

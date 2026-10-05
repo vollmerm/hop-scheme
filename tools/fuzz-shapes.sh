@@ -28,7 +28,7 @@ run_config() {
   cp "$WORK"/p*.scm "$dir"/
   (export "$@"; hop_script "$ROOT/tools/fuzz-shapes.scm" compile "$dir")
   for ((i = 0; i < COUNT; i++)); do
-    clang -arch arm64 -o "$dir/p$i" "$dir/p$i.s" "$ROOT/runtime.c" "$ROOT/codegen_harness.c"
+    clang -arch arm64 ${HOP_CFLAGS:--O2} -o "$dir/p$i" "$dir/p$i.s" "$ROOT/runtime.c" "$ROOT/codegen_harness.c"
     if ! "$dir/p$i" "$(cat "$WORK/p$i.expected")" >/dev/null 2>&1; then
       printf 'MISMATCH %s program %s (seed %s): expected %s\n' \
         "$label" "$i" "$SEED" "$(cat "$WORK/p$i.expected")" >&2
