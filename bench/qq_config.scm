@@ -1,0 +1,12 @@
+; a quasiquoted association table searched by key
+(define (cadr x) (car (cdr x)))
+(define (lookup key table default)
+  (cond ((null? table) default)
+        ((eq? (car (car table)) key) (cadr (car table)))
+        (else (lookup key (cdr table) default))))
+(define (config width height)
+  `((width ,width) (height ,height) (depth 8) (mode 1) (scale 2)))
+(define (area c) (* (lookup 'width c 0) (lookup 'height c 0)))
+(define (go n acc)
+  (if (= n 0) acc (go (- n 1) (+ acc (+ (area (config n 3)) (lookup 'scale (config 1 1) 0))))))
+(go 150 0)
