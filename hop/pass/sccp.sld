@@ -28,12 +28,17 @@
           set-shape-depth!
           set-remove-dead-allocation!
           set-scalar-replacement!
+          set-sccp-stats!
+          analyze            ; exported for the unit tests
+          scalar-replace!    ; exported for the unit tests
           value-table-size
           control-cfg
           control-ssa)
   (import (scheme base)
           (scheme cxr)
-          (only (srfi 1) any append-map filter find fold last list-index)
+          (only (srfi 1) any append-map drop-right filter find fold last list-index map-in-order)
+          (scheme time)
+          (scheme write)
           (srfi 69)
           (hop utils)
           (hop pass cfg)
@@ -56,6 +61,32 @@
 
 (define (primop-rhs? rhs)
   (and (pair? rhs) (eq? (car rhs) 'primop)))
+
+;; 'car or 'cdr when op is a safe or unsafe accessor, else #f.
+(define (accessor-kind op)
+  (case op
+    ((car unsafe-car) 'car)
+    ((cdr unsafe-cdr) 'cdr)
+    (else #f)))
+
+(define (unsafe-accessor kind)
+  (if (eq? kind 'car) 'unsafe-car 'unsafe-cdr))
+
+;; Calls (proc slot arg pred) for each argument of phi, where pred is the
+;; index of the predecessor block that argument flows in from.
+(define (for-each-phi-arg proc block phi)
+  (let ((args (phi-args phi)))
+    (let loop ((slot 0) (preds (ssa-block-preds block)))
+      (unless (null? preds)
+        (proc slot (vector-ref args slot) (car preds))
+        (loop (+ slot 1) (cdr preds))))))
+
+;; The value of an operand: a name's analysis value (bot when never computed),
+;; or the constant of a literal.
+(define (analysis-value analysis operand)
+  (if (symbol? operand)
+      (hash-table-ref/default (analysis-values analysis) operand bot)
+      (literal-value operand)))
 
 ;;; --- Pi nodes ---
 
@@ -94,12 +125,11 @@
        (lambda (j block)
          (for-each
           (lambda (phi)
-            (let ((args (phi-args phi)))
-              (for-each-index
-               (lambda (slot pred)
-                 (when (and (memv pred members) (eq? (vector-ref args slot) from))
-                   (vector-set! args slot to)))
-               (list->vector (ssa-block-preds block)))))
+            (for-each-phi-arg
+             (lambda (slot arg pred)
+               (when (and (memv pred members) (eq? arg from))
+                 (vector-set! (phi-args phi) slot to)))
+             block phi))
           (ssa-block-phis block)))
        blocks))
     (for-each-index
@@ -242,14 +272,13 @@
 ;; names holds each operand's variable name, or #f for a literal.
 (define (eval-primop op args names)
   (cond
-   ((memq #f (map (lambda (a) (not (bot? a))) args)) bot)
+   ((any bot? args) bot)
    ((and (eq? op 'cons) (= (length args) 2))
     (let ((an (and (not (const? (car args))) (car names)))
           (dn (and (not (const? (cadr args))) (cadr names))))
       (limit (make-cons-value (car args) an (cadr args) dn) shape-depth)))
-   ((and (memq op '(car cdr unsafe-car unsafe-cdr)) (= (length args) 1))
-    (car (component (car args)
-                    (if (memq op '(car unsafe-car)) 'car 'cdr))))
+   ((and (accessor-kind op) (= (length args) 1))
+    (car (component (car args) (accessor-kind op))))
    ((and (assq op foldable-arithmetic) (= (length args) 2))
     (if (and (const? (car args)) (const? (cadr args))
              (number? (const-value (car args)))
@@ -330,15 +359,11 @@
     (set-ssa-block-instrs!
      block
      (if (and (pair? instrs) (memq (car (last instrs)) terminator-forms))
-         (let ((rev (reverse instrs)))
-           (append (reverse (cdr rev)) (list instr (car rev))))
+         (append (drop-right instrs 1) (list instr (last instrs)))
          (append instrs (list instr))))))
 
 (define (cons-rhs-operands rhs)
-  (cond
-   ((and (pair? rhs) (eq? (car rhs) 'cons)) (cdr rhs))
-   ((and (pair? rhs) (eq? (car rhs) 'primop) (eq? (cadr rhs) 'cons)) (cddr rhs))
-   (else #f)))
+  (and (primop-rhs? rhs) (eq? (cadr rhs) 'cons) (cddr rhs)))
 
 (define (dominates? idom a b)
   (let walk ((x b))
@@ -395,7 +420,7 @@
          (phi-defs (make-hash-table))
          (fields (make-hash-table equal?))
          (loads (make-hash-table equal?)))
-    (define (value-of name) (hash-table-ref/default (analysis-values analysis) name bot))
+    (define (value-of name) (analysis-value analysis name))
     (define (dom-depth-of x)
       (or (vector-ref dom-depth x)
           (let ((d (if (= x 0) 0 (+ 1 (dom-depth-of (vector-ref idom x))))))
@@ -436,9 +461,8 @@
     (define (read-of instr base)
       (let ((rhs (instr-rhs instr)))
         (and (primop-rhs? rhs)
-             (memq (cadr rhs) '(car cdr unsafe-car unsafe-cdr))
              (eq? (caddr rhs) base)
-             (if (memq (cadr rhs) '(car unsafe-car)) 'car 'cdr))))
+             (accessor-kind (cadr rhs)))))
     (define (component-value value which)
       (if (eq? which 'car) (cons-car value) (cons-cdr value)))
     ;; Reads of name as (dst base which), a base before its readers, and the
@@ -450,11 +474,10 @@
          (lambda (b block)
            (for-each
             (lambda (phi)
-              (for-each-index
-               (lambda (slot arg)
-                 (when (eq? arg name)
-                   (set! escapes (cons (list-ref (ssa-block-preds block) slot) escapes))))
-               (phi-args phi)))
+              (for-each-phi-arg
+               (lambda (slot arg pred)
+                 (when (eq? arg name) (set! escapes (cons pred escapes))))
+               block phi))
             (ssa-block-phis block))
            (for-each
             (lambda (instr)
@@ -479,7 +502,7 @@
     (define (field name path where)
       (cond
        ((null? path) name)
-       ((not (symbol? name)) (error "scalar replacement: field of a literal" name path))
+       ((not (symbol? name)) (raise 'scalar-replacement-abort))
        ((operands-of name)
         => (lambda (ops)
              (field (if (eq? (car path) 'car) (car ops) (cdr ops)) (cdr path) where)))
@@ -492,8 +515,10 @@
                          (phi (car entry)))
                      (hash-table-set! fields key dst)
                      (let* ((preds (ssa-block-preds (vector-ref blocks block-index)))
-                            (args (map (lambda (arg pred) (field arg path pred))
-                                       (vector->list (phi-args phi)) preds))
+                            ;; in predecessor order, so fresh names do not depend on
+                            ;; the order the host's map happens to use
+                            (args (map-in-order (lambda (arg pred) (field arg path pred))
+                                                (vector->list (phi-args phi)) preds))
                             (block (vector-ref blocks block-index)))
                        (set-ssa-block-phis!
                         block
@@ -510,8 +535,7 @@
                            (let ((t (fresh-sroa-name)))
                              (append-before-terminator!
                               (vector-ref blocks where)
-                              `(assign ,t (primop ,(if (eq? (car rest) 'car) 'unsafe-car 'unsafe-cdr)
-                                                  ,from)))
+                              `(assign ,t (primop ,(unsafe-accessor (car rest)) ,from)))
                              (chain t (cdr rest)))))))
                 (hash-table-set! loads key result)
                 result))))))
@@ -542,6 +566,19 @@
             (when (or (not target) (< (vector-ref depth target) (vector-ref depth b)))
               (set! fields (make-hash-table equal?))
               (set! loads (make-hash-table equal?))
+              ;; Building the fields adds phis and loads before anything is
+              ;; rewritten; if that finds a shape it cannot handle (a literal
+              ;; where a pair should flow), put the blocks back and skip this phi.
+              (let ((saved (vector-map (lambda (blk) (cons (ssa-block-phis blk)
+                                                           (ssa-block-instrs blk)))
+                                       blocks)))
+               (guard (e ((eq? e 'scalar-replacement-abort)
+                          (for-each-index
+                           (lambda (i blk)
+                             (set-ssa-block-phis! blk (car (vector-ref saved i)))
+                             (set-ssa-block-instrs! blk (cdr (vector-ref saved i))))
+                           blocks)
+                          (refresh-defs!)))
               (let ((virtual (make-hash-table))   ; name -> (value . path)
                     (copies (make-hash-table))
                     (gone (make-hash-table)))
@@ -583,14 +620,14 @@
                      (lambda (i block)
                        (for-each
                         (lambda (phi)
-                          (let ((args (phi-args phi)))
-                            (for-each-index
-                             (lambda (slot arg)
-                               (when (eq? arg name) (vector-set! args slot (cdr materialized))))
-                             args)))
+                          (for-each-phi-arg
+                           (lambda (slot arg pred)
+                             (when (eq? arg name)
+                               (vector-set! (phi-args phi) slot (cdr materialized))))
+                           block phi))
                         (ssa-block-phis block)))
                      blocks)))
-                (refresh-defs!)))))))
+                (refresh-defs!)))))))))
     (when depth
       (refresh-defs!)
       (for-each-index
@@ -645,9 +682,7 @@
 ;; direct calls, and its return values. name is #f for the entry code.
 (define (ipa-collect! name analysis blocks)
   (define (value-of operand)
-    (strip-names (if (symbol? operand)
-                    (hash-table-ref/default (analysis-values analysis) operand bot)
-                    (literal-value operand))))
+    (strip-names (analysis-value analysis operand)))
   (define (note-call! callee args)
     (let ((seed (hash-table-ref/default ipa-seeds callee #f)))
       (when seed
@@ -726,8 +761,6 @@
        ((literal-expr? rhs) (const rhs))
        ((primop-rhs? rhs)
         (eval-primop (cadr rhs) (map value-of (cddr rhs)) (map operand-name (cddr rhs))))
-       ((and (pair? rhs) (eq? (car rhs) 'cons))
-        (eval-primop 'cons (map value-of (cdr rhs)) (map operand-name (cdr rhs))))
        ((and (pair? rhs) (eq? (car rhs) 'global))
         (hash-table-ref/default quote-cell-values (cadr rhs) unknown))
        ((and ipa-active (pair? rhs) (eq? (car rhs) 'direct-call))
@@ -825,24 +858,31 @@
     (make-analysis values visited edges iterations)))
 
 ;; Records what the entry code stored in each hoisted quote cell, without
-;; component names (they belong to the entry procedure).
+;; component names (they belong to the entry procedure). The values of all
+;; stores to one cell in this analysis are joined, so a cell written on several
+;; paths is described soundly; a later pass replaces the recorded value (it may
+;; be more precise once the interprocedural values have settled).
 (define (harvest-quote-cells! analysis blocks)
-  (for-each-index
-   (lambda (b block)
-     (when (vector-ref (analysis-visited analysis) b)
-       (for-each
-        (lambda (instr)
-          (when (and (eq? (car instr) 'set-global!) (quote-cell? (cadr instr)))
-            (let* ((operand (caddr instr))
-                   (new (strip-names
-                         (if (symbol? operand)
-                             (hash-table-ref/default (analysis-values analysis) operand unknown)
-                             (literal-value operand)))))
-              (unless (eq? new (hash-table-ref/default quote-cell-values (cadr instr) #f))
-                (set! ipa-changed #t))
-              (hash-table-set! quote-cell-values (cadr instr) new))))
-        (ssa-block-instrs block))))
-   blocks))
+  (let ((stored (make-hash-table)))
+    (for-each-index
+     (lambda (b block)
+       (when (vector-ref (analysis-visited analysis) b)
+         (for-each
+          (lambda (instr)
+            (when (and (eq? (car instr) 'set-global!) (quote-cell? (cadr instr)))
+              (let ((v (analysis-value analysis (caddr instr))))
+                (hash-table-update!/default
+                 stored (cadr instr)
+                 (lambda (old) (join old (strip-names (if (bot? v) unknown v))))
+                 bot))))
+          (ssa-block-instrs block))))
+     blocks)
+    (hash-table-walk
+     stored
+     (lambda (cell new)
+       (unless (eq? new (hash-table-ref/default quote-cell-values cell #f))
+         (hash-table-set! quote-cell-values cell new)
+         (when ipa-active (set! ipa-changed #t)))))))
 
 (define (ssa-proc-param-names ssa)
   (params-names (ssa-proc-params ssa)))
@@ -850,10 +890,7 @@
 ;;; --- Rewriting ---
 
 (define (rewrite-instr analysis instr)
-  (define (value-of var)
-    (hash-table-ref/default (analysis-values analysis) var bot))
-  (define (operand-value operand)
-    (if (symbol? operand) (value-of operand) (literal-value operand)))
+  (define (value-of var) (analysis-value analysis var))
   (case (car instr)
     ((assign)
      (let ((dst (cadr instr)) (rhs (caddr instr)))
@@ -863,20 +900,17 @@
         ((literal-expr? rhs) instr)
         ((and (const? (value-of dst))
               (or (symbol? rhs)
-                  (and (primop-rhs? rhs)
-                       (memq (cadr rhs) '(+ - * = < > eq? null? pair? symbol?
-                                          car cdr unsafe-car unsafe-cdr)))))
+                  (and (primop-rhs? rhs) (memq (cadr rhs) foldable-primops))))
          `(assign ,dst ,(const-value (value-of dst))))
         ((and (primop-rhs? rhs)
-              (memq (cadr rhs) '(car cdr unsafe-car unsafe-cdr))
+              (accessor-kind (cadr rhs))
               (symbol? (caddr rhs))
-              (cons? (value-of (caddr rhs))))
-         (let* ((which (if (memq (cadr rhs) '(car unsafe-car)) 'car 'cdr))
-                (name (cdr (component (value-of (caddr rhs)) which))))
+              (cons? (analysis-value analysis (caddr rhs))))
+         (let* ((which (accessor-kind (cadr rhs)))
+                (name (cdr (component (analysis-value analysis (caddr rhs)) which))))
            (if name
                `(assign ,dst ,name)
-               `(assign ,dst (primop ,(if (eq? which 'car) 'unsafe-car 'unsafe-cdr)
-                                     ,(caddr rhs))))))
+               `(assign ,dst (primop ,(unsafe-accessor which) ,(caddr rhs))))))
         (else instr))))
     (else instr)))
 
@@ -911,7 +945,7 @@
                             (cadddr last-instr))))
              (set-ssa-block-instrs!
               block
-              (append (reverse (cdr (reverse instrs))) (list `(goto ,label))))))
+              (append (drop-right instrs 1) (list `(goto ,label))))))
          (let* ((old-preds (ssa-block-preds block))
                 (keep-slot? (map (lambda (p) (and (live-edge? p b) #t)) old-preds)))
            (for-each
@@ -948,6 +982,11 @@
 (define pure-primops
   '(+ - * = < > eq? null? pair? symbol? vector? unsafe-car unsafe-cdr))
 
+;; Primops whose result the analysis can compute, so that a definition it finds
+;; constant may be replaced by the literal.
+(define foldable-primops
+  '(+ - * = < > eq? null? pair? symbol? car cdr unsafe-car unsafe-cdr))
+
 (define (removable-rhs? rhs remove-allocation?)
   (cond
    ((symbol? rhs) #t)
@@ -959,7 +998,6 @@
       ((primop)
        (or (and (memq (cadr rhs) pure-primops) #t)
            (and remove-allocation? (eq? (cadr rhs) 'cons))))
-      ((cons) remove-allocation?)
       (else #f)))))
 
 (define (remove-dead-definitions! blocks remove-allocation?)
@@ -1049,8 +1087,7 @@
    (lambda (b block)
      (let ((constant-phis
             (filter (lambda (phi)
-                      (const? (hash-table-ref/default (analysis-values analysis)
-                                                      (phi-dst phi) bot)))
+                      (const? (analysis-value analysis (phi-dst phi))))
                     (ssa-block-phis block))))
        (unless (null? constant-phis)
          (set-ssa-block-phis!
@@ -1062,9 +1099,7 @@
           (append
            (map (lambda (phi)
                   `(assign ,(phi-dst phi)
-                           ,(const-value
-                             (hash-table-ref (analysis-values analysis)
-                                             (phi-dst phi)))))
+                           ,(const-value (analysis-value analysis (phi-dst phi)))))
                 constant-phis)
            (ssa-block-instrs block))))))
    blocks))
@@ -1087,7 +1122,9 @@
     (when (and entry? (not pis-done?))
       (reset-quote-cells!)
       (harvest-quote-cells! (analyze ssa) blocks))
-    (let ((analysis (analyze ssa name)))
+    (let* ((start (current-jiffy))
+           (ops-before (and sccp-stats? (count-ops blocks)))
+           (analysis (analyze ssa name)))
       (for-each-index
        (lambda (b block)
          (set-ssa-block-instrs!
@@ -1103,7 +1140,66 @@
           (scalar-replace! analysis pruned)
           (propagate-copies! pruned))
         (remove-dead-definitions! pruned remove-allocation?)
+        (when sccp-stats?
+          (report-stats name analysis ops-before (count-ops pruned)
+                        (- (current-jiffy) start)))
         (make-ssa-proc (ssa-proc-params ssa) pruned)))))
+
+;;; --- Static statistics (HOP_SSA_STATS=1) ---
+;;;
+;;; One line per analyzed procedure on stderr: analysis iterations, how the
+;;; analysis values of its SSA names split (unknown / constant / pair of unknown
+;;; contents / structured cons), the number of each shape-related operation
+;;; before and after the rewrite (before:after), analysis plus rewrite time in
+;;; microseconds, and the size of the interned value table so far.
+
+(define sccp-stats? #f)
+(define (set-sccp-stats! flag) (set! sccp-stats? flag))
+
+(define stat-ops '(car cdr cons pair? null?))
+
+;; counts for car, cdr, cons, pair?, null? (unsafe accessors count as car/cdr)
+(define (count-ops blocks)
+  (let ((counts (map (lambda (op) (cons op 0)) stat-ops)))
+    (for-each-index
+     (lambda (b block)
+       (for-each
+        (lambda (instr)
+          (let ((rhs (instr-rhs instr)))
+            (when (primop-rhs? rhs)
+              (let* ((op (cadr rhs))
+                     (op (or (accessor-kind op) op))
+                     (entry (assq op counts)))
+                (when entry (set-cdr! entry (+ 1 (cdr entry))))))))
+        (ssa-block-instrs block)))
+     blocks)
+    (map cdr counts)))
+
+(define (report-stats name analysis before after jiffies)
+  (let ((unknowns 0) (consts 0) (pairs 0) (structs 0))
+    (hash-table-walk
+     (analysis-values analysis)
+     (lambda (var v)
+       (cond ((eq? v unknown) (set! unknowns (+ unknowns 1)))
+             ((const? v) (set! consts (+ consts 1)))
+             ((eq? v pair-value) (set! pairs (+ pairs 1)))
+             ((cons? v) (set! structs (+ structs 1))))))
+    (let ((out (current-error-port)))
+      (display "hop-ssa-stats" out)
+      (display " proc=" out) (display (or name "-") out)
+      (display " iters=" out) (display (analysis-iterations analysis) out)
+      (display " unknown=" out) (display unknowns out)
+      (display " const=" out) (display consts out)
+      (display " pair=" out) (display pairs out)
+      (display " struct=" out) (display structs out)
+      (for-each (lambda (op b a)
+                  (display " " out) (display op out) (display "=" out)
+                  (display b out) (display ":" out) (display a out))
+                stat-ops before after)
+      (display " us=" out)
+      (display (quotient (* jiffies 1000000) (jiffies-per-second)) out)
+      (display " values=" out) (display node-count out)
+      (newline out))))
 
 ;; Optimizes a whole unit at once. specs: a list of (name params cfg) for the
 ;; non-entry procedures; closed: (name . parameter-count) of those whose every

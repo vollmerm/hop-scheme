@@ -197,6 +197,61 @@
 (agrees? "counting-loop" counting-loop '((0) (5) (6)))
 (agrees? "same-constant" same-constant '((#t) (#f)))
 
+;; Scalar replacement abort path. A phi carrying a record is split into field
+;; phis; if an incoming value turns out not to be a pair (it cannot with a sound
+;; analysis, so the test corrupts the SSA after analyzing), the blocks must be
+;; restored exactly. The CFG: p is built on two entry paths, rebuilt in a loop
+;; and read after it, so the phi of p has three arguments.
+(define-program record-loop (x n c0)
+  ((label e) (if c0 e1 e2)
+   (label e1) (assign p (primop cons 1 x)) (assign i 0) (goto h)
+   (label e2) (assign p (primop cons 1 x)) (assign i 1) (goto h)
+   (label h) (assign c (primop < i n)) (if c body done)
+   (label body) (assign a (primop car p)) (assign p (primop cons a x))
+   (assign i (primop + i 1)) (goto h)
+   (label done) (assign r (primop cdr p)) (return r)))
+
+;; Analyzes record-loop at depth 3, lets corrupt! change the argument vector of
+;; the phi of p, runs scalar replacement, and returns (before . after): the phi
+;; names and instructions of every block. The pass visits the arguments in
+;; order, so with slots 0 and 1 corrupted the third (a cons) still feeds the phi.
+(define (sroa-trial corrupt!)
+  (set-shape-depth! 3)
+  (let* ((ssa (cfg->ssa (car record-loop) (build-cfg (cdr record-loop))))
+         (blocks (ssa-proc-blocks ssa))
+         (analysis (analyze ssa))
+         (header (find (lambda (b) (eq? (ssa-block-label b) 'h)) (vector->list blocks)))
+         (phi (find (lambda (phi) (eq? (phi-var phi) 'p)) (ssa-block-phis header))))
+    (define (snapshot)
+      (map (lambda (b) (cons (map phi-dst (ssa-block-phis b)) (ssa-block-instrs b)))
+           (vector->list blocks)))
+    (corrupt! (phi-args phi))
+    (let ((before (snapshot)))
+      (scalar-replace! analysis blocks)
+      (cons before (snapshot)))))
+
+(define (mentions-tree? tree pattern)
+  (let walk ((x tree))
+    (cond ((equal? x pattern) #t)
+          ((pair? x) (or (walk (car x)) (walk (cdr x))))
+          (else #f))))
+
+;; the first incoming value is an opaque pair: the rewrite succeeds and reads
+;; its cdr with an unsafe-cdr at the end of that predecessor (the car is the
+;; constant 1), so the abort case below really has something to undo
+(let ((trial (sroa-trial (lambda (args) (vector-set! args 0 'x)))))
+  (check "opaque incoming pair is split" (not (equal? (car trial) (cdr trial))))
+  (check "opaque incoming pair is read by a load"
+         (mentions-tree? (map cdr (cdr trial)) '(primop unsafe-cdr x))))
+
+;; ... but when the second incoming value is a literal, after the load was
+;; added, the pass gives up and leaves every block as it was
+(let ((trial (sroa-trial (lambda (args)
+                           (vector-set! args 0 'x)
+                           (vector-set! args 1 0)))))
+  (check "scalar replacement aborts and restores the blocks"
+         (equal? (car trial) (cdr trial))))
+
 ;; the control does the cleanup but learns nothing
 (define (control program)
   (ssa->cfg (control-ssa (cfg->ssa (car program) (build-cfg (cdr program))))))

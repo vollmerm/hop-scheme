@@ -60,6 +60,7 @@
          (depth (if depth-text (string->number depth-text) 0))
          (dead-cons (get-environment-variable "HOP_DEAD_CONS")))
     (set-shape-depth! depth)
+    (set-sccp-stats! (equal? (get-environment-variable "HOP_SSA_STATS") "1"))
     (set-scalar-replacement! (equal? (get-environment-variable "HOP_SROA") "1"))
     (set-remove-dead-allocation!
      (if dead-cons (equal? dead-cons "1") (> depth 0)))))
