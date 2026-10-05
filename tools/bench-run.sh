@@ -69,7 +69,7 @@ csi -R r7rs -I "$ROOT" -e "(begin (load \"$ROOT/compiler.scm\") (write-aarch64-p
 clang -arch arm64 -o "$WORK/empty" "$WORK/empty.s" "$ROOT/runtime.c" "$ROOT/codegen_harness.c"
 BASE=$(/usr/bin/time -l "$WORK/empty" 2>&1 >/dev/null | awk '/instructions retired/ {print $1}')
 
-printf '%-10s %-8s %6s %5s %5s %6s %12s\n' program config lines car cdr alloc work-instrs
+printf '%-10s %-8s %6s %5s %5s %6s %12s %12s\n' program config lines car cdr alloc work-instrs dyn-allocs
 for f in "${files[@]}"; do
   name="$(basename "$f" .scm)"
   scaled="$WORK/$name.scm"
@@ -96,8 +96,9 @@ for f in "${files[@]}"; do
     car=$(grep -c 'bl _hop_car' "$asm" || true)
     cdr=$(grep -c 'bl _hop_cdr' "$asm" || true)
     alloc=$(grep -c 'bl _hop_alloc_pair' "$asm" || true)
-    stats="$(HOP_HEAP_BYTES="$HEAP" /usr/bin/time -l "$exe" 2>&1 >/dev/null || true)"
+    stats="$(HOP_STATS=1 HOP_HEAP_BYTES="$HEAP" /usr/bin/time -l "$exe" 2>&1 >/dev/null || true)"
+    dyn=$(sed -n 's/^hop-stats allocs=\([0-9]*\).*/\1/p' <<<"$stats")
     instrs=$(awk '/instructions retired/ {print $1}' <<<"$stats")
-    printf '%-10s %-8s %6s %5s %5s %6s %12s\n' "$name" "$config" "$lines" "$car" "$cdr" "$alloc" "$(( ${instrs:-0} - BASE ))"
+    printf '%-10s %-8s %6s %5s %5s %6s %12s %12s\n' "$name" "$config" "$lines" "$car" "$cdr" "$alloc" "$(( ${instrs:-0} - BASE ))" "${dyn:-0}"
   done
 done

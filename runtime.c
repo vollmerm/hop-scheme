@@ -110,6 +110,8 @@ static size_t hop_parse_heap_size(void) {
     return hop_align_bytes((size_t)parsed);
 }
 
+static void hop_print_stats(void);
+
 static void hop_init_heap(void) {
     size_t bytes;
 
@@ -117,6 +119,9 @@ static void hop_init_heap(void) {
         return;
     }
 
+    if (getenv("HOP_STATS")) {
+        atexit(hop_print_stats);
+    }
     bytes = hop_parse_heap_size();
     hop_runtime_heap.from_space = (uint8_t *)malloc(bytes);
     hop_runtime_heap.to_space = (uint8_t *)malloc(bytes);
@@ -367,8 +372,20 @@ static void hop_scan_copied_objects(void) {
     }
 }
 
+/* Allocation statistics, printed to stderr at exit when HOP_STATS is set. */
+static unsigned long long hop_stat_allocs;
+static unsigned long long hop_stat_words;
+static unsigned long long hop_stat_collections;
+
+static void hop_print_stats(void) {
+    fprintf(stderr, "hop-stats allocs=%llu words=%llu collections=%llu\n",
+            hop_stat_allocs, hop_stat_words, hop_stat_collections);
+}
+
 static void hop_collect(hop_value *temp_roots, size_t temp_root_count) {
     uint8_t *old_from_space = hop_runtime_heap.from_space;
+
+    hop_stat_collections++;
 
     /* Start the new semispace empty and grow it by copying reachable objects. */
     hop_gc_copy_alloc = hop_runtime_heap.to_space;
@@ -391,6 +408,8 @@ static hop_value *hop_alloc_words(size_t words, hop_value *temp_roots, size_t te
     hop_value *object;
 
     hop_init_heap();
+    hop_stat_allocs++;
+    hop_stat_words += words;
 
     /* Allocation is the only safepoint in this runtime. */
     if (hop_runtime_heap.alloc_ptr + bytes > hop_runtime_heap.alloc_limit) {
