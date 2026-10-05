@@ -346,9 +346,6 @@
           ((box unbox)
            (collect (cadr expr) bound))
 
-          ((primop)
-           (append-map (lambda (e) (collect e bound)) (cddr expr)))
-
           ((global)
            '())
 
