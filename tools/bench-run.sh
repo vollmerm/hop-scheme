@@ -11,7 +11,7 @@
 #   jK               pruning and interprocedural summaries (HOP_IPA);  aK  also inlining
 #   sK               aK plus inlining small readers and scalar replacement (HOP_SROA)
 #   ioff             pruning and inlining, no SSA
-# HOP_INLINE_SIZE (default 30) is the inlining size limit.
+# HOP_INLINE_SIZE (default 60) is the inlining size limit.
 # BENCH_FORMAT=csv prints comma-separated rows (with a header) instead of the table.
 # Depth sweep: BENCH_CONFIGS="off control k0 k1 k2 k3 k4 k8" BENCH_FORMAT=csv tools/bench-run.sh
 set -euo pipefail
@@ -88,10 +88,10 @@ for f in "${files[@]}"; do
       off) envs=(HOP_SSA=) ;;
       prune) envs=(HOP_SSA= HOP_PRUNE=1) ;;
       control) envs=(HOP_SSA=control) ;;
-      ioff) envs=(HOP_SSA= HOP_PRUNE=1 "HOP_INLINE=${HOP_INLINE_SIZE:-30}") ;;
-      i[0-9]*) envs=(HOP_SSA=sccp "HOP_SHAPE_K=${config#i}" HOP_PRUNE=1 "HOP_INLINE=${HOP_INLINE_SIZE:-30}") ;;
-      a[0-9]*) envs=(HOP_SSA=sccp "HOP_SHAPE_K=${config#a}" HOP_PRUNE=1 HOP_IPA=1 "HOP_INLINE=${HOP_INLINE_SIZE:-30}") ;;
-      s[0-9]*) envs=(HOP_SSA=sccp "HOP_SHAPE_K=${config#s}" HOP_PRUNE=1 HOP_IPA=1 HOP_SROA=1 HOP_INLINE_READERS=8 "HOP_INLINE=${HOP_INLINE_SIZE:-30}") ;;
+      ioff) envs=(HOP_SSA= HOP_PRUNE=1 "HOP_INLINE=${HOP_INLINE_SIZE:-60}") ;;
+      i[0-9]*) envs=(HOP_SSA=sccp "HOP_SHAPE_K=${config#i}" HOP_PRUNE=1 "HOP_INLINE=${HOP_INLINE_SIZE:-60}") ;;
+      a[0-9]*) envs=(HOP_SSA=sccp "HOP_SHAPE_K=${config#a}" HOP_PRUNE=1 HOP_IPA=1 "HOP_INLINE=${HOP_INLINE_SIZE:-60}") ;;
+      s[0-9]*) envs=(HOP_SSA=sccp "HOP_SHAPE_K=${config#s}" HOP_PRUNE=1 HOP_IPA=1 HOP_SROA=1 HOP_INLINE_READERS=8 "HOP_INLINE=${HOP_INLINE_SIZE:-60}") ;;
       j[0-9]*) envs=(HOP_SSA=sccp "HOP_SHAPE_K=${config#j}" HOP_PRUNE=1 HOP_IPA=1) ;;
       p[0-9]*) envs=(HOP_SSA=sccp "HOP_SHAPE_K=${config#p}" HOP_PRUNE=1) ;;
       k*) envs=(HOP_SSA=sccp "HOP_SHAPE_K=${config#k}") ;;
