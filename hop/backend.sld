@@ -1461,6 +1461,10 @@
      (and (memq (cadr instr) '(= < > eq?))
           (list (cadr instr) (caddr instr) (cadddr instr)
                 (car (cddddr instr)))))
+    ((safe-binop)
+     (and (memq (cadr instr) '(safe-= safe-< safe->))
+          (list (cadr instr) (caddr instr) (cadddr instr)
+                (car (cddddr instr)))))
     ((is-null)
      (list 'eq? (cadr instr) (caddr instr) '()))
     (else #f)))
@@ -2083,18 +2087,144 @@
   (emit-asm-line port (string-append "    bl " helper))
   (emit-store-operand port "x0" dst proc))
 
-(define (emit-safe-binop port op dst a b proc)
-  (emit-load-operand port "x0" a proc)
-  (emit-load-operand port "x1" b proc)
+;; Out-of-line failure paths. A checked operation tests its operands' tags
+;; inline and, when the test fails, branches to a stub emitted after the
+;; procedure's last block. The stub calls the same runtime helper the
+;; operation used to call unconditionally; given a bad operand the helper
+;; reports the error and exits, so a stub never returns and needs neither
+;; saved registers nor a GC safepoint.
+(define pending-slow-stubs '())
+(define slow-stub-counter 0)
+(define slow-stub-prefix "")
+
+(define (begin-slow-stubs! name)
+  (set! pending-slow-stubs '())
+  (set! slow-stub-counter 0)
+  (set! slow-stub-prefix name))
+
+(define (new-slow-stub! emit-body)
+  (set! slow-stub-counter (+ slow-stub-counter 1))
+  (let ((label (string-append "Lslow." slow-stub-prefix "."
+                              (number->string slow-stub-counter))))
+    (set! pending-slow-stubs (cons (cons label emit-body) pending-slow-stubs))
+    label))
+
+(define (flush-slow-stubs! port)
+  (for-each (lambda (stub)
+              (emit-asm-line port (string-append (car stub) ":"))
+              ((cdr stub)))
+            (reverse pending-slow-stubs))
+  (set! pending-slow-stubs '()))
+
+(define (safe-binop-helper op)
   (case op
-    ((safe-+) (emit-asm-line port "    bl _hop_safe_add"))
-    ((safe--) (emit-asm-line port "    bl _hop_safe_sub"))
-    ((safe-*) (emit-asm-line port "    bl _hop_safe_mul"))
-    ((safe-=) (emit-asm-line port "    bl _hop_safe_eq"))
-    ((safe-<) (emit-asm-line port "    bl _hop_safe_lt"))
-    ((safe->) (emit-asm-line port "    bl _hop_safe_gt"))
-    (else (error "Unknown safe binop op" op)))
-  (emit-store-operand port "x0" dst proc))
+    ((safe-+) "_hop_safe_add")
+    ((safe--) "_hop_safe_sub")
+    ((safe-*) "_hop_safe_mul")
+    ((safe-=) "_hop_safe_eq")
+    ((safe-<) "_hop_safe_lt")
+    ((safe->) "_hop_safe_gt")
+    (else (error "Unknown safe binop op" op))))
+
+(define (fixnum-literal? operand)
+  (and (literal-expr? operand) (number? operand)))
+
+;; The operation done once both operands are known to be fixnums.
+(define (emit-checked-binop-fast port op dst a b proc)
+  (case op
+    ((safe-+) (emit-binop port '+ dst a b proc))
+    ((safe--) (emit-binop port '- dst a b proc))
+    ((safe-=) (emit-binop port '= dst a b proc))
+    ((safe-<) (emit-binop port '< dst a b proc))
+    ((safe->) (emit-binop port '> dst a b proc))
+    ((safe-*)
+     ;; Same arithmetic as hop_safe_mul: unshift one operand, multiply.
+     (let* ((ra (operand-source port a "x9" proc))
+            (rb (operand-source port b "x10" proc))
+            (target (result-register dst "x11")))
+       (emit-asm-line port (string-append "    asr x12, " ra ", #"
+                                          (number->string fixnum-shift)))
+       (emit-asm-line port (string-append "    mul " target ", x12, " rb))
+       (store-result port target dst proc)))
+    (else (error "Unknown safe binop op" op))))
+
+(define (non-fixnum-literal? operand)
+  (and (literal-expr? operand) (not (number? operand))))
+
+;; Branches to a stub calling helper (which reports the error) unless both
+;; operands are fixnums. Returns #f, emitting nothing, when an operand is a
+;; literal that can never be one: the caller then just calls the helper.
+(define (emit-fixnum-guard port helper a b proc)
+  (let ((slow (new-slow-stub!
+               (lambda ()
+                 (emit-load-operand port "x0" a proc)
+                 (emit-load-operand port "x1" b proc)
+                 (emit-asm-line port (string-append "    bl " helper))))))
+    (cond
+      ((and (fixnum-literal? a) (fixnum-literal? b)) 'no-test)
+      ((fixnum-literal? a)
+       (emit-asm-line port (string-append "    tst "
+                                          (operand-source port b "x10" proc)
+                                          ", #" (number->string tag-mask)))
+       (emit-asm-line port (string-append "    b.ne " slow)))
+      ((fixnum-literal? b)
+       (emit-asm-line port (string-append "    tst "
+                                          (operand-source port a "x9" proc)
+                                          ", #" (number->string tag-mask)))
+       (emit-asm-line port (string-append "    b.ne " slow)))
+      (else
+       (let ((ra (operand-source port a "x9" proc))
+             (rb (operand-source port b "x10" proc)))
+         (emit-asm-line port (string-append "    orr x11, " ra ", " rb))
+         (emit-asm-line port (string-append "    tst x11, #"
+                                            (number->string tag-mask)))
+         (emit-asm-line port (string-append "    b.ne " slow)))))))
+
+(define (emit-safe-binop port op dst a b proc)
+  (define helper (safe-binop-helper op))
+  (cond
+    ;; A literal that is not a fixnum can never succeed: leave it to the helper.
+    ((or (non-fixnum-literal? a) (non-fixnum-literal? b))
+     (emit-load-operand port "x0" a proc)
+     (emit-load-operand port "x1" b proc)
+     (emit-asm-line port (string-append "    bl " helper))
+     (emit-store-operand port "x0" dst proc))
+    (else
+     (emit-fixnum-guard port helper a b proc)
+     (emit-checked-binop-fast port op dst a b proc))))
+
+;; The fixnum test in front of a fused safe comparison. A literal operand that
+;; is not a fixnum always fails, so it branches straight to the helper.
+(define (emit-safe-compare-guard port op a b proc)
+  (let ((helper (safe-binop-helper op)))
+    (if (or (non-fixnum-literal? a) (non-fixnum-literal? b))
+        (begin
+          (emit-load-operand port "x0" a proc)
+          (emit-load-operand port "x1" b proc)
+          (emit-asm-line port (string-append "    bl " helper)))
+        (emit-fixnum-guard port helper a b proc))))
+
+;; car/cdr of a value that may not be a pair: test the pair tag inline, load
+;; the field directly, and leave the error to the helper (see above). The
+;; header word is not re-checked, as in unsafe-car/unsafe-cdr: the pair tag
+;; belongs to pairs alone.
+(define (emit-checked-pair-load port dst operand offset helper proc)
+  (if (literal-expr? operand)
+      (emit-runtime-unary-call port helper dst operand proc)
+      (let ((slow (new-slow-stub!
+                   (lambda ()
+                     (emit-load-operand port "x0" operand proc)
+                     (emit-asm-line port (string-append "    bl " helper)))))
+            (reg (operand-source port operand "x9" proc))
+            (target (result-register dst "x10")))
+        (emit-asm-line port (string-append "    sub x11, " reg ", #"
+                                           (number->string pair-tag)))
+        (emit-asm-line port (string-append "    tst x11, #"
+                                           (number->string tag-mask)))
+        (emit-asm-line port (string-append "    b.ne " slow))
+        (emit-asm-line port (string-append "    ldr " target ", [x11, #"
+                                           (number->string offset) "]"))
+        (store-result port target dst proc))))
 
 ;; A global read/write addresses its own labeled cell directly (adrp/add,
 ;; same as a procedure address) instead of going through a runtime helper --
@@ -2146,9 +2276,9 @@
 
 (define (comparison-condition op)
   (case op
-    ((= eq?) '("eq" . "ne"))
-    ((<) '("lt" . "ge"))
-    ((>) '("gt" . "le"))
+    ((= eq? safe-=) '("eq" . "ne"))
+    ((< safe-<) '("lt" . "ge"))
+    ((> safe->) '("gt" . "le"))
     (else (error "Unsupported comparison in assembly emission" op))))
 
 ;; Branches to then-label if condition holds, else to else-label, leaving out
@@ -2425,9 +2555,9 @@
     ((load-global)
       (emit-runtime-global-read port (cadr instr) (caddr instr) proc))
     ((load-car)
-      (emit-runtime-unary-call port "_hop_car" (cadr instr) (caddr instr) proc))
+      (emit-checked-pair-load port (cadr instr) (caddr instr) 8 "_hop_car" proc))
     ((load-cdr)
-      (emit-runtime-unary-call port "_hop_cdr" (cadr instr) (caddr instr) proc))
+      (emit-checked-pair-load port (cadr instr) (caddr instr) 16 "_hop_cdr" proc))
     ((unsafe-load-car)
       (emit-unsafe-pair-load port (cadr instr) (caddr instr) 8 "_hop_car" proc))
     ((unsafe-load-cdr)
@@ -2464,6 +2594,8 @@
       (emit-conditional-branch port "ne" "eq" (caddr instr) (cadddr instr)
                                next-label))
     ((cmp-branch)
+      (when (memq (cadr instr) '(safe-= safe-< safe->))
+        (emit-safe-compare-guard port (cadr instr) (caddr instr) (cadddr instr) proc))
       (emit-compare port (caddr instr) (cadddr instr) proc)
       (let ((condition (comparison-condition (cadr instr))))
         (emit-conditional-branch port (car condition) (cdr condition)
@@ -2529,6 +2661,7 @@
 (define (emit-machine-procedure-body port proc exported-name)
   (emit-asm-line port (string-append ".p2align 2"))
   (emit-asm-line port (string-append (asm-name exported-name) ":"))
+  (begin-slow-stubs! (asm-name exported-name))
   (let loop ((blocks (machine-procedure-blocks proc)) (first? #t))
     (if (null? blocks)
         'done
@@ -2537,6 +2670,7 @@
                               (and (pair? (cdr blocks))
                                    (machine-block-label (cadr blocks))))
           (loop (cdr blocks) #f))))
+  (flush-slow-stubs! port)
   (newline port))
 
 (define (emit-procedure-descriptor port proc)
