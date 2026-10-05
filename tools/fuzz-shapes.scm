@@ -61,7 +61,7 @@
         ((3) (gen-inspect-list env (- depth 1)))
         ((4) (gen-let env depth 'int))
         ((5) (gen-call env depth 'int))
-        (else (gen-loop env depth)))))))
+        (else (if (chance? 50) (gen-record-loop env depth) (gen-loop env depth))))))))
 
 ;; Joins two three-element lists built from variables, then reads them.
 (define (gen-chain env)
@@ -177,6 +177,33 @@
                                  ((1) `(cons 1 (if (pair? ,l) (cdr ,l) ,l)))
                                  (else (gen-list env2 (- depth 1)))))))))
        (,go ,(random-below 4) ,(gen-list env (- depth 1))))))
+
+;; A counted loop carrying a three-field record that is rebuilt (or passed on, or
+;; rebuilt sharing its tail) each time round; the end uses it as fields or as a
+;; whole.
+(define (gen-record-loop env depth)
+  (let* ((go (fresh "go")) (n (fresh "n")) (r (fresh "rec"))
+         (a `(car ,r)) (b `(car (cdr ,r))) (c `(car (cdr (cdr ,r)))))
+    (define (field) (pick `(+ ,a ,n) `(- ,b 1) `(+ ,b ,c) c n 7 a))
+    (define (record) `(cons ,(field) (cons ,(field) (cons ,(field) '()))))
+    (define (step)
+      (case (random-below 4)
+        ((0) (record))
+        ((1) `(if (< ,n 2) ,r ,(record)))
+        ((2) `(cons ,(field) (cdr ,r)))
+        (else `(if (< ,n 3) (cons ,(field) (cdr ,r)) ,(record)))))
+    (define (finish)
+      (case (random-below 4)
+        ((0) `(+ ,a (+ ,b ,c)))
+        ((1) `(let ((x ,r)) (if (eq? x x) (+ (car x) 1000) 0)))
+        ((2) `(let ((both (cons ,r ,r))) (if (eq? (car both) (cdr both)) ,c 0)))
+        (else `(+ ,a (car (cdr (cdr ,r)))))))
+    `(letrec ((,go (lambda (,n ,r)
+                     (if (= ,n 0)
+                         ,(finish)
+                         (,go (- ,n 1) ,(step))))))
+       (,go ,(random-below 5)
+            (cons ,(gen-atom env) (cons ,(gen-atom env) (cons ,(gen-atom env) '())))))))
 
 ;;; Output
 

@@ -60,6 +60,7 @@
          (depth (if depth-text (string->number depth-text) 0))
          (dead-cons (get-environment-variable "HOP_DEAD_CONS")))
     (set-shape-depth! depth)
+    (set-scalar-replacement! (equal? (get-environment-variable "HOP_SROA") "1"))
     (set-remove-dead-allocation!
      (if dead-cons (equal? dead-cons "1") (> depth 0)))))
 
@@ -85,7 +86,9 @@
 (define (maybe-inline entry-instrs procedures exported-labels)
   (let* ((text (get-environment-variable "HOP_INLINE"))
          (size (and text (string->number text)))
-         (prune? (equal? (get-environment-variable "HOP_PRUNE") "1")))
+         (prune? (equal? (get-environment-variable "HOP_PRUNE") "1"))
+         (readers (get-environment-variable "HOP_INLINE_READERS")))
+    (set-inline-reader-size! (or (and readers (string->number readers)) 0))
     ;; HOP_PRUNE=1 drops unread top-level definitions and the procedures only
     ;; they reached. It runs first so that inlining sees only real references,
     ;; and again afterwards for what inlining left unreferenced.

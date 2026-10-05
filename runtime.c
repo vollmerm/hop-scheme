@@ -119,9 +119,6 @@ static void hop_init_heap(void) {
         return;
     }
 
-    if (getenv("HOP_STATS")) {
-        atexit(hop_print_stats);
-    }
     bytes = hop_parse_heap_size();
     hop_runtime_heap.from_space = (uint8_t *)malloc(bytes);
     hop_runtime_heap.to_space = (uint8_t *)malloc(bytes);
@@ -1420,6 +1417,9 @@ static uintptr_t hop_stack_base = 0;
 
 __attribute__((noinline)) hop_value hop_run(hop_value (*entry)(void)) {
     hop_stack_base = (uintptr_t)__builtin_frame_address(0) + 16;
+    if (getenv("HOP_STATS")) {
+        atexit(hop_print_stats);
+    }
     return entry();
 }
 

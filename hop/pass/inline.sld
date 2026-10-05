@@ -16,6 +16,7 @@
   ;;; available to closures and unknown callers.
   (export inline-known-calls
           set-inline-tiny-size!
+          set-inline-reader-size!
           prune-dead-procedures)
   (import (scheme base)
           (scheme cxr)
@@ -143,6 +144,10 @@
 
 (define tiny-size 3)
 (define (set-inline-tiny-size! n) (set! tiny-size n))
+;; Procedures of at most this many instructions that read a parameter as a
+;; pair are inlined whatever the argument (0: only when it is visibly a pair).
+(define reader-size 0)
+(define (set-inline-reader-size! n) (set! reader-size n))
 
 (define reader-primops '(car cdr unsafe-car unsafe-cdr pair? null?))
 
@@ -259,6 +264,9 @@
     (define (worth-inlining? callee args result structured demanded)
       (or (hash-table-exists? single-use callee)
           (<= (instruction-size (expanded-body callee)) tiny-size)
+          (and (> reader-size 0)
+               (<= (instruction-size (expanded-body callee)) reader-size)
+               (any (lambda (consumed) consumed) (consumed-params callee)))
           (any (lambda (arg consumed)
                  (and consumed (symbol? arg) (hash-table-exists? structured arg)))
                args (consumed-params callee))

@@ -27,12 +27,13 @@
           sccp-program
           set-shape-depth!
           set-remove-dead-allocation!
+          set-scalar-replacement!
           value-table-size
           control-cfg
           control-ssa)
   (import (scheme base)
           (scheme cxr)
-          (only (srfi 1) append-map filter find last list-index)
+          (only (srfi 1) any append-map filter find fold last list-index)
           (srfi 69)
           (hop utils)
           (hop pass cfg)
@@ -298,6 +299,304 @@
               (string=? (substring name 0 6) "hop_q_")))))
 
 ;;; --- Analysis ---
+
+;;; --- Scalar replacement of pairs carried by phis ---
+;;;
+;;; A phi p whose value is a known cons (a loop-carried record) is split into
+;;; one phi per field, a tree of phis for nested conses. A field the analysis
+;;; knows to be a constant becomes that literal. Each incoming pair
+;;; contributes its operands when it is a cons instruction, and otherwise a
+;;; pair of loads (unsafe-car/cdr) at the end of the predecessor; pairs are
+;;; immutable, so the loads may run early. Reads of p become copies of the
+;;; field phis. Uses of p as a whole get one fresh cons chain, built at the
+;;; nearest block that dominates all of them, and only when that block is
+;;; outside the loops of p's block; otherwise nothing changes. One chain for
+;;; all whole uses keeps eq? on them as before. Nothing is done when a
+;;; component pair would be used as a whole, or in a procedure with
+;;; irreducible loops.
+
+(define scalar-replacement #f)
+(define (set-scalar-replacement! flag) (set! scalar-replacement flag))
+(define sroa-count 0)
+(define (fresh-sroa-name)
+  (set! sroa-count (+ sroa-count 1))
+  (string->symbol (string-append "sr." (number->string sroa-count) "~1")))
+
+(define terminator-forms
+  '(if goto return tail-call direct-tail-call tail-apply-call tail-callcc-call))
+
+(define (append-before-terminator! block instr)
+  (let ((instrs (ssa-block-instrs block)))
+    (set-ssa-block-instrs!
+     block
+     (if (and (pair? instrs) (memq (car (last instrs)) terminator-forms))
+         (let ((rev (reverse instrs)))
+           (append (reverse (cdr rev)) (list instr (car rev))))
+         (append instrs (list instr))))))
+
+(define (cons-rhs-operands rhs)
+  (cond
+   ((and (pair? rhs) (eq? (car rhs) 'cons)) (cdr rhs))
+   ((and (pair? rhs) (eq? (car rhs) 'primop) (eq? (cadr rhs) 'cons)) (cddr rhs))
+   (else #f)))
+
+(define (dominates? idom a b)
+  (let walk ((x b))
+    (cond ((not x) #f) ((= x a) #t) ((= x 0) #f) (else (walk (vector-ref idom x))))))
+
+;; Number of natural loops containing each block, or #f when removing the back
+;; edges leaves a cycle (an irreducible loop).
+(define (loop-depths blocks idom)
+  (let* ((n (vector-length blocks))
+         (depth (make-vector n 0))
+         (headers (make-hash-table))
+         (color (make-vector n 0)))
+    (define (back-edge? a b) (dominates? idom b a))
+    (define (cyclic? x)
+      (vector-set! color x 1)
+      (let ((found (any (lambda (y)
+                          (and (not (back-edge? x y))
+                               (or (= (vector-ref color y) 1)
+                                   (and (= (vector-ref color y) 0) (cyclic? y)))))
+                        (ssa-block-succs (vector-ref blocks x)))))
+        (vector-set! color x 2)
+        found))
+    (for-each-index
+     (lambda (a block)
+       (for-each (lambda (b)
+                   (when (back-edge? a b)
+                     (hash-table-update!/default headers b (lambda (l) (cons a l)) '())))
+                 (ssa-block-succs block)))
+     blocks)
+    (and (not (cyclic? 0))
+         (begin
+           (for-each
+            (lambda (h)
+              (let ((body (make-hash-table)))
+                (hash-table-set! body h #t)
+                (let loop ((stack (hash-table-ref headers h)))
+                  (unless (null? stack)
+                    (if (hash-table-exists? body (car stack))
+                        (loop (cdr stack))
+                        (begin
+                          (hash-table-set! body (car stack) #t)
+                          (loop (append (ssa-block-preds (vector-ref blocks (car stack)))
+                                        (cdr stack)))))))
+                (for-each (lambda (x) (vector-set! depth x (+ 1 (vector-ref depth x))))
+                          (hash-table-keys body))))
+            (hash-table-keys headers))
+           depth))))
+
+(define (scalar-replace! analysis blocks)
+  (let* ((idom (immediate-dominators blocks))
+         (depth (loop-depths blocks idom))
+         (dom-depth (make-vector (vector-length blocks) #f))
+         (defs (make-hash-table))
+         (phi-defs (make-hash-table))
+         (fields (make-hash-table equal?))
+         (loads (make-hash-table equal?)))
+    (define (value-of name) (hash-table-ref/default (analysis-values analysis) name bot))
+    (define (dom-depth-of x)
+      (or (vector-ref dom-depth x)
+          (let ((d (if (= x 0) 0 (+ 1 (dom-depth-of (vector-ref idom x))))))
+            (vector-set! dom-depth x d)
+            d)))
+    (define (common-dominator a b)
+      (cond ((= a b) a)
+            ((> (dom-depth-of a) (dom-depth-of b)) (common-dominator (vector-ref idom a) b))
+            (else (common-dominator a (vector-ref idom b)))))
+    (define (refresh-defs!)
+      (set! defs (make-hash-table))
+      (set! phi-defs (make-hash-table))
+      (for-each-index
+       (lambda (b block)
+         (for-each (lambda (phi) (hash-table-set! phi-defs (phi-dst phi) (cons phi b)))
+                   (ssa-block-phis block))
+         (for-each (lambda (instr)
+                     (when (eq? (car instr) 'assign)
+                       (hash-table-set! defs (cadr instr) (caddr instr))))
+                   (ssa-block-instrs block)))
+       blocks))
+    ;; (car-operand . cdr-operand) when name is defined by a cons, else #f
+    (define (operands-of name)
+      (let* ((rhs (and (symbol? name) (hash-table-ref/default defs name #f)))
+             (ops (and rhs (cons-rhs-operands rhs))))
+        (and ops (cons (car ops) (cadr ops)))))
+    ;; Does a cons instruction feed name, possibly through phis?
+    (define (web-has-fresh? name)
+      (let ((seen (make-hash-table)))
+        (let visit ((x name))
+          (and (symbol? x)
+               (not (hash-table-exists? seen x))
+               (begin
+                 (hash-table-set! seen x #t)
+                 (or (and (operands-of x) #t)
+                     (let ((entry (hash-table-ref/default phi-defs x #f)))
+                       (and entry (any visit (vector->list (phi-args (car entry))))))))))))
+    (define (read-of instr base)
+      (let ((rhs (instr-rhs instr)))
+        (and (primop-rhs? rhs)
+             (memq (cadr rhs) '(car cdr unsafe-car unsafe-cdr))
+             (eq? (caddr rhs) base)
+             (if (memq (cadr rhs) '(car unsafe-car)) 'car 'cdr))))
+    (define (component-value value which)
+      (if (eq? which 'car) (cons-car value) (cons-cdr value)))
+    ;; Reads of name as (dst base which), a base before its readers, and the
+    ;; blocks of its whole uses; #f when a component pair (a read of a cons
+    ;; valued field) is used as a whole.
+    (define (classify name value)
+      (let ((reads '()) (escapes '()))
+        (for-each-index
+         (lambda (b block)
+           (for-each
+            (lambda (phi)
+              (for-each-index
+               (lambda (slot arg)
+                 (when (eq? arg name)
+                   (set! escapes (cons (list-ref (ssa-block-preds block) slot) escapes))))
+               (phi-args phi)))
+            (ssa-block-phis block))
+           (for-each
+            (lambda (instr)
+              (when (memq name (instr-uses instr))
+                (let ((which (read-of instr name)))
+                  (if which
+                      (set! reads (cons (list (cadr instr) name which) reads))
+                      (set! escapes (cons b escapes))))))
+            (ssa-block-instrs block)))
+         blocks)
+        (let loop ((rs (reverse reads)) (nested '()))
+          (if (null? rs)
+              (cons (append (reverse reads) nested) escapes)
+              (let ((child (component-value value (caddr (car rs)))))
+                (if (cons? child)
+                    (let ((sub (classify (car (car rs)) child)))
+                      (and sub (null? (cdr sub))
+                           (loop (cdr rs) (append nested (car sub)))))
+                    (loop (cdr rs) nested)))))))
+    ;; The name holding the field at path (a list of car/cdr) of the pair name.
+    ;; where: block index at whose end loads may be placed.
+    (define (field name path where)
+      (cond
+       ((null? path) name)
+       ((not (symbol? name)) (error "scalar replacement: field of a literal" name path))
+       ((operands-of name)
+        => (lambda (ops)
+             (field (if (eq? (car path) 'car) (car ops) (cdr ops)) (cdr path) where)))
+       ((hash-table-ref/default phi-defs name #f)
+        => (lambda (entry)
+             (let ((key (cons name path)))
+               (or (hash-table-ref/default fields key #f)
+                   (let ((dst (fresh-sroa-name))
+                         (block-index (cdr entry))
+                         (phi (car entry)))
+                     (hash-table-set! fields key dst)
+                     (let* ((preds (ssa-block-preds (vector-ref blocks block-index)))
+                            (args (map (lambda (arg pred) (field arg path pred))
+                                       (vector->list (phi-args phi)) preds))
+                            (block (vector-ref blocks block-index)))
+                       (set-ssa-block-phis!
+                        block
+                        (append (ssa-block-phis block)
+                                (list (make-phi dst dst (list->vector args))))))
+                     dst)))))
+       (else
+        (let ((key (list name path where)))
+          (or (hash-table-ref/default loads key #f)
+              (let ((result
+                     (let chain ((from name) (rest path))
+                       (if (null? rest)
+                           from
+                           (let ((t (fresh-sroa-name)))
+                             (append-before-terminator!
+                              (vector-ref blocks where)
+                              `(assign ,t (primop ,(if (eq? (car rest) 'car) 'unsafe-car 'unsafe-cdr)
+                                                  ,from)))
+                             (chain t (cdr rest)))))))
+                (hash-table-set! loads key result)
+                result))))))
+    ;; The leaf at path: its literal when the analysis knows it, else a field.
+    (define (leaf root value path)
+      (if (const? value) (const-value value) (field root path #f)))
+    ;; (instructions . name) building the pair of value at path from fields
+    (define (materialize root value path)
+      (if (cons? value)
+          (let ((a (materialize root (cons-car value) (append path '(car))))
+                (d (materialize root (cons-cdr value) (append path '(cdr))))
+                (name (fresh-sroa-name)))
+            (cons (append (car a) (car d)
+                          (list `(assign ,name (primop cons ,(cdr a) ,(cdr d)))))
+                  name))
+          (cons '() (leaf root value path))))
+    (define (try-phi! b phi)
+      (let* ((name (phi-dst phi))
+             (value (value-of name))
+             (found (and (cons? value)
+                         (> (vector-ref depth b) 0)
+                         (web-has-fresh? name)
+                         (classify name value))))
+        (when found
+          (let* ((reads (car found))
+                 (escapes (cdr found))
+                 (target (and (pair? escapes) (fold common-dominator (car escapes) (cdr escapes)))))
+            (when (or (not target) (< (vector-ref depth target) (vector-ref depth b)))
+              (set! fields (make-hash-table equal?))
+              (set! loads (make-hash-table equal?))
+              (let ((virtual (make-hash-table))   ; name -> (value . path)
+                    (copies (make-hash-table))
+                    (gone (make-hash-table)))
+                (hash-table-set! virtual name (cons value '()))
+                (for-each
+                 (lambda (read)
+                   (let* ((base (hash-table-ref virtual (cadr read)))
+                          (child (component-value (car base) (caddr read)))
+                          (path (append (cdr base) (list (caddr read)))))
+                     (if (cons? child)
+                         (begin (hash-table-set! virtual (car read) (cons child path))
+                                (hash-table-set! gone (car read) #t))
+                         (hash-table-set! copies (car read) (leaf name child path)))))
+                 reads)
+                (let ((materialized (and target (materialize name value '()))))
+                  (for-each-index
+                   (lambda (i block)
+                     (set-ssa-block-phis!
+                      block
+                      (filter (lambda (p) (not (eq? (phi-dst p) name))) (ssa-block-phis block)))
+                     (set-ssa-block-instrs!
+                      block
+                      (append
+                       (if (and target (= i target)) (car materialized) '())
+                       (append-map
+                        (lambda (instr)
+                          (cond
+                           ((and (eq? (car instr) 'assign) (hash-table-exists? gone (cadr instr))) '())
+                           ((and (eq? (car instr) 'assign) (hash-table-exists? copies (cadr instr)))
+                            (list `(assign ,(cadr instr) ,(hash-table-ref copies (cadr instr)))))
+                           (target (list (map-instr-uses
+                                          (lambda (v) (if (eq? v name) (cdr materialized) v))
+                                          instr)))
+                           (else (list instr))))
+                        (ssa-block-instrs block)))))
+                   blocks)
+                  (when target
+                    (for-each-index
+                     (lambda (i block)
+                       (for-each
+                        (lambda (phi)
+                          (let ((args (phi-args phi)))
+                            (for-each-index
+                             (lambda (slot arg)
+                               (when (eq? arg name) (vector-set! args slot (cdr materialized))))
+                             args)))
+                        (ssa-block-phis block)))
+                     blocks)))
+                (refresh-defs!)))))))
+    (when depth
+      (refresh-defs!)
+      (for-each-index
+       (lambda (b block)
+         (for-each (lambda (phi) (try-phi! b phi)) (ssa-block-phis block)))
+       blocks))))
 
 ;;; --- Interprocedural summaries ---
 ;;;
@@ -664,52 +963,52 @@
       (else #f)))))
 
 (define (remove-dead-definitions! blocks remove-allocation?)
-  (let ((counts (make-hash-table)))
-    (define (bump! var delta)
-      (when (symbol? var)
-        (hash-table-update!/default counts var (lambda (n) (+ n delta)) 0)))
-    (define (uses instr) (instr-uses instr))
-    (define (dead? var)
-      (= 0 (hash-table-ref/default counts var 0)))
+  ;; Mark what essential instructions need, through phis as well, so that
+  ;; loop-carried values nobody reads (cycles of phis) die too.
+  (let ((live (make-hash-table))
+        (phi-of (make-hash-table))
+        (instr-of (make-hash-table))
+        (work '()))
+    (define (removable? instr)
+      (and (eq? (car instr) 'assign)
+           (removable-rhs? (caddr instr) remove-allocation?)))
+    (define (mark! var)
+      (when (and (symbol? var) (not (hash-table-exists? live var)))
+        (hash-table-set! live var #t)
+        (set! work (cons var work))))
     (for-each-index
      (lambda (b block)
-       (for-each (lambda (phi)
-                   (for-each (lambda (arg) (bump! arg 1))
-                             (vector->list (phi-args phi))))
+       (for-each (lambda (phi) (hash-table-set! phi-of (phi-dst phi) phi))
                  (ssa-block-phis block))
        (for-each (lambda (instr)
-                   (for-each (lambda (v) (bump! v 1)) (uses instr)))
+                   (if (removable? instr)
+                       (hash-table-set! instr-of (cadr instr) instr)
+                       (for-each mark! (instr-uses instr))))
                  (ssa-block-instrs block)))
      blocks)
     (let loop ()
-      (let ((changed? #f))
-        (for-each-index
-         (lambda (b block)
-           (set-ssa-block-phis!
-            block
-            (filter (lambda (phi)
-                      (if (dead? (phi-dst phi))
-                          (begin
-                            (for-each (lambda (arg) (bump! arg -1))
-                                      (vector->list (phi-args phi)))
-                            (set! changed? #t)
-                            #f)
-                          #t))
-                    (ssa-block-phis block)))
-           (set-ssa-block-instrs!
-            block
-            (filter (lambda (instr)
-                      (if (and (eq? (car instr) 'assign)
-                               (dead? (cadr instr))
-                               (removable-rhs? (caddr instr) remove-allocation?))
-                          (begin
-                            (for-each (lambda (v) (bump! v -1)) (uses instr))
-                            (set! changed? #t)
-                            #f)
-                          #t))
-                    (ssa-block-instrs block))))
-         blocks)
-        (when changed? (loop))))))
+      (unless (null? work)
+        (let ((var (car work)))
+          (set! work (cdr work))
+          (cond
+           ((hash-table-ref/default phi-of var #f)
+            => (lambda (phi) (for-each mark! (vector->list (phi-args phi)))))
+           ((hash-table-ref/default instr-of var #f)
+            => (lambda (instr) (for-each mark! (instr-uses instr)))))
+          (loop))))
+    (for-each-index
+     (lambda (b block)
+       (set-ssa-block-phis!
+        block
+        (filter (lambda (phi) (hash-table-exists? live (phi-dst phi)))
+                (ssa-block-phis block)))
+       (set-ssa-block-instrs!
+        block
+        (filter (lambda (instr)
+                  (not (and (removable? instr)
+                            (not (hash-table-exists? live (cadr instr))))))
+                (ssa-block-instrs block))))
+     blocks)))
 
 ;;; --- Copy propagation ---
 
@@ -799,6 +1098,10 @@
       (materialize-constant-phis! analysis blocks)
       (let ((pruned (prune-dead-code! analysis blocks)))
         (propagate-copies! pruned)
+        (when (and scalar-replacement remove-allocation?)
+          (remove-dead-definitions! pruned remove-allocation?)
+          (scalar-replace! analysis pruned)
+          (propagate-copies! pruned))
         (remove-dead-definitions! pruned remove-allocation?)
         (make-ssa-proc (ssa-proc-params ssa) pruned)))))
 

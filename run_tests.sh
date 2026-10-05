@@ -325,6 +325,12 @@ runtime_cases=(
   "test141|5"
   "test142|7"
   "test143|2"
+  "test144|135"
+  "test145|23"
+  "test146|1006"
+  "test147|12"
+  "test148|23"
+  "test149|18"
 )
 
 csi -R r7rs -I "$ROOT" -s "$ROOT/ssa_tests.scm"
@@ -713,5 +719,30 @@ check_ipa() {
 }
 check_ipa test142 7
 check_ipa test143 2
+
+# Scalar replacement of loop-carried pairs (HOP_SROA): the same answers, and the
+# plain loop must stop allocating.
+check_sroa() {
+  local test_name="$1" expected="$2"
+  local asm_path="$TMPDIR/sroa_${test_name}.s" exe_path="$TMPDIR/sroa_${test_name}"
+  HOP_SROA=1 HOP_IPA=1 HOP_PRUNE=1 HOP_INLINE=30 HOP_INLINE_READERS=8 HOP_SSA=sccp HOP_SHAPE_K=3 generate "$test_name" "$asm_path"
+  clang -arch arm64 -o "$exe_path" "$asm_path" "$ROOT/runtime.c" "$ROOT/codegen_harness.c"
+  "$exe_path" "$expected" >/dev/null
+  printf 'ok sroa %s\n' "$test_name"
+}
+for entry in "test144|135" "test145|23" "test146|1006" "test147|12" "test148|23" "test149|18"; do
+  check_sroa "${entry%%|*}" "${entry##*|}"
+done
+sroa_allocs() { HOP_STATS=1 "$TMPDIR/sroa_$1" 2>&1 >/dev/null | sed -n 's/.*allocs=\([0-9]*\).*/\1/p'; }
+plain_allocs() {
+  HOP_SROA=0 HOP_INLINE_READERS=0 HOP_IPA=1 HOP_PRUNE=1 HOP_INLINE=30 HOP_SSA=sccp HOP_SHAPE_K=3 generate "$1" "$TMPDIR/plain_$1.s"
+  clang -arch arm64 -o "$TMPDIR/plain_$1" "$TMPDIR/plain_$1.s" "$ROOT/runtime.c" "$ROOT/codegen_harness.c"
+  HOP_STATS=1 "$TMPDIR/plain_$1" 2>&1 >/dev/null | sed -n 's/.*allocs=\([0-9]*\).*/\1/p'
+}
+sroa_n=$(sroa_allocs test144); plain_n=$(plain_allocs test144)
+if (( ${sroa_n:-999999} >= ${plain_n:-0} )); then
+  echo "scalar replacement did not reduce allocation in test144 ($sroa_n vs $plain_n)" >&2; exit 1
+fi
+printf 'ok sroa allocation test144\n'
 
 echo "compiler tests passed"

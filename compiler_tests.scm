@@ -1111,6 +1111,57 @@
   '(letrec ((mk (lambda (x) (if (= x 0) (cons 1 2) (cons 1 3)))))
      (+ (car (mk 0)) (car (mk 1)))))
 
+;; Scalar replacement of loop-carried pairs.
+(define test144
+  '(letrec ((go (lambda (i s)
+                (if (= i 10)
+                    (+ (car s) (car (cdr s)))
+                    (go (+ i 1) (cons (+ (car s) i) (cons (- (car (cdr s)) 1) '())))))))
+     (go 0 (cons 0 (cons 100 '())))))
+
+(define test145
+  '(letrec ((sum (lambda (p) (+ (car p) (car (cdr p)))))
+            (go (lambda (i s acc)
+                  (if (= i 5)
+                      acc
+                      (go (+ i 1) (cons (+ (car s) 1) (cons i '())) (+ acc (sum s)))))))
+     (go 0 (cons 1 (cons 2 '())) 0)))
+
+(define test146
+  '(letrec ((go (lambda (i s)
+                  (if (= i 4)
+                      s
+                      (go (+ i 1) (cons (+ (car s) i) (cons i '())))))))
+     (let ((r (go 0 (cons 0 (cons 0 '())))))
+       (let ((both (cons r r)))
+         (if (eq? (car both) (cdr both)) (+ (car r) 1000) 0)))))
+
+(define test147
+  '(letrec ((go (lambda (i s)
+                  (if (= i 6)
+                      (+ (car s) (car (cdr s)))
+                      (go (+ i 1) (cons i (cdr s)))))))
+     (go 0 (cons 0 (cons 7 '())))))
+
+(define test148
+  '(letrec ((go (lambda (i s)
+                  (if (= i 8)
+                      (car s)
+                      (if (= (- i (* 2 (- i (- i 0)))) 0)
+                          (go (+ i 1) s)
+                          (go (+ i 1) (if (< i 4) s (cons (+ (car s) i) (cdr s)))))))))
+     (go 0 (cons 1 (cons 2 '())))))
+
+(define test149
+  '(letrec ((inner (lambda (j s)
+                    (if (= j 3) s (inner (+ j 1) (cons (+ (car s) j) (cons (car (cdr s)) '()))))))
+            (outer (lambda (i acc)
+                     (if (= i 4)
+                         acc
+                         (let ((r (inner 0 (cons i (cons acc '())))))
+                           (outer (+ i 1) (+ (car r) (car (cdr r)))))))))
+     (outer 0 0)))
+
 (define sample-tests
   (list (cons "Test 1: Simple arithmetic" test1)
         (cons "Test 2: Lambda application" test2)
@@ -1253,7 +1304,13 @@
         (cons "Test 140: single-use letrec loop becomes a loop of the caller" test140)
         (cons "Test 141: mutually tail-recursive local functions with a known start" test141)
         (cons "Test 142: parameter shape joined over the call sites of a recursive function" test142)
-        (cons "Test 143: return shape of a function" test143)))
+        (cons "Test 143: return shape of a function" test143)
+        (cons "Test 144: loop-carried list record, rebuilt each step" test144)
+        (cons "Test 145: record passed to a procedure inside the loop" test145)
+        (cons "Test 146: identity of the materialized record" test146)
+        (cons "Test 147: record sharing its tail across iterations" test147)
+        (cons "Test 148: record passed through unchanged on some branches" test148)
+        (cons "Test 149: record carried by an inner loop" test149)))
 
 (define named-tests
   ;; These are runnable end-to-end regression cases. test6 and test7 stay as
@@ -1397,7 +1454,13 @@
          (cons 'test140 test140)
          (cons 'test141 test141)
          (cons 'test142 test142)
-         (cons 'test143 test143)))
+         (cons 'test143 test143)
+         (cons 'test144 test144)
+         (cons 'test145 test145)
+         (cons 'test146 test146)
+         (cons 'test147 test147)
+         (cons 'test148 test148)
+         (cons 'test149 test149)))
 
 (define (lookup-named-test name)
   (let ((binding (assoc name named-tests)))
