@@ -27,7 +27,8 @@
           (scheme process-context)
           (hop compat)
           (only (srfi 69) make-hash-table hash-table-set! hash-table-ref
-                hash-table-ref/default hash-table-exists?)
+                hash-table-ref/default hash-table-exists?
+                hash-table-delete! hash-table-size)
           (hop utils)
           (hop pass tac)
           (hop pass cfg))
@@ -373,6 +374,9 @@
                      result)))))
     ((branch-if ret)
      (if (symbol? (cadr instr)) (list (cadr instr)) '()))
+    ((cmp-branch)
+     (append (if (symbol? (caddr instr)) (list (caddr instr)) '())
+             (if (symbol? (cadddr instr)) (list (cadddr instr)) '())))
     ((jump) '())
     (else (error "Unknown machine instruction in use analysis" instr))))
 
@@ -386,7 +390,7 @@
       (list (cadr instr)))
     ((binop safe-binop)
       (list (caddr instr)))
-    ((store-box store-global branch-if jump ret tail-call tail-call-known tail-call-apply
+    ((store-box store-global branch-if cmp-branch jump ret tail-call tail-call-known tail-call-apply
       tail-call-callcc) '())
     (else (error "Unknown machine instruction in def analysis" instr))))
 
@@ -1070,6 +1074,11 @@
      `(branch-if ,(lookup-home homes (cadr instr))
                  ,(caddr instr)
                  ,(cadddr instr)))
+    ((cmp-branch)
+     `(cmp-branch ,(cadr instr)
+                  ,(lookup-home homes (caddr instr))
+                  ,(lookup-home homes (cadddr instr))
+                  ,@(cddddr instr)))
     ((jump) instr)
     ((ret)
      `(ret ,(lookup-home homes (cadr instr))))
@@ -1423,10 +1432,310 @@
      (machine-procedure-frame-slots proc)
      saved-registers)))
 
+;;; ── Peephole: compare-and-branch fusion ───────────────────────────────────
+;;
+;; A comparison (or null?) whose boolean result feeds only the branch right
+;; after it becomes one (cmp-branch op lhs rhs then-label else-label), which
+;; emits a cmp and a conditional branch with no boolean materialized. The
+;; boolean's only use must be that branch, so dropping its definition is safe.
+
+(define (count-variable-uses blocks)
+  (let ((counts (make-hash-table eq?)))
+    (for-each
+     (lambda (block)
+       (for-each
+        (lambda (instr)
+          (for-each
+           (lambda (var)
+             (hash-table-set! counts var
+                              (+ 1 (hash-table-ref/default counts var 0))))
+           (machine-instr-uses instr)))
+        (machine-block-instructions block)))
+     blocks)
+    counts))
+
+(define (fusable-comparison instr)
+  ;; (op dst lhs rhs) for an instruction computing a boolean, else #f.
+  (case (car instr)
+    ((binop)
+     (and (memq (cadr instr) '(= < > eq?))
+          (list (cadr instr) (caddr instr) (cadddr instr)
+                (car (cddddr instr)))))
+    ((is-null)
+     (list 'eq? (cadr instr) (caddr instr) '()))
+    (else #f)))
+
+(define (fuse-block-compare-branches instrs uses)
+  (let loop ((rest instrs) (result '()))
+    (cond
+     ((null? rest) (reverse result))
+     ((and (pair? (cdr rest))
+           (fusable-comparison (car rest))
+           (eq? (car (cadr rest)) 'branch-if))
+      (let ((cmp (fusable-comparison (car rest)))
+            (branch (cadr rest)))
+        (if (and (eq? (cadr cmp) (cadr branch))
+                 (= 1 (hash-table-ref/default uses (cadr cmp) 0)))
+            (loop (cddr rest)
+                  (cons `(cmp-branch ,(car cmp) ,(caddr cmp) ,(cadddr cmp)
+                                     ,(caddr branch) ,(cadddr branch))
+                        result))
+            (loop (cdr rest) (cons (car rest) result)))))
+     (else (loop (cdr rest) (cons (car rest) result))))))
+
+(define (fuse-compare-branches proc)
+  (let ((uses (count-variable-uses (machine-procedure-blocks proc))))
+    (make-machine-procedure
+     (machine-procedure-name proc)
+     (machine-procedure-params proc)
+     (machine-procedure-param-locations proc)
+     (map (lambda (block)
+            (make-machine-block
+             (machine-block-label block)
+             (fuse-block-compare-branches (machine-block-instructions block)
+                                          uses)
+             (machine-block-successors block)))
+          (machine-procedure-blocks proc))
+     (machine-procedure-homes proc)
+     (machine-procedure-root-homes proc)
+     (machine-procedure-frame-slots proc)
+     (machine-procedure-used-registers proc))))
+
+;;; ── Peephole: redundant moves after allocation ─────────────────────────────
+
+;; (move a b) immediately followed by (move b a) leaves both unchanged, so
+;; the second is dropped. Allocation already removes (move a a).
+(define (move-like? instr)
+  (memq (car instr) '(move move-out)))
+
+(define (stack-arg-operand? operand)
+  (and (pair? operand) (eq? (car operand) 'stack-arg)))
+
+(define (drop-redundant-moves instrs)
+  (let loop ((rest instrs) (result '()))
+    (cond
+     ((null? rest) (reverse result))
+     ((and (pair? result)
+           (move-like? (car rest))
+           (move-like? (car result))
+           (equal? (cadr (car rest)) (caddr (car result)))
+           (equal? (caddr (car rest)) (cadr (car result)))
+           ;; a stack-arg is read from the incoming area but written to the
+           ;; outgoing one, so the pair is not a round trip
+           (not (stack-arg-operand? (cadr (car rest))))
+           (not (stack-arg-operand? (caddr (car rest)))))
+      (loop (cdr rest) result))
+     (else (loop (cdr rest) (cons (car rest) result))))))
+
+;;; ── Peephole: jump-only blocks ─────────────────────────────────────────────
+;;
+;; A block holding nothing but (jump L) is a trampoline: every branch to it
+;; goes straight to L instead, and the block is removed. A chain of
+;; trampolines collapses to its final target. The entry block, an unlabeled
+;; block, a trampoline cycle (L: jump L), and a block the previous one falls
+;; into are all left alone.
+
+(define (terminator-instruction? instr)
+  (memq (car instr)
+        '(jump branch-if cmp-branch ret tail-call-indirect tail-call-label)))
+
+(define (jump-only-target block)
+  (let ((instrs (machine-block-instructions block)))
+    (and (machine-block-label block)
+         (pair? instrs)
+         (null? (cdr instrs))
+         (eq? (car (car instrs)) 'jump)
+         (cadr (car instrs)))))
+
+(define (ends-in-terminator? block)
+  (let ((instrs (machine-block-instructions block)))
+    (and (pair? instrs)
+         (terminator-instruction? (list-ref instrs (- (length instrs) 1))))))
+
+(define (remove-jump-only-blocks blocks)
+  (let* ((vec (list->vector blocks))
+         (count (vector-length vec))
+         (forward (make-hash-table eq?)))
+    (define (follow label)
+      ;; Final label after the trampolines, or #f on a cycle.
+      (let loop ((label label) (fuel count))
+        (let ((next (hash-table-ref/default forward label #f)))
+          (cond ((not next) label)
+                ((= fuel 0) #f)
+                (else (loop next (- fuel 1)))))))
+    (do ((i 1 (+ i 1)))
+        ((>= i count))
+      (let ((target (jump-only-target (vector-ref vec i))))
+        (when (and target (ends-in-terminator? (vector-ref vec (- i 1))))
+          (hash-table-set! forward (machine-block-label (vector-ref vec i))
+                           target))))
+    ;; Drop trampolines that lead into a cycle.
+    (for-each
+     (lambda (block)
+       (let ((label (machine-block-label block)))
+         (when (and label
+                    (hash-table-exists? forward label)
+                    (not (follow label)))
+           (hash-table-delete! forward label))))
+     blocks)
+    (if (= 0 (hash-table-size forward))
+        blocks
+        (let ((new-index (make-vector count #f))
+              (label-index (make-hash-table eq?)))
+          (let loop ((i 0) (next 0))
+            (when (< i count)
+              (let ((label (machine-block-label (vector-ref vec i))))
+                (if (and label (hash-table-exists? forward label))
+                    (loop (+ i 1) next)
+                    (begin
+                      (vector-set! new-index i next)
+                      (when label (hash-table-set! label-index label next))
+                      (loop (+ i 1) (+ next 1)))))))
+          (letrec ((retarget (lambda (label) (follow label)))
+                   (successor
+                    (lambda (i)
+                      (let ((label (machine-block-label (vector-ref vec i))))
+                        (if (and label (hash-table-exists? forward label))
+                            (hash-table-ref label-index (follow label))
+                            (vector-ref new-index i)))))
+                   (rewrite
+                    (lambda (instr)
+                      (case (car instr)
+                        ((jump) `(jump ,(retarget (cadr instr))))
+                        ((branch-if)
+                         `(branch-if ,(cadr instr)
+                                     ,(retarget (caddr instr))
+                                     ,(retarget (cadddr instr))))
+                        ((cmp-branch)
+                         `(cmp-branch ,(cadr instr) ,(caddr instr)
+                                      ,(cadddr instr)
+                                      ,(retarget (car (cddddr instr)))
+                                      ,(retarget (cadr (cddddr instr)))))
+                        (else instr)))))
+            (let loop ((i (- count 1)) (result '()))
+              (if (< i 0)
+                  result
+                  (let* ((block (vector-ref vec i))
+                         (label (machine-block-label block)))
+                    (if (and label (hash-table-exists? forward label))
+                        (loop (- i 1) result)
+                        (loop (- i 1)
+                              (cons (make-machine-block
+                                     label
+                                     (map rewrite
+                                          (machine-block-instructions block))
+                                     (dedupe-successors
+                                      (map successor
+                                           (machine-block-successors block))))
+                                    result)))))))))))
+
+(define (dedupe-successors indices)
+  (let loop ((rest indices) (result '()))
+    (cond ((null? rest) (reverse result))
+          ((memv (car rest) result) (loop (cdr rest) result))
+          (else (loop (cdr rest) (cons (car rest) result))))))
+
+;;; ── Peephole: shared return epilogue ───────────────────────────────────────
+;;
+;; Every plain (ret) finalizes to the same four-instruction epilogue
+;; (gc-pop-frame, restore-callee-saved, deallocate-frame, ret) after its
+;; move-out. When a procedure has two or more of them, one copy is kept as a
+;; block and the other sites jump to it. If the last block is itself a return
+;; site it becomes that copy, with the code before its epilogue falling
+;; through, so that return pays no extra jump.
+
+(define (epilogue-suffix instrs)
+  (let ((n (length instrs)))
+    (and (>= n 4)
+         (let ((tail (list-tail instrs (- n 4))))
+           (and (equal? (car tail) '(gc-pop-frame))
+                (eq? (car (cadr tail)) 'restore-callee-saved)
+                (eq? (car (caddr tail)) 'deallocate-frame)
+                (equal? (cadddr tail) '(ret))
+                tail)))))
+
+(define (without-last instrs k)
+  (reverse (list-tail (reverse instrs) k)))
+
+(define (merge-return-epilogues name blocks)
+  (let* ((count (length blocks))
+         (suffix (let find ((rest blocks))
+                   (cond ((null? rest) #f)
+                         ((epilogue-suffix (machine-block-instructions (car rest))))
+                         (else (find (cdr rest))))))
+         (site? (lambda (block)
+                  (and suffix
+                       (equal? (epilogue-suffix (machine-block-instructions block))
+                               suffix)))))
+    (if (< (length (filter site? blocks)) 2)
+        blocks
+        (let* ((last-block (list-ref blocks (- count 1)))
+               (last-instrs (machine-block-instructions last-block))
+               (reuse-last? (and (site? last-block)
+                                 (= (length last-instrs) 4)
+                                 (machine-block-label last-block)))
+               (label (if reuse-last?
+                          (machine-block-label last-block)
+                          (string->symbol
+                           (string-append "epilogue."
+                                          (symbol->string name)))))
+               (index (if reuse-last? (- count 1) count))
+               (jump-site
+                (lambda (block)
+                  (make-machine-block
+                   (machine-block-label block)
+                   (append (without-last (machine-block-instructions block) 4)
+                           (list `(jump ,label)))
+                   (list index))))
+               (rewritten
+                (let loop ((rest blocks) (i 0) (result '()))
+                  (cond
+                    ((null? rest) (reverse result))
+                    ((and (= i (- count 1)) (site? (car rest)))
+                     ;; The last block: keep it as the epilogue itself, or
+                     ;; split it so its prefix falls into the epilogue block.
+                     (loop (cdr rest) (+ i 1)
+                           (cons (if reuse-last?
+                                     (car rest)
+                                     (make-machine-block
+                                      (machine-block-label (car rest))
+                                      (without-last (machine-block-instructions
+                                                     (car rest))
+                                                    4)
+                                      (list index)))
+                                 result)))
+                    ((site? (car rest))
+                     (loop (cdr rest) (+ i 1) (cons (jump-site (car rest)) result)))
+                    (else (loop (cdr rest) (+ i 1) (cons (car rest) result)))))))
+          (if reuse-last?
+              rewritten
+              (append rewritten
+                      (list (make-machine-block label suffix '()))))))))
+
+(define (peephole-machine-procedure proc)
+  (make-machine-procedure
+   (machine-procedure-name proc)
+   (machine-procedure-params proc)
+   (machine-procedure-param-locations proc)
+   (map (lambda (block)
+          (make-machine-block
+           (machine-block-label block)
+           (drop-redundant-moves (machine-block-instructions block))
+           (machine-block-successors block)))
+        (remove-jump-only-blocks
+         (merge-return-epilogues (machine-procedure-name proc)
+                                 (machine-procedure-blocks proc))))
+   (machine-procedure-homes proc)
+   (machine-procedure-root-homes proc)
+   (machine-procedure-frame-slots proc)
+   (machine-procedure-used-registers proc)))
+
 (define (cfg->allocated-machine-procedure name params cfg)
-  (finalize-machine-procedure
-   (allocate-machine-procedure
-     (select-machine-procedure name params cfg))))
+  (peephole-machine-procedure
+   (finalize-machine-procedure
+    (allocate-machine-procedure
+     (fuse-compare-branches
+      (select-machine-procedure name params cfg))))))
 
 ;;; ── Display helpers ────────────────────────────────────────────────────────
 
@@ -1682,12 +1991,46 @@
     (else
      (error "Unsupported destination operand in assembly emission" operand))))
 
+;; Register destinations load straight into place and register sources store
+;; straight out; only memory-to-memory and literal-to-memory go through x9.
 (define (emit-move port dst src proc)
-  (if (equal? dst src)
-      'done
+  (cond
+    ((equal? dst src) 'done)
+    ((register-operand? dst)
+     (emit-load-operand port (register-name dst) src proc))
+    ((register-operand? src)
+     (emit-store-operand port (register-name src) dst proc))
+    (else
+     (emit-load-operand port "x9" src proc)
+     (emit-store-operand port "x9" dst proc))))
+
+;; The register holding operand: its own if it lives in one, else scratch
+;; after loading it there.
+(define (operand-source port operand scratch proc)
+  (if (register-operand? operand)
+      (register-name operand)
       (begin
-        (emit-load-operand port "x9" src proc)
-        (emit-store-operand port "x9" dst proc))))
+        (emit-load-operand port scratch operand proc)
+        scratch)))
+
+;; Where to compute a result for dst: dst's register, or scratch if it lives
+;; in memory (then store-result writes it back).
+(define (result-register dst scratch)
+  (if (register-operand? dst) (register-name dst) scratch))
+
+(define (store-result port reg dst proc)
+  (unless (register-operand? dst)
+    (emit-store-operand port reg dst proc)))
+
+;; The encoded value of a literal operand if it fits an AArch64 12-bit
+;; arithmetic/compare immediate, else #f.
+(define (small-immediate operand)
+  (and (literal-expr? operand)
+       (let ((value (encode-immediate operand)))
+         (and (<= 0 value 4095) value))))
+
+(define (immediate-text value)
+  (string-append "#" (number->string value)))
 
 (define (emit-procedure-address port reg proc-name)
   (emit-asm-line port
@@ -1704,9 +2047,10 @@
   (emit-asm-line port
                  (string-append "    mov x12, #"
                                 (number->string true-immediate)))
-  (emit-asm-line port
-                 (string-append "    csel x11, x12, x11, " condition))
-  (emit-store-operand port "x11" dst proc))
+  (let ((target (result-register dst "x11")))
+    (emit-asm-line port
+                   (string-append "    csel " target ", x12, x11, " condition))
+    (store-result port target dst proc)))
 
 (define (emit-load-box-address port operand proc)
   (emit-load-operand port "x9" operand proc)
@@ -1778,42 +2122,106 @@
                                 (gc-desc-label proc-name) "@PAGEOFF")))
 
 (define (emit-immediate-compare port operand immediate proc)
-  (emit-load-operand port "x9" operand proc)
+  (let ((reg (operand-source port operand "x9" proc)))
+    (if (<= 0 immediate 4095)
+        (emit-asm-line port
+                       (string-append "    cmp " reg ", "
+                                      (immediate-text immediate)))
+        (begin
+          (emit-asm-line port
+                         (string-append "    mov x10, #"
+                                        (number->string immediate)))
+          (emit-asm-line port (string-append "    cmp " reg ", x10"))))))
+
+(define (emit-compare port lhs rhs proc)
+  (let* ((lhs-reg (operand-source port lhs "x9" proc))
+         (imm (small-immediate rhs)))
+    (if imm
+        (emit-asm-line port
+                       (string-append "    cmp " lhs-reg ", "
+                                      (immediate-text imm)))
+        (emit-asm-line port
+                       (string-append "    cmp " lhs-reg ", "
+                                      (operand-source port rhs "x10" proc))))))
+
+(define (comparison-condition op)
+  (case op
+    ((= eq?) '("eq" . "ne"))
+    ((<) '("lt" . "ge"))
+    ((>) '("gt" . "le"))
+    (else (error "Unsupported comparison in assembly emission" op))))
+
+;; Branches to then-label if condition holds, else to else-label, leaving out
+;; whichever jump falls through to next-label (the block emitted next).
+(define (emit-conditional-branch port condition inverse then-label else-label next-label)
+  (define (label-text label) (string-append "L" (symbol->string label)))
+  (cond
+    ((eq? then-label else-label)
+     (unless (eq? then-label next-label)
+       (emit-asm-line port (string-append "    b " (label-text then-label)))))
+    ((eq? then-label next-label)
+     (emit-asm-line port (string-append "    b." inverse " "
+                                        (label-text else-label))))
+    ((eq? else-label next-label)
+     (emit-asm-line port (string-append "    b." condition " "
+                                        (label-text then-label))))
+    (else
+     (emit-asm-line port (string-append "    b." condition " "
+                                        (label-text then-label)))
+     (emit-asm-line port (string-append "    b " (label-text else-label))))))
+
+(define (emit-tag-compare port operand tag proc)
   (emit-asm-line port
-                 (string-append "    mov x10, #"
-                                (number->string immediate)))
-  (emit-asm-line port "    cmp x9, x10"))
+                 (string-append "    and x10, "
+                                (operand-source port operand "x9" proc)
+                                ", #" (number->string tag-mask)))
+  (emit-asm-line port
+                 (string-append "    cmp x10, #" (number->string tag))))
 
 (define (emit-binop port op dst lhs rhs proc)
-  (emit-load-operand port "x9" lhs proc)
-  (emit-load-operand port "x10" rhs proc)
+  (define (emit-add-sub mnemonic commutative?)
+    (let* ((target (result-register dst "x11"))
+           (rhs-imm (small-immediate rhs))
+           (lhs-imm (and commutative? (not rhs-imm) (small-immediate lhs))))
+      (cond
+        (rhs-imm
+         (emit-asm-line port
+                        (string-append "    " mnemonic " " target ", "
+                                       (operand-source port lhs "x9" proc)
+                                       ", " (immediate-text rhs-imm))))
+        (lhs-imm
+         (emit-asm-line port
+                        (string-append "    " mnemonic " " target ", "
+                                       (operand-source port rhs "x10" proc)
+                                       ", " (immediate-text lhs-imm))))
+        (else
+         (let* ((a (operand-source port lhs "x9" proc))
+                (b (operand-source port rhs "x10" proc)))
+           (emit-asm-line port
+                          (string-append "    " mnemonic " " target ", "
+                                         a ", " b)))))
+      (store-result port target dst proc)))
+  (define (emit-comparison condition)
+    (emit-compare port lhs rhs proc)
+    (emit-bool-result port condition dst proc))
   (cond
-    ((eq? op '+)
-     (emit-asm-line port "    add x11, x9, x10")
-     (emit-store-operand port "x11" dst proc))
-    ((eq? op '-)
-     (emit-asm-line port "    sub x11, x9, x10")
-     (emit-store-operand port "x11" dst proc))
+    ((eq? op '+) (emit-add-sub "add" #t))
+    ((eq? op '-) (emit-add-sub "sub" #f))
     ((eq? op '*)
-     (emit-asm-line port "    mul x11, x9, x10")
-     (emit-asm-line port
-                    (string-append "    asr x11, x11, #"
-                                   (number->string fixnum-shift)))
-     (emit-store-operand port "x11" dst proc))
-    ((eq? op '=)
-      (emit-asm-line port "    cmp x9, x10")
-      (emit-bool-result port "eq" dst proc))
+     (let* ((a (operand-source port lhs "x9" proc))
+            (b (operand-source port rhs "x10" proc))
+            (target (result-register dst "x11")))
+       (emit-asm-line port (string-append "    mul x11, " a ", " b))
+       (emit-asm-line port
+                      (string-append "    asr " target ", x11, #"
+                                     (number->string fixnum-shift)))
+       (store-result port target dst proc)))
+    ((eq? op '=) (emit-comparison "eq"))
     ;; eq? compares the full tagged words, so it is valid for any two Scheme
     ;; values: fixnums, symbols, immediates, and heap pointers alike.
-    ((eq? op 'eq?)
-      (emit-asm-line port "    cmp x9, x10")
-      (emit-bool-result port "eq" dst proc))
-    ((eq? op '<)
-      (emit-asm-line port "    cmp x9, x10")
-      (emit-bool-result port "lt" dst proc))
-    ((eq? op '>)
-      (emit-asm-line port "    cmp x9, x10")
-      (emit-bool-result port "gt" dst proc))
+    ((eq? op 'eq?) (emit-comparison "eq"))
+    ((eq? op '<) (emit-comparison "lt"))
+    ((eq? op '>) (emit-comparison "gt"))
     (else
      (error "Unsupported primop in assembly emission" op)))
   'done)
@@ -1899,7 +2307,7 @@
                                 (if tail? "b " "bl ")
                                 (asm-name proc-name))))
 
-(define (emit-machine-instruction port instr proc)
+(define (emit-machine-instruction port instr proc next-label)
   (case (car instr)
     ((allocate-frame)
      (emit-asm-line port "    stp x29, x30, [sp, #-16]!")
@@ -2001,13 +2409,7 @@
       (emit-asm-line port "    bl _hop_vector_set")
       (emit-store-operand port "x0" (cadr instr) proc))
     ((is-vector)
-      (emit-load-operand port "x9" (caddr instr) proc)
-      (emit-asm-line port
-                     (string-append "    and x10, x9, #"
-                                    (number->string tag-mask)))
-      (emit-asm-line port
-                     (string-append "    cmp x10, #"
-                                     (number->string vector-tag)))
+      (emit-tag-compare port (caddr instr) vector-tag proc)
       (emit-bool-result port "eq" (cadr instr) proc))
     ((load-box)
        (emit-load-box-address port (caddr instr) proc)
@@ -2031,25 +2433,13 @@
     ((unsafe-load-cdr)
       (emit-unsafe-pair-load port (cadr instr) (caddr instr) 16 "_hop_cdr" proc))
     ((is-pair)
-      (emit-load-operand port "x9" (caddr instr) proc)
-      (emit-asm-line port
-                     (string-append "    and x10, x9, #"
-                                    (number->string tag-mask)))
-      (emit-asm-line port
-                     (string-append "    cmp x10, #"
-                                     (number->string pair-tag)))
+      (emit-tag-compare port (caddr instr) pair-tag proc)
       (emit-bool-result port "eq" (cadr instr) proc))
     ((is-null)
       (emit-immediate-compare port (caddr instr) null-immediate proc)
       (emit-bool-result port "eq" (cadr instr) proc))
     ((is-symbol)
-      (emit-load-operand port "x9" (caddr instr) proc)
-      (emit-asm-line port
-                     (string-append "    and x10, x9, #"
-                                    (number->string tag-mask)))
-      (emit-asm-line port
-                     (string-append "    cmp x10, #"
-                                     (number->string symbol-tag)))
+      (emit-tag-compare port (caddr instr) symbol-tag proc)
       (emit-bool-result port "eq" (cadr instr) proc))
     ((store-box)
         (emit-load-box-address port (cadr instr) proc)
@@ -2071,22 +2461,26 @@
       (emit-call-label port (cadr instr) #t))
     ((branch-if)
       (emit-immediate-compare port (cadr instr) false-immediate proc)
-      (emit-asm-line port
-                     (string-append "    b.ne L"
-                                    (symbol->string (caddr instr))))
-      (emit-asm-line port
-                     (string-append "    b L"
-                                   (symbol->string (cadddr instr)))))
+      (emit-conditional-branch port "ne" "eq" (caddr instr) (cadddr instr)
+                               next-label))
+    ((cmp-branch)
+      (emit-compare port (caddr instr) (cadddr instr) proc)
+      (let ((condition (comparison-condition (cadr instr))))
+        (emit-conditional-branch port (car condition) (cdr condition)
+                                 (car (cddddr instr))
+                                 (cadr (cddddr instr))
+                                 next-label)))
     ((jump)
-     (emit-asm-line port
-                    (string-append "    b L"
-                                   (symbol->string (cadr instr)))))
+     (unless (eq? (cadr instr) next-label)
+       (emit-asm-line port
+                      (string-append "    b L"
+                                     (symbol->string (cadr instr))))))
     ((ret)
      (emit-asm-line port "    ret"))
     (else
      (error "Unsupported machine instruction in assembly emission" instr))))
 
-(define (emit-machine-block port block proc first?)
+(define (emit-machine-block port block proc first? next-label)
   (define (entry-setup-instruction? instr)
     (and (pair? instr)
          (or (memq (car instr) '(allocate-frame save-callee-saved init-frame-slots gc-push-frame))
@@ -2107,7 +2501,7 @@
               (list-tail instrs (length prologue))
               instrs)))
     (for-each (lambda (instr)
-                (emit-machine-instruction port instr proc))
+                (emit-machine-instruction port instr proc next-label))
               prologue)
     (if (or (not first?) (machine-block-label block))
         (emit-asm-line port
@@ -2115,7 +2509,7 @@
                                       (symbol->string (machine-block-label block))
                                       ":")))
     (for-each (lambda (instr)
-                (emit-machine-instruction port instr proc))
+                (emit-machine-instruction port instr proc next-label))
               body)))
 
 (define (emit-machine-procedure port proc exported-name)
@@ -2139,7 +2533,9 @@
     (if (null? blocks)
         'done
         (begin
-          (emit-machine-block port (car blocks) proc first?)
+          (emit-machine-block port (car blocks) proc first?
+                              (and (pair? (cdr blocks))
+                                   (machine-block-label (cadr blocks))))
           (loop (cdr blocks) #f))))
   (newline port))
 

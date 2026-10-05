@@ -382,7 +382,7 @@ assert_asm_not_contains "test95" '_hop_(tail_)?call_[0-9]+' 'generic call helper
 # entry-tag rather than collapsing to an unconditional jump to whichever
 # member happens to be first (see test96's definition for why a broken
 # dispatch would still "run" but produce the wrong answer).
-assert_asm_contains "test96" 'b\.ne Lentry\.' 'conditional entry-tag dispatch branch between cluster members'
+assert_asm_contains "test96" 'b\.(ne|eq) Lentry\.' 'conditional entry-tag dispatch branch between cluster members'
 
 # indirect call to a statically-unresolvable variadic target must go
 # through the runtime's hop_call_N family (which internally branches on the
