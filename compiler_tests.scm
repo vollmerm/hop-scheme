@@ -1101,6 +1101,16 @@
             (od (lambda (n l) (if (= n 0) (car (cdr l)) (ev (- n 1) (cdr l))))))
      (ev 3 (cons 1 (cons 2 (cons 3 (cons 4 (cons 5 '()))))))))
 
+;; Interprocedural summaries: every call passes a pair whose car is 1.
+(define test142
+  '(letrec ((f (lambda (p k) (if (= k 0) (car p) (+ 1 (f p (- k 1)))))))
+     (+ (f (cons 1 2) 3) (f (cons 1 7) 2))))
+
+;; The returned pair always has car 1, whichever branch built it.
+(define test143
+  '(letrec ((mk (lambda (x) (if (= x 0) (cons 1 2) (cons 1 3)))))
+     (+ (car (mk 0)) (car (mk 1)))))
+
 (define sample-tests
   (list (cons "Test 1: Simple arithmetic" test1)
         (cons "Test 2: Lambda application" test2)
@@ -1241,7 +1251,9 @@
         (cons "Test 138: inlining a callee that loops" test138)
         (cons "Test 139: inlining a callee that tail-calls an unknown closure" test139)
         (cons "Test 140: single-use letrec loop becomes a loop of the caller" test140)
-        (cons "Test 141: mutually tail-recursive local functions with a known start" test141)))
+        (cons "Test 141: mutually tail-recursive local functions with a known start" test141)
+        (cons "Test 142: parameter shape joined over the call sites of a recursive function" test142)
+        (cons "Test 143: return shape of a function" test143)))
 
 (define named-tests
   ;; These are runnable end-to-end regression cases. test6 and test7 stay as
@@ -1383,7 +1395,9 @@
          (cons 'test138 test138)
          (cons 'test139 test139)
          (cons 'test140 test140)
-         (cons 'test141 test141)))
+         (cons 'test141 test141)
+         (cons 'test142 test142)
+         (cons 'test143 test143)))
 
 (define (lookup-named-test name)
   (let ((binding (assoc name named-tests)))

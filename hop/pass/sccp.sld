@@ -24,6 +24,7 @@
   ;;; and blocks, and removes definitions nobody reads.
   (export sccp-cfg
           sccp-ssa
+          sccp-program
           set-shape-depth!
           set-remove-dead-allocation!
           value-table-size
@@ -298,6 +299,88 @@
 
 ;;; --- Analysis ---
 
+;;; --- Interprocedural summaries ---
+;;;
+;;; With sccp-program the procedures of a unit are analyzed together. A
+;;; procedure that is closed (every reference to it is a direct call, so it
+;;; has no unknown callers) starts with the join of its call sites' arguments
+;;; as the values of its parameters, and the value of a direct call is the join
+;;; of what the callee returns. Everything crossing a procedure boundary loses
+;;; its component names (they are SSA names of the other procedure). Start
+;;; optimistic (bot) and iterate whole rounds until no table changes; values
+;;; only grow and the lattice is finite, so this terminates.
+
+(define ipa-seeds (make-hash-table))     ; closed procedure -> vector of values
+(define ipa-called (make-hash-table))    ; closed procedure -> seen at a live call
+(define ipa-returns (make-hash-table))   ; procedure -> joined return value
+(define ipa-changed #f)
+(define ipa-active #f)
+(define ipa-solving #f)  ; while solving, a procedure not yet called is all bot
+
+(define (ipa-join! table key new)
+  (let* ((old (hash-table-ref/default table key bot))
+         (merged (join old new)))
+    (unless (eq? old merged)
+      (hash-table-set! table key merged)
+      (set! ipa-changed #t))))
+
+(define (ipa-reset! closed all)
+  (set! ipa-seeds (make-hash-table))
+  (set! ipa-called (make-hash-table))
+  (set! ipa-returns (make-hash-table))
+  (set! ipa-active #t)
+  (for-each (lambda (name) (hash-table-set! ipa-returns name bot)) all)
+  (for-each (lambda (entry)
+              (hash-table-set! ipa-seeds (car entry)
+                               (make-vector (cdr entry) bot)))
+            closed))
+
+(define (ipa-clear!)
+  (set! ipa-seeds (make-hash-table))
+  (set! ipa-called (make-hash-table))
+  (set! ipa-returns (make-hash-table))
+  (set! ipa-solving #f)
+  (set! ipa-active #f))
+
+;; Reads off what an analyzed procedure contributes: arguments at its live
+;; direct calls, and its return values. name is #f for the entry code.
+(define (ipa-collect! name analysis blocks)
+  (define (value-of operand)
+    (strip-names (if (symbol? operand)
+                    (hash-table-ref/default (analysis-values analysis) operand bot)
+                    (literal-value operand))))
+  (define (note-call! callee args)
+    (let ((seed (hash-table-ref/default ipa-seeds callee #f)))
+      (when seed
+        (unless (hash-table-ref/default ipa-called callee #f)
+          (hash-table-set! ipa-called callee #t)
+          (set! ipa-changed #t))
+        (do ((i 0 (+ i 1)) (args args (cdr args)))
+            ((or (= i (vector-length seed)) (null? args)))
+          (let* ((old (vector-ref seed i))
+                 (merged (join old (value-of (car args)))))
+            (unless (eq? old merged)
+              (vector-set! seed i merged)
+              (set! ipa-changed #t)))))))
+  (define (note-return! v) (when name (ipa-join! ipa-returns name v)))
+  (for-each-index
+   (lambda (b block)
+     (when (vector-ref (analysis-visited analysis) b)
+       (for-each
+        (lambda (instr)
+          (let ((rhs (instr-rhs instr)))
+            (cond
+             ((and (pair? rhs) (eq? (car rhs) 'direct-call))
+              (note-call! (cadr rhs) (cddr rhs)))
+             ((eq? (car instr) 'direct-tail-call)
+              (note-call! (cadr instr) (cddr instr))
+              (note-return! (hash-table-ref/default ipa-returns (cadr instr) unknown)))
+             ((eq? (car instr) 'return) (note-return! (value-of (cadr instr))))
+             ((memq (car instr) '(tail-call tail-apply-call tail-callcc-call))
+              (note-return! unknown)))))
+        (ssa-block-instrs block))))
+   blocks))
+
 ;; Result of the analysis: the value of each name, and which blocks and edges
 ;; can execute. Edges are keyed by (from . to) block indices.
 (define-record-type <analysis>
@@ -310,7 +393,7 @@
 
 (define (edge-key from to) (cons from to))
 
-(define (analyze ssa)
+(define (analyze ssa . maybe-name)
   (let* ((blocks (ssa-proc-blocks ssa))
          (values (make-hash-table))
          (visited (make-vector (vector-length blocks) #f))
@@ -348,6 +431,8 @@
         (eval-primop 'cons (map value-of (cdr rhs)) (map operand-name (cdr rhs))))
        ((and (pair? rhs) (eq? (car rhs) 'global))
         (hash-table-ref/default quote-cell-values (cadr rhs) unknown))
+       ((and ipa-active (pair? rhs) (eq? (car rhs) 'direct-call))
+        (hash-table-ref/default ipa-returns (cadr rhs) unknown))
        ((and (pair? rhs) (eq? (car rhs) 'pi))
         (eval-pi (cadr rhs) (value-of (caddr rhs))))
        (else unknown)))
@@ -402,8 +487,16 @@
                                (instr-uses instr))))
                  (ssa-block-instrs block)))
      blocks)
-    (for-each (lambda (param) (hash-table-set! values param unknown))
-              (ssa-proc-param-names ssa))
+    (let ((seed (and ipa-active (pair? maybe-name) (car maybe-name)
+                     (or ipa-solving (hash-table-ref/default ipa-called (car maybe-name) #f))
+                     (hash-table-ref/default ipa-seeds (car maybe-name) #f))))
+      (do ((params (ssa-proc-param-names ssa) (cdr params))
+           (i 0 (+ i 1)))
+          ((null? params))
+        (hash-table-set! values (car params)
+                         (if (and seed (< i (vector-length seed)))
+                             (vector-ref seed i)
+                             unknown))))
     (visit-block! 0)
     (let loop ()
       (cond
@@ -441,13 +534,14 @@
        (for-each
         (lambda (instr)
           (when (and (eq? (car instr) 'set-global!) (quote-cell? (cadr instr)))
-            (let ((operand (caddr instr)))
-              (hash-table-set!
-               quote-cell-values (cadr instr)
-               (strip-names
-                (if (symbol? operand)
-                    (hash-table-ref/default (analysis-values analysis) operand unknown)
-                    (literal-value operand)))))))
+            (let* ((operand (caddr instr))
+                   (new (strip-names
+                         (if (symbol? operand)
+                             (hash-table-ref/default (analysis-values analysis) operand unknown)
+                             (literal-value operand)))))
+              (unless (eq? new (hash-table-ref/default quote-cell-values (cadr instr) #f))
+                (set! ipa-changed #t))
+              (hash-table-set! quote-cell-values (cadr instr) new))))
         (ssa-block-instrs block))))
    blocks))
 
@@ -681,16 +775,20 @@
 ;; entry? marks the program's entry procedure: what it stores in hoisted quote
 ;; cells is recorded for the procedures processed after it.
 (define (sccp-ssa ssa . options)
-  (let ((remove-allocation? (if (and (pair? options) (car options))
-                                (car options)
-                                remove-dead-allocation))
-        (entry? (and (pair? options) (pair? (cdr options)) (cadr options)))
-        (blocks (ssa-proc-blocks ssa)))
-    (insert-pis! blocks)
-    (when entry?
+  (run-sccp ssa
+            (if (and (pair? options) (car options)) (car options) remove-dead-allocation)
+            (and (pair? options) (pair? (cdr options)) (cadr options))
+            #f #f))
+
+;; name: the procedure's label when its parameters have interprocedural seeds;
+;; pis-done?: insert-pis! and the quote cells were handled by sccp-program.
+(define (run-sccp ssa remove-allocation? entry? name pis-done?)
+  (let ((blocks (ssa-proc-blocks ssa)))
+    (unless pis-done? (insert-pis! blocks))
+    (when (and entry? (not pis-done?))
       (reset-quote-cells!)
       (harvest-quote-cells! (analyze ssa) blocks))
-    (let ((analysis (analyze ssa)))
+    (let ((analysis (analyze ssa name)))
       (for-each-index
        (lambda (b block)
          (set-ssa-block-instrs!
@@ -703,6 +801,41 @@
         (propagate-copies! pruned)
         (remove-dead-definitions! pruned remove-allocation?)
         (make-ssa-proc (ssa-proc-params ssa) pruned)))))
+
+;; Optimizes a whole unit at once. specs: a list of (name params cfg) for the
+;; non-entry procedures; closed: (name . parameter-count) of those whose every
+;; reference is a direct call. Returns the entry CFG and the other CFGs in the
+;; order of specs.
+(define (sccp-program entry-cfg specs closed)
+  (let* ((entry-ssa (check-ssa (cfg->ssa '() entry-cfg)))
+         (ssas (map (lambda (spec)
+                      (check-ssa (cfg->ssa (cadr spec) (caddr spec))))
+                    specs))
+         (names (map car specs)))
+    (ipa-reset! closed names)
+    (for-each (lambda (ssa) (insert-pis! (ssa-proc-blocks ssa))) (cons entry-ssa ssas))
+    (reset-quote-cells!)
+    ;; the quote cells are written first and do not depend on any call result
+    (harvest-quote-cells! (analyze entry-ssa) (ssa-proc-blocks entry-ssa))
+    (set! ipa-solving #t)
+    (let loop ()
+      (set! ipa-changed #f)
+      (let ((analysis (analyze entry-ssa)))
+        (harvest-quote-cells! analysis (ssa-proc-blocks entry-ssa))
+        (ipa-collect! #f analysis (ssa-proc-blocks entry-ssa)))
+      (for-each (lambda (name ssa)
+                  (let ((analysis (analyze ssa name)))
+                    (ipa-collect! name analysis (ssa-proc-blocks ssa))))
+                names ssas)
+      (when ipa-changed (loop)))
+    (set! ipa-solving #f)
+    (let* ((entry-out (run-sccp entry-ssa remove-dead-allocation #f #f #t))
+           (outs (map (lambda (name ssa)
+                        (run-sccp ssa remove-dead-allocation #f name #t))
+                      names ssas)))
+      (ipa-clear!)
+      (values (ssa->cfg (check-ssa entry-out))
+              (map (lambda (out) (ssa->cfg (check-ssa out))) outs)))))
 
 (define (sccp-cfg params cfg . maybe-entry?)
   (ssa->cfg (check-ssa (sccp-ssa (check-ssa (cfg->ssa params cfg))

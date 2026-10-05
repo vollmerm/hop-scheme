@@ -3,9 +3,11 @@
   ;;; Pass 3.6: 0CFA Analysis and Known-Call Rewriting
   (export normalize-for-cfa
           run-0cfa
-          rewrite-known-calls)
+          rewrite-known-calls
+          closed-lambdas)
   (import (scheme base)
           (scheme cxr)
+          (only (srfi 1) filter)
           (srfi 69)
           (hop utils))
   (begin
@@ -520,13 +522,29 @@
      (hash-table-keys escaped))
     (if changed
         (loop)
-        (list procedures var-flow box-contents global-flow proc-results))))
+        (list procedures var-flow box-contents global-flow proc-results escaped))))
+
+;; Set by rewrite-known-calls: the procedures of the last program it rewrote,
+;; and those that can be reached other than through a known call.
+(define last-procedures (make-hash-table))
+(define last-open-procedures (make-hash-table))
+
+;; The names of the procedures every call of which was rewritten into a known
+;; call: they never escape and no generic call, apply or call/cc can reach
+;; them, so their only callers are the known-call sites of the rewritten
+;; program. Valid right after rewrite-known-calls.
+(define (closed-lambdas)
+  (filter (lambda (name) (not (hash-table-exists? last-open-procedures name)))
+          (hash-table-keys last-procedures)))
 
 (define (rewrite-known-calls expr analysis)
   (let ((procedures (car analysis))
         (var-flow (cadr analysis))
         (box-contents (caddr analysis))
-        (global-flow (cadddr analysis)))
+        (global-flow (cadddr analysis))
+        (open (make-hash-table)))
+    (define (note-open! targets)
+      (for-each (lambda (name) (hash-table-set! open name #t)) targets))
     (define (flow-ref table key)
       (let ((value (hash-table-ref/default table key #f)))
         (if value value '())))
@@ -631,7 +649,9 @@
                      (error "Wrong number of arguments to procedure" proc-name expr))
                     (else
                      `(known-call ,proc-name ,capture-count ,rest-k ,rator ,@args))))
-                 `(closure-call ,rator ,@args))))
+                 (begin
+                   (note-open! targets)
+                   `(closure-call ,rator ,@args)))))
           ((known-call)
            `(known-call ,(cadr expr)
                         ,(caddr expr)
@@ -639,8 +659,10 @@
                         ,(rewrite (car (cddddr expr)))
                         ,@(map rewrite (cdr (cddddr expr)))))
           ((closure-apply)
+           (note-open! (closure-set (rewrite (cadr expr))))
            `(closure-apply ,(rewrite (cadr expr)) ,@(map rewrite (cddr expr))))
           ((closure-callcc)
+           (note-open! (closure-set (rewrite (cadr expr))))
            `(closure-callcc ,(rewrite (cadr expr))))
           ((self-tail-call)
            `(self-tail-call ,@(map rewrite (cdr expr))))
@@ -669,6 +691,10 @@
        (else
         (error "Invalid expression in known-call rewrite" expr))))
 
-    (rewrite expr)))
+    (note-open! (hash-table-keys (list-ref analysis 5)))
+    (let ((result (rewrite expr)))
+      (set! last-procedures procedures)
+      (set! last-open-procedures open)
+      result)))
 
 )) ; end define-library

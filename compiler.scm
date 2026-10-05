@@ -74,6 +74,12 @@
      ((equal? mode "control") (control-cfg params cfg))
      (else cfg))))
 
+;; HOP_IPA=1 (with HOP_SSA=sccp) analyzes all of a unit's procedures together,
+;; passing parameter and return values across direct calls.
+(define (ipa-enabled?)
+  (and (equal? (get-environment-variable "HOP_SSA") "sccp")
+       (equal? (get-environment-variable "HOP_IPA") "1")))
+
 ;; HOP_INLINE=<n> inlines known procedures of at most n instructions (off when
 ;; unset or 0); see (hop pass inline).
 (define (maybe-inline entry-instrs procedures exported-labels)
@@ -112,17 +118,40 @@
          (closure-converted (closure-convert desugared))
          (cfa-normalized (normalize-for-cfa closure-converted))
          (cfa-analysis (run-0cfa cfa-normalized exported-labels))
-         (cfa-rewritten (rewrite-known-calls cfa-normalized cfa-analysis)))
+         (cfa-rewritten (rewrite-known-calls cfa-normalized cfa-analysis))
+         (cfa-closed (closed-lambdas)))
     (let*-values (((raw-instrs raw-procedures) (expr->tac cfa-rewritten))
                   ((tac-instrs procedures) (maybe-inline raw-instrs raw-procedures exported-labels)))
-      (let* ((entry-cfg (maybe-ssa-round-trip '() (build-cfg tac-instrs) #t))
-             (procedure-cfgs
-              (map (lambda (procedure)
-                     (cons procedure
-                     (maybe-ssa-round-trip
-                      (procedure-params procedure)
-                      (build-cfg (procedure-instructions procedure)))))
-                   procedures))
+      (let*-values (((entry-cfg procedure-cfgs)
+                     (if (ipa-enabled?)
+                         (let-values (((entry-out outs)
+                                       (begin
+                                         (configure-shape-analysis!)
+                                         (sccp-program
+                                          (build-cfg tac-instrs)
+                                          (map (lambda (procedure)
+                                                 (list (procedure-name procedure)
+                                                       (procedure-params procedure)
+                                                       (build-cfg (procedure-instructions procedure))))
+                                               procedures)
+                                          (apply append
+                                                 (map (lambda (procedure)
+                                                        (if (memq (procedure-name procedure) cfa-closed)
+                                                            (list (cons (procedure-name procedure)
+                                                                        (length (params-names (procedure-params procedure)))))
+                                                            '()))
+                                                      procedures))))))
+                           (values entry-out (map cons procedures outs)))
+                         (values
+                          (maybe-ssa-round-trip '() (build-cfg tac-instrs) #t)
+                          (map (lambda (procedure)
+                                 (cons procedure
+                                       (maybe-ssa-round-trip
+                                        (procedure-params procedure)
+                                        (build-cfg (procedure-instructions procedure)))))
+                               procedures)))))
+        (let*
+            (
              (optimized-entry-cfg
                (eliminate-dead-writes-cfg
                  (constant-fold-cfg
@@ -143,7 +172,7 @@
                 cfa-normalized
                 cfa-rewritten
                 optimized-entry-cfg
-                optimized-procedure-cfgs)))))
+                optimized-procedure-cfgs))))))
 
 ;; Turns a middle-end's optimized entry/procedure CFGs into allocated machine
 ;; procedures. entry-name is the entry procedure's own asm label -- always

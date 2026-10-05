@@ -323,6 +323,8 @@ runtime_cases=(
   "test139|8"
   "test140|9"
   "test141|5"
+  "test142|7"
+  "test143|2"
 )
 
 csi -R r7rs -I "$ROOT" -s "$ROOT/ssa_tests.scm"
@@ -691,5 +693,25 @@ for t in test137 test140; do
     echo "inlining $t left a car or cdr behind" >&2; exit 1
   fi
 done
+
+# Interprocedural summaries (HOP_IPA): the same answers, and the accessors on
+# parameters and call results of closed procedures disappear.
+check_ipa() {
+  local test_name="$1" expected="$2"
+  local asm_path="$TMPDIR/ipa_${test_name}.s" exe_path="$TMPDIR/ipa_${test_name}"
+  HOP_IPA=1 HOP_PRUNE=1 HOP_SSA=sccp HOP_SHAPE_K=3 generate "$test_name" "$asm_path"
+  clang -arch arm64 -o "$exe_path" "$asm_path" "$ROOT/runtime.c" "$ROOT/codegen_harness.c"
+  "$exe_path" "$expected" >/dev/null
+  if grep -Eq '_hop_car' "$asm_path"; then
+    echo "ipa left a car in $test_name" >&2; exit 1
+  fi
+  HOP_IPA=0 HOP_INLINE=0 HOP_PRUNE=1 HOP_SSA=sccp HOP_SHAPE_K=3 generate "$test_name" "$TMPDIR/noipa_${test_name}.s"
+  if ! grep -Eq '_hop_car' "$TMPDIR/noipa_${test_name}.s"; then
+    echo "$test_name no longer needs ipa to remove its car" >&2; exit 1
+  fi
+  printf 'ok ipa %s\n' "$test_name"
+}
+check_ipa test142 7
+check_ipa test143 2
 
 echo "compiler tests passed"
