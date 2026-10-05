@@ -12,6 +12,8 @@
 #   sK               aK plus inlining small readers and scalar replacement (HOP_SROA)
 #   ioff             pruning and inlining, no SSA
 # HOP_INLINE_SIZE (default 30) is the inlining size limit.
+# BENCH_FORMAT=csv prints comma-separated rows (with a header) instead of the table.
+# Depth sweep: BENCH_CONFIGS="off control k0 k1 k2 k3 k4 k8" BENCH_FORMAT=csv tools/bench-run.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export HOP_CHECK_ALLOC=1
@@ -71,7 +73,9 @@ csi -R r7rs -I "$ROOT" -e "(begin (load \"$ROOT/compiler.scm\") (write-aarch64-p
 clang -arch arm64 -o "$WORK/empty" "$WORK/empty.s" "$ROOT/runtime.c" "$ROOT/codegen_harness.c"
 BASE=$(/usr/bin/time -l "$WORK/empty" 2>&1 >/dev/null | awk '/instructions retired/ {print $1}')
 
-printf '%-10s %-8s %6s %5s %5s %6s %12s %12s\n' program config lines car cdr alloc work-instrs dyn-allocs
+CSV=0; [[ "${BENCH_FORMAT:-}" == csv ]] && CSV=1
+if (( CSV )); then echo "program,config,lines,car,cdr,alloc,work_instrs,dyn_allocs,iters,unknown_names,shaped_names,analysis_us"
+else printf '%-10s %-8s %6s %5s %5s %6s %12s %12s\n' program config lines car cdr alloc work-instrs dyn-allocs; fi
 for f in "${files[@]}"; do
   name="$(basename "$f" .scm)"
   scaled="$WORK/$name.scm"
@@ -91,8 +95,12 @@ for f in "${files[@]}"; do
       k*) envs=(HOP_SSA=sccp "HOP_SHAPE_K=${config#k}") ;;
     esac
     asm="$WORK/$name.$config.s"; exe="$WORK/$name.$config"
-    env "${envs[@]}" csi -R r7rs -I "$ROOT" -e \
-      "(begin (load \"$ROOT/compiler.scm\") (write-aarch64-program-file \"$scaled\" \"$asm\"))"
+    env "${envs[@]}" HOP_SSA_STATS=1 csi -R r7rs -I "$ROOT" -e \
+      "(begin (load \"$ROOT/compiler.scm\") (write-aarch64-program-file \"$scaled\" \"$asm\"))" \
+      2>"$WORK/stats.txt"
+    # analysis statistics summed over the unit's procedures (zeros when the analysis is off)
+    read -r iters unk strc us < <(awk '/^hop-ssa-stats/ { for (i=2;i<=NF;i++) { split($i,kv,"="); s[kv[1]]+=kv[2] } }
+      END { printf "%d %d %d %d\n", s["iters"], s["unknown"], s["struct"]+s["pair"], s["us"] }' "$WORK/stats.txt")
     clang -arch arm64 -o "$exe" "$asm" "$ROOT/runtime.c" "$ROOT/codegen_harness.c"
     if ! HOP_HEAP_BYTES="$HEAP" "$exe" "$expected" >/dev/null 2>&1; then
       echo "WRONG RESULT: $name $config (expected $expected)" >&2; exit 1
@@ -104,6 +112,10 @@ for f in "${files[@]}"; do
     stats="$(HOP_STATS=1 HOP_HEAP_BYTES="$HEAP" /usr/bin/time -l "$exe" 2>&1 >/dev/null || true)"
     dyn=$(sed -n 's/^hop-stats allocs=\([0-9]*\).*/\1/p' <<<"$stats")
     instrs=$(awk '/instructions retired/ {print $1}' <<<"$stats")
-    printf '%-10s %-8s %6s %5s %5s %6s %12s %12s\n' "$name" "$config" "$lines" "$car" "$cdr" "$alloc" "$(( ${instrs:-0} - BASE ))" "${dyn:-0}"
+    if (( CSV )); then
+      echo "$name,$config,$lines,$car,$cdr,$alloc,$(( ${instrs:-0} - BASE )),${dyn:-0},$iters,$unk,$strc,$us"
+    else
+      printf '%-10s %-8s %6s %5s %5s %6s %12s %12s\n' "$name" "$config" "$lines" "$car" "$cdr" "$alloc" "$(( ${instrs:-0} - BASE ))" "${dyn:-0}"
+    fi
   done
 done
