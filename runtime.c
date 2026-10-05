@@ -1,4 +1,5 @@
 #include <setjmp.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -65,7 +66,11 @@ typedef struct {
     uint8_t *alloc_limit;
 } hop_heap;
 
-static hop_heap hop_runtime_heap = {0};
+/* Exported: generated code allocates pairs inline by bumping alloc_ptr (see
+ * emit-inline-alloc-pair in (hop backend)); the slow path calls hop_alloc_pair. */
+hop_heap hop_runtime_heap = {0};
+_Static_assert(offsetof(hop_heap, alloc_ptr) == 24, "generated code reads alloc_ptr at +24");
+_Static_assert(offsetof(hop_heap, alloc_limit) == 32, "generated code reads alloc_limit at +32");
 void *hop_gc_top_frame = NULL;
 /* The value being passed to a continuation while it is reinstated (see
  * hop_continuation_entry); a GC root in case a collection ever intervenes. */
@@ -373,10 +378,14 @@ static void hop_scan_copied_objects(void) {
 static unsigned long long hop_stat_allocs;
 static unsigned long long hop_stat_words;
 static unsigned long long hop_stat_collections;
+/* Pairs allocated by generated code without calling the runtime (counted by the
+ * inline path unless compiled with HOP_ALLOC_COUNT=0); folded into allocs/words. */
+unsigned long long hop_stat_inline_pairs;
 
 static void hop_print_stats(void) {
     fprintf(stderr, "hop-stats allocs=%llu words=%llu collections=%llu\n",
-            hop_stat_allocs, hop_stat_words, hop_stat_collections);
+            hop_stat_allocs + hop_stat_inline_pairs,
+            hop_stat_words + 3 * hop_stat_inline_pairs, hop_stat_collections);
 }
 
 static void hop_collect(hop_value *temp_roots, size_t temp_root_count) {

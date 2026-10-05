@@ -2109,6 +2109,11 @@
     (set! pending-slow-stubs (cons (cons label emit-body) pending-slow-stubs))
     label))
 
+;; A fresh file-local label for code a stub jumps back to.
+(define (new-local-label! kind)
+  (set! slow-stub-counter (+ slow-stub-counter 1))
+  (string-append kind "." slow-stub-prefix "." (number->string slow-stub-counter)))
+
 (define (flush-slow-stubs! port)
   (for-each (lambda (stub)
               (emit-asm-line port (string-append (car stub) ":"))
@@ -2192,6 +2197,55 @@
     (else
      (emit-fixnum-guard port helper a b proc)
      (emit-checked-binop-fast port op dst a b proc))))
+
+;; Pair allocation. The fast path bumps the runtime heap's alloc_ptr (struct
+;; hop_heap in runtime.c, exported as hop_runtime_heap: alloc_ptr at +24,
+;; alloc_limit at +32) and writes the header, car and cdr; when the pair does not
+;; fit, a stub calls hop_alloc_pair, which collects, and rejoins after the
+;; allocation. The heap is initialized lazily and starts with both pointers 0, so
+;; the first allocation always takes the stub. The GC root syncs and reloads
+;; around the instruction are unchanged: alloc-pair is still a safepoint.
+;; HOP_ALLOC_COUNT=0 leaves out the counter the inline path bumps for HOP_STATS.
+(define pair-object-type 2)  ; HOP_OBJ_PAIR in runtime.c, with no header aux bits
+
+(define (alloc-count-enabled?)
+  (not (equal? (get-environment-variable "HOP_ALLOC_COUNT") "0")))
+
+(define (emit-inline-alloc-pair port dst car-operand cdr-operand proc)
+  (let* ((target (result-register dst "x10"))
+         (back (new-local-label! "Lback"))
+         (slow (new-slow-stub!
+                (lambda ()
+                  (emit-load-operand port "x0" car-operand proc)
+                  (emit-load-operand port "x1" cdr-operand proc)
+                  (emit-asm-line port "    bl _hop_alloc_pair")
+                  (emit-asm-line port (string-append "    mov " target ", x0"))
+                  (emit-asm-line port (string-append "    b " back))))))
+    (emit-asm-line port "    adrp x9, _hop_runtime_heap@PAGE")
+    (emit-asm-line port "    add x9, x9, _hop_runtime_heap@PAGEOFF")
+    (emit-asm-line port "    ldp x10, x11, [x9, #24]")
+    (emit-asm-line port "    add x12, x10, #24")
+    (emit-asm-line port "    cmp x12, x11")
+    (emit-asm-line port (string-append "    b.hi " slow))
+    (emit-asm-line port "    str x12, [x9, #24]")
+    (when (alloc-count-enabled?)
+      (emit-asm-line port "    adrp x13, _hop_stat_inline_pairs@PAGE")
+      (emit-asm-line port "    add x13, x13, _hop_stat_inline_pairs@PAGEOFF")
+      (emit-asm-line port "    ldr x14, [x13]")
+      (emit-asm-line port "    add x14, x14, #1")
+      (emit-asm-line port "    str x14, [x13]"))
+    (emit-asm-line port (string-append "    mov x11, #" (number->string pair-object-type)))
+    (emit-asm-line port "    str x11, [x10]")
+    (emit-asm-line port (string-append "    str "
+                                       (operand-source port car-operand "x13" proc)
+                                       ", [x10, #8]"))
+    (emit-asm-line port (string-append "    str "
+                                       (operand-source port cdr-operand "x14" proc)
+                                       ", [x10, #16]"))
+    (emit-asm-line port (string-append "    add " target ", x10, #"
+                                       (number->string pair-tag)))
+    (emit-asm-line port (string-append back ":"))
+    (store-result port target dst proc)))
 
 ;; The fixnum test in front of a fused safe comparison. A literal operand that
 ;; is not a fixnum always fails, so it branches straight to the helper.
@@ -2516,10 +2570,7 @@
     ((alloc-box)
       (emit-runtime-unary-call port "_hop_alloc_box" (cadr instr) (caddr instr) proc))
     ((alloc-pair)
-      (emit-load-operand port "x0" (caddr instr) proc)
-      (emit-load-operand port "x1" (cadddr instr) proc)
-      (emit-asm-line port "    bl _hop_alloc_pair")
-      (emit-store-operand port "x0" (cadr instr) proc))
+      (emit-inline-alloc-pair port (cadr instr) (caddr instr) (cadddr instr) proc))
     ((alloc-vector)
       (emit-load-operand port "x0" (caddr instr) proc)
       (emit-load-operand port "x1" (cadddr instr) proc)
