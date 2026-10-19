@@ -165,6 +165,34 @@
   (check "car after car and pair? folded"
          (and (= 1 (count-primop cfg 'car)) (not (has-primop? cfg 'unsafe-car)))))
 
+;; (not (pair? x)) joins constants before branching; threading the join lets
+;; the pair? test reach the car it guards
+(define-program not-pair (x)
+  ((label e) (assign t (primop pair? x)) (if t a b)
+   (label a) (assign r #f) (goto j)
+   (label b) (assign r #t) (goto j)
+   (label j) (if r l1 l2)
+   (label l1) (return 0)
+   (label l2) (assign v (primop car x)) (return v)))
+(let ((cfg (sccp-cfg '(x) (build-cfg (cdr not-pair)))))
+  (check "car under (not (pair? x)) is unsafe"
+         (and (has-primop? cfg 'unsafe-car) (not (has-primop? cfg 'car)))))
+
+;; (and (pair? x) (pair? (cdr x))): the second test reaches the branch through
+;; a copy and a phi left with one argument
+(define-program and-pair (x)
+  ((label e) (assign t (primop pair? x)) (if t a b)
+   (label a) (assign d (primop cdr x)) (assign u (primop pair? d)) (assign r u) (goto j)
+   (label b) (assign r #f) (goto j)
+   (label j) (if r l1 l2)
+   (label l1) (assign d2 (primop cdr x)) (assign v (primop car d2)) (return v)
+   (label l2) (return 0)))
+(let ((cfg (sccp-cfg '(x) (build-cfg (cdr and-pair)))))
+  (check "accessors under (and (pair? x) (pair? (cdr x))) are unsafe"
+         (and (not (has-primop? cfg 'car)) (not (has-primop? cfg 'cdr))))
+  (check "the cdr under the and is not recomputed"
+         (= 1 (count-primop cfg 'unsafe-cdr))))
+
 ;; inside the then-arm of a null? test, a second null? test is true
 (define-program refine-null (x)
   ((label e) (assign t (primop null? x)) (if t l1 l2)
@@ -258,6 +286,21 @@
 (agrees? "steady-loop" steady-loop '((0) (20)))
 (agrees? "counting-loop" counting-loop '((0) (5) (6)))
 (agrees? "same-constant" same-constant '((#t) (#f)))
+
+;; a threaded edge into a block with a phi brings the value the join passed
+(define-program threaded-phi (a b c)
+  ((label e) (assign w 5) (assign t (primop < a b)) (if t l1 l2)
+   (label l1) (assign r #f) (goto j)
+   (label l2) (assign r c) (goto j)
+   (label j) (if r yes k)
+   (label yes) (assign w 7) (goto k)
+   (label k) (assign o (primop + w a)) (return o)))
+(let ((cfg (sccp-cfg '(a b c) (build-cfg (cdr threaded-phi)))))
+  (for-each (lambda (args)
+              (check "threaded-phi agrees"
+                     (equal? (run threaded-phi args (build-cfg (cdr threaded-phi)))
+                             (run threaded-phi args cfg))))
+            '((1 2 #t) (1 2 #f) (3 2 #t) (3 2 #f))))
 
 ;; Scalar replacement abort path. A phi carrying a record is split into field
 ;; phis; if an incoming value turns out not to be a pair (it cannot with a sound

@@ -91,28 +91,228 @@
       (hash-table-ref/default (analysis-values analysis) operand bot)
       (literal-value operand)))
 
+;;; --- Threading branches on constant phis ---
+;;;
+;;; (not e), (and a b) and (or a b) become a join block whose phi t collects
+;;; constants and test results, followed by (if t ...). A predecessor that
+;;; passes a constant into t already decides the branch, so its edge is moved
+;;; to the arm the constant selects. Then the then-arm of a pair? or null?
+;;; test reaches the code it guards without a join, and gets its pi node.
+;;;
+;;; Only a join block that holds nothing but the branch and the phi t, with t
+;;; read by nothing else, is threaded: it defines no value any moved edge
+;;; could miss. A join left with no predecessors is removed.
+
+(define (remove-slot vec slot)
+  (let loop ((i (- (vector-length vec) 1)) (acc '()))
+    (cond ((< i 0) (list->vector acc))
+          ((= i slot) (loop (- i 1) acc))
+          (else (loop (- i 1) (cons (vector-ref vec i) acc))))))
+
+(define (remove-index lst index)
+  (let loop ((lst lst) (i 0))
+    (cond ((null? lst) '())
+          ((= i index) (cdr lst))
+          (else (cons (car lst) (loop (cdr lst) (+ i 1)))))))
+
+(define (replace-phi-args! block phi args)
+  (set-ssa-block-phis!
+   block
+   (map (lambda (p) (if (eq? p phi) (make-phi (phi-dst p) (phi-var p) args) p))
+        (ssa-block-phis block))))
+
+;; Removes the edge from block p (at slot of b's predecessors) into block b.
+(define (drop-pred-slot! block slot)
+  (for-each (lambda (phi) (replace-phi-args! block phi (remove-slot (phi-args phi) slot)))
+            (ssa-block-phis block))
+  (set-ssa-block-preds! block (remove-index (ssa-block-preds block) slot)))
+
+;; Returns the blocks, possibly a new vector.
+(define (thread-constant-branches blocks)
+  (let ((defs (make-hash-table))
+        (uses (make-hash-table))
+        (dead (make-slots (vector-length blocks) #f)))
+    (define (note-use! v)
+      (when (symbol? v)
+        (hash-table-update!/default uses v (lambda (n) (+ n 1)) 0)))
+    (for-each-index
+     (lambda (b block)
+       (for-each (lambda (phi) (for-each note-use! (vector->list (phi-args phi))))
+                 (ssa-block-phis block))
+       (for-each (lambda (instr)
+                   (for-each note-use! (instr-uses instr))
+                   (when (eq? (car instr) 'assign)
+                     (hash-table-set! defs (cadr instr) (caddr instr))))
+                 (ssa-block-instrs block)))
+     blocks)
+    ;; (literal) when operand is a literal or a name defined as one, else #f
+    (define (constant-of operand)
+      (cond ((literal-expr? operand) (list operand))
+            ((and (symbol? operand)
+                  (literal-expr? (hash-table-ref/default defs operand '(none))))
+             (list (hash-table-ref defs operand)))
+            (else #f)))
+    ;; (then else) block indices when block j is a join to thread
+    (define (join-branch j)
+      (let* ((block (vector-ref blocks j))
+             (instrs (ssa-block-instrs block))
+             (phis (ssa-block-phis block))
+             (succs (ssa-block-succs block)))
+        (and (> j 0)
+             (not (vector-ref dead j))
+             (= (length instrs) 1)
+             (eq? (car (car instrs)) 'if)
+             (= (length phis) 1)
+             (eq? (cadr (car instrs)) (phi-dst (car phis)))
+             (= 1 (hash-table-ref/default uses (phi-dst (car phis)) 0))
+             (= (length succs) 2)
+             (not (= (car succs) (cadr succs)))
+             (not (memv j succs))
+             succs)))
+    ;; Points the end of block p, which goes to block from, at block to.
+    (define (retarget! p from to)
+      (let* ((block (vector-ref blocks p))
+             (instrs (ssa-block-instrs block))
+             (from-label (ssa-block-label (vector-ref blocks from)))
+             (to-label (ssa-block-label (vector-ref blocks to)))
+             (term (and (pair? instrs) (last instrs))))
+        (set-ssa-block-instrs!
+         block
+         (cond
+          ((and term (eq? (car term) 'goto))
+           (append (drop-right instrs 1) (list `(goto ,to-label))))
+          ((and term (eq? (car term) 'if))
+           (let ((relabel (lambda (l) (if (eq? l from-label) to-label l))))
+             (append (drop-right instrs 1)
+                     (list `(if ,(cadr term) ,(relabel (caddr term)) ,(relabel (cadddr term)))))))
+          ;; falls through into from
+          (else (append instrs (list `(goto ,to-label))))))
+        (set-ssa-block-succs! block (map (lambda (s) (if (= s from) to s))
+                                         (ssa-block-succs block)))))
+    ;; Moves one constant-passing edge into join j; #f when there is none.
+    (define (thread-one! j targets)
+      (let* ((block (vector-ref blocks j))
+             (phi (car (ssa-block-phis block))))
+        (let loop ((slot 0) (preds (ssa-block-preds block)))
+          (cond
+           ((null? preds) #f)
+           ((let* ((p (car preds))
+                   (c (constant-of (vector-ref (phi-args phi) slot)))
+                   (to (and c (if (car c) (car targets) (cadr targets))))
+                   (p-succs (and to (ssa-block-succs (vector-ref blocks p)))))
+              (and to
+                   (not (= p j))
+                   (not (memv to p-succs))
+                   (= 1 (length (filter (lambda (s) (= s j)) p-succs)))
+                   (begin
+                     (let* ((target (vector-ref blocks to))
+                            (j-slot (list-index (lambda (q) (= q j)) (ssa-block-preds target))))
+                       (for-each
+                        (lambda (tphi)
+                          (replace-phi-args!
+                           target tphi
+                           (vector-append (phi-args tphi)
+                                          (vector (vector-ref (phi-args tphi) j-slot)))))
+                        (ssa-block-phis target))
+                       (set-ssa-block-preds! target (append (ssa-block-preds target) (list p))))
+                     (retarget! p j to)
+                     (drop-pred-slot! block slot)
+                     #t))))
+           (else (loop (+ slot 1) (cdr preds)))))))
+    (define (kill-if-unreached! j)
+      (when (null? (ssa-block-preds (vector-ref blocks j)))
+        (vector-set! dead j #t)
+        (for-each
+         (lambda (s)
+           (let ((succ (vector-ref blocks s)))
+             (drop-pred-slot! succ (list-index (lambda (q) (= q j)) (ssa-block-preds succ)))))
+         (ssa-block-succs (vector-ref blocks j)))
+        (set-ssa-block-succs! (vector-ref blocks j) '())))
+    (let loop ()
+      (let ((changed #f))
+        (for-each-index
+         (lambda (j block)
+           (let ((targets (join-branch j)))
+             (when targets
+               (let thread ()
+                 (when (and (join-branch j) (thread-one! j targets))
+                   (set! changed #t)
+                   (thread)))
+               (kill-if-unreached! j))))
+         blocks)
+        (when changed (loop))))
+    (if (not (any (lambda (x) x) (vector->list dead)))
+        blocks
+        (let ((new-index (make-slots (vector-length blocks) #f))
+              (kept '()))
+          (for-each-index
+           (lambda (b block)
+             (unless (vector-ref dead b)
+               (vector-set! new-index b (length kept))
+               (set! kept (cons block kept))))
+           blocks)
+          (for-each
+           (lambda (block)
+             (set-ssa-block-preds! block (map (lambda (p) (vector-ref new-index p))
+                                              (ssa-block-preds block)))
+             (set-ssa-block-succs! block (map (lambda (s) (vector-ref new-index s))
+                                              (ssa-block-succs block))))
+           kept)
+          (list->vector (reverse kept))))))
+
+(define (thread-constant-branches-ssa ssa)
+  (make-ssa-proc (ssa-proc-params ssa) (thread-constant-branches (ssa-proc-blocks ssa))))
+
 ;;; --- Pi nodes ---
 
 ;; (kind subject) when block b ends in a branch on a pair? or null? test of a
-;; variable, where the test is computed in the same block.
-(define (branch-test blocks b)
+;; variable. The test may be computed in any block and reach the branch
+;; through copies and one-argument phis (what threading leaves of a join).
+;; defs maps each name to the block defining it, or a one-argument phi to the
+;; phi; the right-hand side is read as it is now, after earlier renaming.
+(define (branch-test blocks b defs)
   (let ((instrs (ssa-block-instrs (vector-ref blocks b))))
     (and (pair? instrs)
          (let ((term (last instrs)))
            (and (eq? (car term) 'if)
-                (symbol? (cadr term))
-                (let ((def (find (lambda (i) (eq? (instr-def i) (cadr term)))
-                                 instrs)))
-                  (and def
-                       (primop-rhs? (caddr def))
-                       (memq (cadr (caddr def)) '(pair? null?))
-                       (symbol? (caddr (caddr def)))
-                       (list (cadr (caddr def)) (caddr (caddr def))))))))))
+                (let follow ((v (cadr term)) (steps 0))
+                  (let* ((site (and (symbol? v) (< steps 64)
+                                    (hash-table-ref/default defs v #f)))
+                         (rhs (cond
+                               ((not site) #f)
+                               ((phi? site) (vector-ref (phi-args site) 0))
+                               (else
+                                (let ((def (find (lambda (i) (eq? (instr-def i) v))
+                                                 (ssa-block-instrs (vector-ref blocks site)))))
+                                  (and def (caddr def)))))))
+                    (cond
+                     ((symbol? rhs) (follow rhs (+ steps 1)))
+                     ((and (primop-rhs? rhs)
+                           (memq (cadr rhs) '(pair? null?))
+                           (symbol? (caddr rhs)))
+                      (list (cadr rhs) (caddr rhs)))
+                     (else #f)))))))))
+
+(define (branch-test-defs blocks)
+  (let ((defs (make-hash-table)))
+    (for-each-index
+     (lambda (b block)
+       (for-each (lambda (phi)
+                   (when (= (vector-length (phi-args phi)) 1)
+                     (hash-table-set! defs (phi-dst phi) phi)))
+                 (ssa-block-phis block))
+       (for-each (lambda (instr)
+                   (when (eq? (car instr) 'assign)
+                     (hash-table-set! defs (cadr instr) b)))
+                 (ssa-block-instrs block)))
+     blocks)
+    defs))
 
 ;; accessors? (default #t) also adds the pis of car and cdr (see
 ;; insert-accessor-pis!); the control leaves them out.
 (define (insert-pis! blocks . maybe-accessors?)
   (let* ((children (dominator-children (immediate-dominators blocks)))
+         (defs (branch-test-defs blocks))
          (counter 0))
     (define (fresh-name subject)
       (set! counter (+ counter 1))
@@ -142,7 +342,7 @@
        blocks))
     (for-each-index
      (lambda (b block)
-       (let ((test (branch-test blocks b)))
+       (let ((test (branch-test blocks b defs)))
          (when test
            (let* ((then-block (car (ssa-block-succs block)))
                   (target (vector-ref blocks then-block)))
@@ -222,7 +422,10 @@
                    (hash-table-set! roots dst rhs)
                    (loop (cdr instrs) (cons instr acc)))
                   ((and dst (pair? rhs) (eq? (car rhs) 'pi) (symbol? (caddr rhs)))
+                   ;; a branch's pi: the uses below already read dst, and so
+                   ;; do reused results that are copies of its subject
                    (hash-table-set! roots dst (caddr rhs))
+                   (rename! (caddr rhs) dst)
                    (loop (cdr instrs) (cons instr acc)))
                   (else (loop (cdr instrs) (cons instr acc))))))))
         (for-each
@@ -1221,7 +1424,8 @@
 ;; name: the procedure's label when its parameters have interprocedural seeds;
 ;; pis-done?: insert-pis! and the quote cells were handled by sccp-program.
 (define (run-sccp ssa remove-allocation? entry? name pis-done?)
-  (let ((blocks (ssa-proc-blocks ssa)))
+  (let* ((ssa (if pis-done? ssa (thread-constant-branches-ssa ssa)))
+         (blocks (ssa-proc-blocks ssa)))
     (unless pis-done? (insert-pis! blocks))
     (when (and entry? (not pis-done?))
       (reset-quote-cells!)
@@ -1310,9 +1514,10 @@
 ;; reference is a direct call. Returns the entry CFG and the other CFGs in the
 ;; order of specs.
 (define (sccp-program entry-cfg specs closed)
-  (let* ((entry-ssa (check-ssa (cfg->ssa '() entry-cfg)))
+  (let* ((entry-ssa (thread-constant-branches-ssa (check-ssa (cfg->ssa '() entry-cfg))))
          (ssas (map (lambda (spec)
-                      (check-ssa (cfg->ssa (cadr spec) (caddr spec))))
+                      (thread-constant-branches-ssa
+                       (check-ssa (cfg->ssa (cadr spec) (caddr spec)))))
                     specs))
          (names (map car specs)))
     (ipa-reset! closed names)
