@@ -193,6 +193,42 @@
   (check "the cdr under the and is not recomputed"
          (= 1 (count-primop cfg 'unsafe-cdr))))
 
+;; a list stays a list around a loop walking it, and the else-arm of its null?
+;; test has a pair
+(define-program list-walk (n)
+  ((label e) (assign c (primop cons n ())) (assign l (primop cons n c)) (assign s 0) (goto h)
+   (label h) (assign t (primop null? l)) (if t done body)
+   (label body) (assign a (primop car l)) (assign s (primop + s a))
+   (assign l (primop cdr l)) (goto h)
+   (label done) (return s)))
+(let ((cfg (optimize list-walk)))
+  (check "accessors in a list walk are unsafe"
+         (and (not (has-primop? cfg 'car)) (not (has-primop? cfg 'cdr))
+              (has-primop? cfg 'unsafe-car) (has-primop? cfg 'unsafe-cdr))))
+
+;; the same walk over a parameter knows nothing
+(define-program unknown-walk (l)
+  ((label e) (assign s 0) (goto h)
+   (label h) (assign t (primop null? l)) (if t done body)
+   (label body) (assign a (primop car l)) (assign s (primop + s a))
+   (assign l (primop cdr l)) (goto h)
+   (label done) (return s)))
+(check "car in a walk over an unknown value stays checked"
+       (has-primop? (optimize unknown-walk) 'car))
+
+;; the else-arm of pair? on a list has '()
+(define-program list-not-pair (n c)
+  ((label e) (if c l1 l2)
+   (label l1) (assign x (primop cons n ())) (goto j)
+   (label l2) (assign x ()) (goto j)
+   (label j) (assign t (primop pair? x)) (if t yes no)
+   (label yes) (return 1)
+   (label no) (assign u (primop null? x)) (if u l3 l4)
+   (label l3) (return 2)
+   (label l4) (return 3)))
+(check "null? in the else-arm of pair? on a list decided"
+       (not (memq 'l4 (labels (optimize list-not-pair)))))
+
 ;; inside the then-arm of a null? test, a second null? test is true
 (define-program refine-null (x)
   ((label e) (assign t (primop null? x)) (if t l1 l2)

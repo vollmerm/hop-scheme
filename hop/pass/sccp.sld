@@ -7,6 +7,7 @@
   ;;;   bot       not computed yet (the block or definition is unreachable)
   ;;;   (const c) the literal c; '() is (const ()), a quoted symbol is a const
   ;;;   pair      known to be a cons cell, contents unknown
+  ;;;   list      a proper list: '() or a pair whose cdr is a list
   ;;;   unknown   anything
   ;;;
   ;;; Values flow along executable edges only, so a branch on a known value
@@ -15,8 +16,10 @@
   ;;; Before the analysis, pi nodes record what a branch learned: at the head of
   ;;; the then-arm of (if (pair? x) ...) or (if (null? x) ...) a fresh name for
   ;;; x is bound by (pi pair x) or (pi null x), and uses of x dominated by that
-  ;;; arm read the fresh name. This only applies to arms with a single
-  ;;; predecessor, so the refinement is not lost to a join. Likewise a car or
+  ;;; arm read the fresh name; the else-arm gets (pi non-pair x) or
+  ;;; (pi non-null x), which turns a list into '() or a list pair. This only
+  ;;; applies to arms with a single predecessor, so the refinement is not lost
+  ;;; to a join. Likewise a car or
   ;;; cdr of x that succeeds is followed by (pi car x a) or (pi cdr x a): x is
   ;;; a pair whose car (cdr) is a, and a repeated accessor of x becomes a copy
   ;;; of a. Pi nodes become plain copies afterwards.
@@ -343,19 +346,20 @@
     (for-each-index
      (lambda (b block)
        (let ((test (branch-test blocks b defs)))
-         (when test
-           (let* ((then-block (car (ssa-block-succs block)))
-                  (target (vector-ref blocks then-block)))
-             (when (= (length (ssa-block-preds target)) 1)
-               (let* ((kind (car test))
-                      (subject (cadr test))
-                      (fresh (fresh-name subject)))
-                 (rename-uses! (subtree then-block) subject fresh)
-                 (set-ssa-block-instrs!
-                  target
-                  (cons `(assign ,fresh
-                                 (pi ,(if (eq? kind 'pair?) 'pair 'null) ,subject))
-                        (ssa-block-instrs target)))))))))
+         (when (and test (= (length (ssa-block-succs block)) 2))
+           (for-each
+            (lambda (arm kind)
+              (let ((target (vector-ref blocks arm))
+                    (subject (cadr test)))
+                (when (= (length (ssa-block-preds target)) 1)
+                  (let ((fresh (fresh-name subject)))
+                    (rename-uses! (subtree arm) subject fresh)
+                    (set-ssa-block-instrs!
+                     target
+                     (cons `(assign ,fresh (pi ,kind ,subject))
+                           (ssa-block-instrs target)))))))
+            (ssa-block-succs block)
+            (if (eq? (car test) 'pair?) '(pair non-pair) '(null non-null))))))
      blocks)
     (when (or (null? maybe-accessors?) (car maybe-accessors?))
       (insert-accessor-pis! blocks children fresh-name))))
@@ -454,10 +458,17 @@
 ;;;   const     a literal: number, boolean, '(), or (quote sym)
 ;;;   cons      a pair whose car and cdr are described by values, each with an
 ;;;             optional SSA name that is known to hold exactly that component
+;;;   list      a proper list of unknown elements: '() or list-pair, the cons
+;;;             whose car is unknown and whose cdr is list
+;;;
+;;; A join of '() or list with a cons whose cdrs end in '() or list is list,
+;;; so a loop walking down a list keeps knowing it has a list, and the
+;;; else-arm of its null? test knows it has a pair.
 ;;;
 ;;; The depth bound k limits how much structure a cons keeps: a cons keeps its
 ;;; children only while the nesting below it is at most k deep, and a cons
-;;; beyond that is crushed to pair-value (a pair of unknown contents). The
+;;; beyond that is crushed to list-pair when it is a list, and otherwise to
+;;; pair-value (a pair of unknown contents). The
 ;;; depth counts nesting along any path, through car or cdr alike. k = 0 keeps
 ;;; only "this is a pair", which is what the old unsafe-car/cdr pass knew.
 ;;; Component names are dropped at k = 0.
@@ -474,6 +485,7 @@
 (define unknown 'unknown)
 (define bot 'bot)
 (define (bot? v) (eq? v bot))
+(define list-value 'list)
 
 (define node-count 0)
 (define (next-id!) (set! node-count (+ node-count 1)) node-count)
@@ -502,6 +514,7 @@
 (define (value-id v)
   (cond ((eq? v unknown) 0)
         ((eq? v bot) -1)
+        ((eq? v list-value) -2)
         ((const? v) (vector-ref v 2))
         (else (vector-ref v 6))))
 
@@ -515,12 +528,18 @@
           node))))
 
 (define pair-value (make-cons-value unknown #f unknown #f))
+(define list-pair (make-cons-value unknown #f list-value #f))
+
+;; Is v '() or a pair whose cdrs end in '() or list (or nothing yet)?
+(define (list-shaped? v)
+  (or (bot? v) (nil? v) (eq? v list-value)
+      (and (cons? v) (list-shaped? (cons-cdr v)))))
 
 (define (limit v k)
   (cond
    ((not (cons? v)) v)
-   ((or (eq? v pair-value) (<= (cons-depth v) k)) v)
-   ((<= k 0) pair-value)
+   ((or (eq? v pair-value) (eq? v list-pair) (<= (cons-depth v) k)) v)
+   ((<= k 0) (if (list-shaped? v) list-pair pair-value))
    (else
     (make-cons-value (limit (cons-car v) (- k 1)) (cons-car-name v)
                      (limit (cons-cdr v) (- k 1)) (cons-cdr-name v)))))
@@ -535,6 +554,10 @@
                      (and (eq? (cons-car-name a) (cons-car-name b)) (cons-car-name a))
                      (join (cons-cdr a) (cons-cdr b))
                      (and (eq? (cons-cdr-name a) (cons-cdr-name b)) (cons-cdr-name a))))
+   ((and (or (nil? a) (eq? a list-value) (cons? a))
+         (or (nil? b) (eq? b list-value) (cons? b))
+         (list-shaped? a) (list-shaped? b))
+    list-value)
    (else unknown)))
 
 (define (strip-names v)
@@ -560,6 +583,8 @@
    ((cons? v) (if (eq? which 'car)
                   (cons (cons-car v) (cons-car-name v))
                   (cons (cons-cdr v) (cons-cdr-name v))))
+   ;; an accessor on '() fails, so a cdr that returns is the cdr of a list pair
+   ((and (eq? v list-value) (eq? which 'cdr)) (cons list-value #f))
    (else (cons unknown #f))))
 
 ;; names holds each operand's variable name, or #f for a literal.
@@ -595,7 +620,7 @@
    ((and (eq? op 'symbol?) (= (length args) 1))
     (cond ((const? (car args))
            (bool-value (quoted-symbol-expr? (const-value (car args)))))
-          ((cons? (car args)) (bool-value #f))
+          ((or (cons? (car args)) (eq? (car args) list-value)) (bool-value #f))
           (else unknown)))
    (else unknown)))
 
@@ -614,11 +639,15 @@
   (cond
    ((bot? v) bot)
    ((eq? kind 'pair)
-    (cond ((const? v) bot) ((cons? v) v) (else pair-value)))
-   (else
+    (cond ((const? v) bot) ((cons? v) v) ((eq? v list-value) list-pair) (else pair-value)))
+   ((eq? kind 'null)
     (cond ((nil? v) v)
           ((or (const? v) (cons? v)) bot)
-          (else nil-value)))))
+          (else nil-value)))
+   ((eq? kind 'non-pair)
+    (cond ((cons? v) bot) ((eq? v list-value) nil-value) (else v)))
+   (else
+    (cond ((nil? v) bot) ((eq? v list-value) list-pair) (else v)))))
 
 ;; Values the pass has learned for hoisted quote cells (hop_q_...), which are
 ;; written once, by the program's entry code, before any procedure runs. Cleared
