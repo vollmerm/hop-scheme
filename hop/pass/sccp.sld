@@ -16,8 +16,10 @@
   ;;; the then-arm of (if (pair? x) ...) or (if (null? x) ...) a fresh name for
   ;;; x is bound by (pi pair x) or (pi null x), and uses of x dominated by that
   ;;; arm read the fresh name. This only applies to arms with a single
-  ;;; predecessor, so the refinement is not lost to a join. Pi nodes become
-  ;;; plain copies afterwards.
+  ;;; predecessor, so the refinement is not lost to a join. Likewise a car or
+  ;;; cdr of x that succeeds is followed by (pi car x a) or (pi cdr x a): x is
+  ;;; a pair whose car (cdr) is a, and a repeated accessor of x becomes a copy
+  ;;; of a. Pi nodes become plain copies afterwards.
   ;;;
   ;;; The rewrite replaces constant definitions with literals, makes car/cdr of
   ;;; a known pair unsafe, turns decided branches into jumps, drops dead edges
@@ -107,9 +109,14 @@
                        (symbol? (caddr (caddr def)))
                        (list (cadr (caddr def)) (caddr (caddr def))))))))))
 
-(define (insert-pis! blocks)
+;; accessors? (default #t) also adds the pis of car and cdr (see
+;; insert-accessor-pis!); the control leaves them out.
+(define (insert-pis! blocks . maybe-accessors?)
   (let* ((children (dominator-children (immediate-dominators blocks)))
          (counter 0))
+    (define (fresh-name subject)
+      (set! counter (+ counter 1))
+      (symbol-append subject "%pi" (number->string counter)))
     (define (subtree b)
       (cons b (append-map subtree (vector-ref children b))))
     (define (rename-uses! members from to)
@@ -142,16 +149,98 @@
              (when (= (length (ssa-block-preds target)) 1)
                (let* ((kind (car test))
                       (subject (cadr test))
-                      (fresh (begin (set! counter (+ counter 1))
-                                    (symbol-append subject "%pi"
-                                                   (number->string counter)))))
+                      (fresh (fresh-name subject)))
                  (rename-uses! (subtree then-block) subject fresh)
                  (set-ssa-block-instrs!
                   target
                   (cons `(assign ,fresh
                                  (pi ,(if (eq? kind 'pair?) 'pair 'null) ,subject))
                         (ssa-block-instrs target)))))))))
-     blocks)))
+     blocks)
+    (when (or (null? maybe-accessors?) (car maybe-accessors?))
+      (insert-accessor-pis! blocks children fresh-name))))
+
+;; After (assign a (primop car x)) succeeds, x is a pair whose car is a (a
+;; failed accessor does not return). The instruction is followed by
+;; (assign x' (pi car x a)), and the uses of x it dominates read x': the rest
+;; of the block, the blocks it dominates, and phi arguments on edges leaving
+;; the block. A later (cdr x') is then unsafe.
+;;
+;; Pairs are immutable, so a later (car y) of the same value as x, where y is
+;; x or a pi or copy of it, becomes a copy of a, and its uses read a's newest
+;; name, so they see what has been learned about a since (car x) ran.
+;;
+;; Walks the dominator tree, so what a block learns is seen only below it.
+(define (insert-accessor-pis! blocks children fresh-name)
+  (let ((renames (make-hash-table))     ; name -> the name its uses read now
+        (roots (make-hash-table))       ; pi or copy -> the name it copies
+        (available (make-hash-table equal?)))  ; (car . root) -> its result
+    (define (current v)
+      (let ((next (hash-table-ref/default renames v #f)))
+        (if next (current next) v)))
+    (define (root v)
+      (let ((next (hash-table-ref/default roots v #f)))
+        (if next (root next) v)))
+    (define (visit! b)
+      (let ((block (vector-ref blocks b))
+            (renamed '())
+            (made-available '()))
+        (define (rename! from to)
+          (hash-table-set! renames from to)
+          (set! renamed (cons from renamed)))
+        ;; in order: each rename applies to the instructions after it
+        (set-ssa-block-instrs!
+         block
+         (let loop ((instrs (ssa-block-instrs block)) (acc '()))
+           (if (null? instrs)
+               (reverse acc)
+               (let* ((instr (map-instr-uses current (car instrs)))
+                      (dst (instr-def instr))
+                      (rhs (instr-rhs instr)))
+                 (cond
+                  ((and (primop-rhs? rhs)
+                        (accessor-kind (cadr rhs))
+                        (= (length rhs) 3)
+                        (symbol? (caddr rhs)))
+                   (let* ((which (accessor-kind (cadr rhs)))
+                          (subject (caddr rhs))
+                          (key (cons which (root subject)))
+                          (earlier (hash-table-ref/default available key #f)))
+                     (if earlier
+                         (begin
+                           (rename! dst earlier)
+                           (loop (cdr instrs) (cons `(assign ,dst ,(current earlier)) acc)))
+                         (let ((fresh (fresh-name subject)))
+                           (hash-table-set! available key dst)
+                           (set! made-available (cons key made-available))
+                           (hash-table-set! roots fresh subject)
+                           (rename! subject fresh)
+                           (loop (cdr instrs)
+                                 (cons `(assign ,fresh (pi ,which ,subject ,dst))
+                                       (cons instr acc)))))))
+                  ((and dst (symbol? rhs))
+                   (hash-table-set! roots dst rhs)
+                   (loop (cdr instrs) (cons instr acc)))
+                  ((and dst (pair? rhs) (eq? (car rhs) 'pi) (symbol? (caddr rhs)))
+                   (hash-table-set! roots dst (caddr rhs))
+                   (loop (cdr instrs) (cons instr acc)))
+                  (else (loop (cdr instrs) (cons instr acc))))))))
+        (for-each
+         (lambda (s)
+           (let ((succ (vector-ref blocks s)))
+             (for-each
+              (lambda (phi)
+                (for-each-phi-arg
+                 (lambda (slot arg pred)
+                   (when (and (= pred b) (symbol? arg))
+                     (vector-set! (phi-args phi) slot (current arg))))
+                 succ phi))
+              (ssa-block-phis succ))))
+         (ssa-block-succs block))
+        (for-each visit! (vector-ref children b))
+        (for-each (lambda (name) (hash-table-delete! renames name)) renamed)
+        (for-each (lambda (key) (hash-table-delete! available key)) made-available)))
+    (visit! 0)))
 
 ;;; --- Lattice ---
 ;;;
@@ -306,6 +395,17 @@
           ((cons? (car args)) (bool-value #f))
           (else unknown)))
    (else unknown)))
+
+;; (pi car x a) or (pi cdr x a): x is a pair whose car (or cdr) is a, with
+;; value av. A non-pair x would have stopped the accessor, so nothing flows.
+(define (eval-accessor-pi which v name av)
+  (if (or (bot? v) (bot? av) (const? v))
+      bot
+      (let ((other (component v (if (eq? which 'car) 'cdr 'car))))
+        (limit (if (eq? which 'car)
+                   (make-cons-value av name (car other) (cdr other))
+                   (make-cons-value (car other) (cdr other) av name))
+               shape-depth))))
 
 (define (eval-pi kind v)
   (cond
@@ -766,6 +866,9 @@
         (hash-table-ref/default quote-cell-values (cadr rhs) unknown))
        ((and ipa-active (pair? rhs) (eq? (car rhs) 'direct-call))
         (hash-table-ref/default ipa-returns (cadr rhs) unknown))
+       ((and (pair? rhs) (eq? (car rhs) 'pi) (pair? (cdddr rhs)))
+        (eval-accessor-pi (cadr rhs) (value-of (caddr rhs))
+                          (cadddr rhs) (value-of (cadddr rhs))))
        ((and (pair? rhs) (eq? (car rhs) 'pi))
         (eval-pi (cadr rhs) (value-of (caddr rhs))))
        (else unknown)))
@@ -1247,7 +1350,7 @@
 ;; so nothing is learned about values and no branch or block is removed.
 (define (control-ssa ssa)
   (let ((blocks (ssa-proc-blocks ssa)))
-    (insert-pis! blocks)
+    (insert-pis! blocks #f)
     (for-each-index
      (lambda (b block)
        (set-ssa-block-instrs!

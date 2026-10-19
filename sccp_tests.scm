@@ -106,6 +106,65 @@
   ((label e) (assign v (primop car x)) (return v)))
 (check "untested car stays safe" (has-primop? (optimize plain-car) 'car))
 
+(define (count-primop cfg op)
+  (length (filter (lambda (instr)
+                    (and (eq? (car instr) 'assign)
+                         (pair? (caddr instr))
+                         (equal? (take (caddr instr) 2) `(primop ,op))))
+                  (all-instrs cfg))))
+
+;; after a car succeeds its operand is a pair: the cdr is unsafe
+(define-program car-then-cdr (x)
+  ((label e) (assign a (primop car x)) (assign d (primop cdr x))
+   (assign r (primop + a d)) (return r)))
+(let ((cfg (optimize car-then-cdr)))
+  (check "first car stays safe" (has-primop? cfg 'car))
+  (check "cdr after car is unsafe" (= 1 (count-primop cfg 'unsafe-cdr)))
+  (check "no safe cdr after car" (not (has-primop? cfg 'cdr))))
+
+;; a second car of the same pair reads the first one's result
+(define-program car-twice (x)
+  ((label e) (assign a (primop car x)) (assign b (primop car x))
+   (assign r (primop + a b)) (return r)))
+(let ((cfg (optimize car-twice)))
+  (check "repeated car folded" (= 1 (count-primop cfg 'car)))
+  (check "repeated car not reloaded" (not (has-primop? cfg 'unsafe-car)))
+  (check "sum reads the first car"
+         (any (lambda (instr)
+                (let ((rhs (and (eq? (car instr) 'assign) (caddr instr))))
+                  (and (pair? rhs) (equal? (take rhs 2) '(primop +))
+                       (eq? (caddr rhs) (cadddr rhs)))))
+              (all-instrs cfg))))
+
+;; ... also in a block the first car dominates, and what is learned about its
+;; result since (here: it is a pair) carries over to the reused name
+(define-program cdr-dominates (x c)
+  ((label e) (assign d (primop cdr x)) (assign a (primop car d)) (if c l1 l2)
+   (label l1) (assign d2 (primop cdr x)) (assign dd (primop cdr d2)) (return dd)
+   (label l2) (return a)))
+(let ((cfg (optimize cdr-dominates)))
+  (check "dominated cdr folded" (= 1 (count-primop cfg 'cdr)))
+  (check "cdr of a reused car-checked name is unsafe"
+         (= 1 (count-primop cfg 'unsafe-cdr))))
+
+;; ... but not from a sibling arm, which need not have run
+(define-program car-siblings (x c)
+  ((label e) (if c l1 l2)
+   (label l1) (assign a (primop car x)) (return a)
+   (label l2) (assign b (primop car x)) (return b)))
+(check "car in a sibling arm stays safe"
+       (= 2 (count-primop (optimize car-siblings) 'car)))
+
+;; the reuse sees through the pi of a pair? test
+(define-program car-then-test (x)
+  ((label e) (assign a (primop car x)) (assign t (primop pair? x)) (if t l1 l2)
+   (label l1) (assign b (primop car x)) (return b)
+   (label l2) (return 0)))
+(let ((cfg (optimize car-then-test)))
+  (check "pair? after car decided" (not (memq 'l2 (labels cfg))))
+  (check "car after car and pair? folded"
+         (and (= 1 (count-primop cfg 'car)) (not (has-primop? cfg 'unsafe-car)))))
+
 ;; inside the then-arm of a null? test, a second null? test is true
 (define-program refine-null (x)
   ((label e) (assign t (primop null? x)) (if t l1 l2)
@@ -266,6 +325,8 @@
   (check "control keeps the dead arm" (memq 'l1 (labels cfg))))
 (let ((cfg (control refine-pair)))
   (check "control keeps the safe car" (has-primop? cfg 'car)))
+(let ((cfg (control car-twice)))
+  (check "control keeps both cars" (= 2 (count-primop cfg 'car))))
 (for-each
  (lambda (args)
    (check "control agrees"
