@@ -45,8 +45,8 @@
           control-ssa)
   (import (scheme base)
           (hop compat)
-          (scheme cxr)
-          (only (srfi 1) any drop-right filter find fold last list-index map-in-order)
+          (only (srfi 1) any drop-right filter filter-map find fold fold-right iota last
+                list-index map-in-order)
           (scheme time)
           (scheme write)
           (srfi 69)
@@ -68,10 +68,9 @@
                parts))))
 
 (define (instr-rhs instr)
-  (and (eq? (car instr) 'assign) (caddr instr)))
-
-(define (primop-rhs? rhs)
-  (and (pair? rhs) (eq? (car rhs) 'primop)))
+  (match instr
+    (('assign _ rhs) rhs)
+    (_ #f)))
 
 ;; 'car or 'cdr when op is a safe or unsafe accessor, else #f.
 (define (accessor-kind op)
@@ -83,14 +82,21 @@
 (define (unsafe-accessor kind)
   (if (eq? kind 'car) 'unsafe-car 'unsafe-cdr))
 
+;; (which . x) when rhs is a car or cdr, safe or not, of the variable x;
+;; which is car or cdr.
+(define (accessor-read rhs)
+  (match rhs
+    (('primop (= accessor-kind (? symbol? which)) (? symbol? x)) (cons which x))
+    (_ #f)))
+
 ;; Calls (proc slot arg pred) for each argument of phi, where pred is the
 ;; index of the predecessor block that argument flows in from.
 (define (for-each-phi-arg proc block phi)
-  (let ((args (phi-args phi)))
-    (let loop ((slot 0) (preds (ssa-block-preds block)))
-      (unless (null? preds)
-        (proc slot (vector-ref args slot) (car preds))
-        (loop (+ slot 1) (cdr preds))))))
+  (let ((args (phi-args phi))
+        (preds (ssa-block-preds block)))
+    (for-each (lambda (slot pred) (proc slot (vector-ref args slot) pred))
+              (iota (length preds))
+              preds)))
 
 ;; The value of an operand: a name's analysis value (bot when never computed),
 ;; or the constant of a literal.
@@ -119,9 +125,9 @@
 
 (define (remove-index lst index)
   (let loop ((lst lst) (i 0))
-    (cond ((null? lst) '())
-          ((= i index) (cdr lst))
-          (else (cons (car lst) (loop (cdr lst) (+ i 1)))))))
+    (match lst
+      (() '())
+      ((x . rest) (if (= i index) rest (cons x (loop rest (+ i 1))))))))
 
 (define (replace-phi-args! block phi args)
   (set-ssa-block-phis!
@@ -149,8 +155,9 @@
                  (ssa-block-phis block))
        (for-each (lambda (instr)
                    (for-each note-use! (instr-uses instr))
-                   (when (eq? (car instr) 'assign)
-                     (hash-table-set! defs (cadr instr) (caddr instr))))
+                   (match instr
+                     (('assign dst rhs) (hash-table-set! defs dst rhs))
+                     (_ #f)))
                  (ssa-block-instrs block)))
      blocks)
     ;; (literal) when operand is a literal or a name defined as one, else #f
@@ -162,71 +169,77 @@
             (else #f)))
     ;; (then else) block indices when block j is a join to thread
     (define (join-branch j)
-      (let* ((block (vector-ref blocks j))
-             (instrs (ssa-block-instrs block))
-             (phis (ssa-block-phis block))
-             (succs (ssa-block-succs block)))
+      (let ((block (vector-ref blocks j)))
         (and (> j 0)
              (not (vector-ref dead j))
-             (= (length instrs) 1)
-             (eq? (car (car instrs)) 'if)
-             (= (length phis) 1)
-             (eq? (cadr (car instrs)) (phi-dst (car phis)))
-             (= 1 (hash-table-ref/default uses (phi-dst (car phis)) 0))
-             (= (length succs) 2)
-             (not (= (car succs) (cadr succs)))
-             (not (memv j succs))
-             succs)))
+             (match (list (ssa-block-phis block)
+                          (ssa-block-instrs block)
+                          (ssa-block-succs block))
+               (((phi) (('if test _ _)) (and succs (then-block else-block)))
+                (and (eq? test (phi-dst phi))
+                     (= 1 (hash-table-ref/default uses test 0))
+                     (not (= then-block else-block))
+                     (not (memv j succs))
+                     succs))
+               (_ #f)))))
     ;; Points the end of block p, which goes to block from, at block to.
     (define (retarget! p from to)
       (let* ((block (vector-ref blocks p))
              (instrs (ssa-block-instrs block))
              (from-label (ssa-block-label (vector-ref blocks from)))
-             (to-label (ssa-block-label (vector-ref blocks to)))
-             (term (and (pair? instrs) (last instrs))))
+             (to-label (ssa-block-label (vector-ref blocks to))))
+        (define (relabel l) (if (eq? l from-label) to-label l))
+        (define (replace-terminator term)
+          (append (drop-right instrs 1) (list term)))
         (set-ssa-block-instrs!
          block
-         (cond
-          ((and term (eq? (car term) 'goto))
-           (append (drop-right instrs 1) (list `(goto ,to-label))))
-          ((and term (eq? (car term) 'if))
-           (let ((relabel (lambda (l) (if (eq? l from-label) to-label l))))
-             (append (drop-right instrs 1)
-                     (list `(if ,(cadr term) ,(relabel (caddr term)) ,(relabel (cadddr term)))))))
-          ;; falls through into from
-          (else (append instrs (list `(goto ,to-label))))))
+         (match (and (pair? instrs) (last instrs))
+           (('goto _) (replace-terminator `(goto ,to-label)))
+           (('if test then-label else-label)
+            (replace-terminator `(if ,test ,(relabel then-label) ,(relabel else-label))))
+           ;; falls through into from
+           (_ (append instrs (list `(goto ,to-label))))))
         (set-ssa-block-succs! block (map (lambda (s) (if (= s from) to s))
                                          (ssa-block-succs block)))))
+    ;; The arm of targets, a (then else) pair of block indices, that the
+    ;; phi argument arg selects; #f when arg is not a constant.
+    (define (selected-arm arg targets)
+      (match (list (constant-of arg) targets)
+        (((value) (then-block else-block)) (if value then-block else-block))
+        (_ #f)))
+    ;; Gives block p an edge to block to that carries what its edge into join
+    ;; j carried into to's phis.
+    (define (add-edge-from-join! p j to)
+      (let* ((target (vector-ref blocks to))
+             (j-slot (list-index (lambda (q) (= q j)) (ssa-block-preds target))))
+        (for-each
+         (lambda (tphi)
+           (replace-phi-args!
+            target tphi
+            (vector-append (phi-args tphi)
+                           (vector (vector-ref (phi-args tphi) j-slot)))))
+         (ssa-block-phis target))
+        (set-ssa-block-preds! target (append (ssa-block-preds target) (list p)))))
     ;; Moves one constant-passing edge into join j; #f when there is none.
     (define (thread-one! j targets)
-      (let* ((block (vector-ref blocks j))
-             (phi (car (ssa-block-phis block))))
+      (match-let* ((block (vector-ref blocks j))
+                   ((phi) (ssa-block-phis block)))
         (let loop ((slot 0) (preds (ssa-block-preds block)))
-          (cond
-           ((null? preds) #f)
-           ((let* ((p (car preds))
-                   (c (constant-of (vector-ref (phi-args phi) slot)))
-                   (to (and c (if (car c) (car targets) (cadr targets))))
-                   (p-succs (and to (ssa-block-succs (vector-ref blocks p)))))
-              (and to
-                   (not (= p j))
-                   (not (memv to p-succs))
-                   (= 1 (length (filter (lambda (s) (= s j)) p-succs)))
+          (match preds
+            (() #f)
+            ((p . rest)
+             (let* ((to (selected-arm (vector-ref (phi-args phi) slot) targets))
+                    (p-succs (ssa-block-succs (vector-ref blocks p))))
+               (if (and to
+                        (not (= p j))
+                        (not (memv to p-succs))
+                        (= 1 (length (filter (lambda (s) (= s j)) p-succs))))
                    (begin
-                     (let* ((target (vector-ref blocks to))
-                            (j-slot (list-index (lambda (q) (= q j)) (ssa-block-preds target))))
-                       (for-each
-                        (lambda (tphi)
-                          (replace-phi-args!
-                           target tphi
-                           (vector-append (phi-args tphi)
-                                          (vector (vector-ref (phi-args tphi) j-slot)))))
-                        (ssa-block-phis target))
-                       (set-ssa-block-preds! target (append (ssa-block-preds target) (list p))))
+                     (add-edge-from-join! p j to)
                      (retarget! p j to)
                      (drop-pred-slot! block slot)
-                     #t))))
-           (else (loop (+ slot 1) (cdr preds)))))))
+                     #t)
+                   (loop (+ slot 1) rest))))))))
     (define (kill-if-unreached! j)
       (when (null? (ssa-block-preds (vector-ref blocks j)))
         (vector-set! dead j #t)
@@ -279,27 +292,26 @@
 ;; defs maps each name to the block defining it, or a one-argument phi to the
 ;; phi; the right-hand side is read as it is now, after earlier renaming.
 (define (branch-test blocks b defs)
-  (let ((instrs (ssa-block-instrs (vector-ref blocks b))))
-    (and (pair? instrs)
-         (let ((term (last instrs)))
-           (and (eq? (car term) 'if)
-                (let follow ((v (cadr term)) (steps 0))
-                  (let* ((site (and (symbol? v) (< steps 64)
-                                    (hash-table-ref/default defs v #f)))
-                         (rhs (cond
-                               ((not site) #f)
-                               ((phi? site) (vector-ref (phi-args site) 0))
-                               (else
-                                (let ((def (find (lambda (i) (eq? (instr-def i) v))
-                                                 (ssa-block-instrs (vector-ref blocks site)))))
-                                  (and def (caddr def)))))))
-                    (cond
-                     ((symbol? rhs) (follow rhs (+ steps 1)))
-                     ((and (primop-rhs? rhs)
-                           (memq (cadr rhs) '(pair? null?))
-                           (symbol? (caddr rhs)))
-                      (list (cadr rhs) (caddr rhs)))
-                     (else #f)))))))))
+  ;; The right-hand side that defines v, or #f when there is none to follow.
+  (define (defining-rhs v)
+    (match (hash-table-ref/default defs v #f)
+      (#f #f)
+      ((? phi? phi) (vector-ref (phi-args phi) 0))
+      (site (let ((def (find (lambda (i) (eq? (instr-def i) v))
+                             (ssa-block-instrs (vector-ref blocks site)))))
+              (and def (instr-rhs def))))))
+  (match (ssa-block-instrs (vector-ref blocks b))
+    (() #f)
+    (instrs
+     (match (last instrs)
+       (('if test _ _)
+        (let follow ((v test) (steps 0))
+          (match (and (symbol? v) (< steps 64) (defining-rhs v))
+            ((? symbol? source) (follow source (+ steps 1)))
+            (('primop (and op (or 'pair? 'null?)) (? symbol? subject))
+             (list op subject))
+            (_ #f))))
+       (_ #f)))))
 
 (define (branch-test-defs blocks)
   (let ((defs (make-hash-table)))
@@ -310,15 +322,15 @@
                      (hash-table-set! defs (phi-dst phi) phi)))
                  (ssa-block-phis block))
        (for-each (lambda (instr)
-                   (when (eq? (car instr) 'assign)
-                     (hash-table-set! defs (cadr instr) b)))
+                   (let ((dst (instr-def instr)))
+                     (when dst (hash-table-set! defs dst b))))
                  (ssa-block-instrs block)))
      blocks)
     defs))
 
-;; accessors? (default #t) also adds the pis of car and cdr (see
-;; insert-accessor-pis!); the control leaves them out.
-(define (insert-pis! blocks . maybe-accessors?)
+;; accessors? also adds the pis of car and cdr (see insert-accessor-pis!);
+;; the control leaves them out.
+(define (insert-pis! blocks accessors?)
   (let* ((children (dominator-children (immediate-dominators blocks)))
          (defs (branch-test-defs blocks))
          (counter 0))
@@ -350,23 +362,23 @@
        blocks))
     (for-each-index
      (lambda (b block)
-       (let ((test (branch-test blocks b defs)))
-         (when (and test (= (length (ssa-block-succs block)) 2))
-           (for-each
-            (lambda (arm kind)
-              (let ((target (vector-ref blocks arm))
-                    (subject (cadr test)))
-                (when (= (length (ssa-block-preds target)) 1)
-                  (let ((fresh (fresh-name subject)))
-                    (rename-uses! (subtree arm) subject fresh)
-                    (set-ssa-block-instrs!
-                     target
-                     (cons `(assign ,fresh (pi ,kind ,subject))
-                           (ssa-block-instrs target)))))))
-            (ssa-block-succs block)
-            (if (eq? (car test) 'pair?) '(pair non-pair) '(null non-null))))))
+       (match (list (branch-test blocks b defs) (ssa-block-succs block))
+         (((test-op subject) (_ _))
+          (for-each
+           (lambda (arm kind)
+             (let ((target (vector-ref blocks arm)))
+               (when (= (length (ssa-block-preds target)) 1)
+                 (let ((fresh (fresh-name subject)))
+                   (rename-uses! (subtree arm) subject fresh)
+                   (set-ssa-block-instrs!
+                    target
+                    (cons `(assign ,fresh (pi ,kind ,subject))
+                          (ssa-block-instrs target)))))))
+           (ssa-block-succs block)
+           (if (eq? test-op 'pair?) '(pair non-pair) '(null non-null))))
+         (_ #f)))
      blocks)
-    (when (or (null? maybe-accessors?) (car maybe-accessors?))
+    (when accessors?
       (insert-accessor-pis! blocks children fresh-name))))
 
 ;; After (assign a (primop car x)) succeeds, x is a pair whose car is a (a
@@ -401,42 +413,36 @@
         (set-ssa-block-instrs!
          block
          (let loop ((instrs (ssa-block-instrs block)) (acc '()))
-           (if (null? instrs)
-               (reverse acc)
-               (let* ((instr (map-instr-uses current (car instrs)))
-                      (dst (instr-def instr))
-                      (rhs (instr-rhs instr)))
-                 (cond
-                  ((and (primop-rhs? rhs)
-                        (accessor-kind (cadr rhs))
-                        (= (length rhs) 3)
-                        (symbol? (caddr rhs)))
-                   (let* ((which (accessor-kind (cadr rhs)))
-                          (subject (caddr rhs))
-                          (key (cons which (root subject)))
+           (match instrs
+             (() (reverse acc))
+             ((next . rest)
+              (let ((instr (map-instr-uses current next)))
+                (match instr
+                  (('assign dst (= accessor-read (which . subject)))
+                   (let* ((key (cons which (root subject)))
                           (earlier (hash-table-ref/default available key #f)))
                      (if earlier
                          (begin
                            (rename! dst earlier)
-                           (loop (cdr instrs) (cons `(assign ,dst ,(current earlier)) acc)))
+                           (loop rest (cons `(assign ,dst ,(current earlier)) acc)))
                          (let ((fresh (fresh-name subject)))
                            (hash-table-set! available key dst)
                            (set! made-available (cons key made-available))
                            (hash-table-set! roots fresh subject)
                            (rename! subject fresh)
-                           (loop (cdr instrs)
+                           (loop rest
                                  (cons `(assign ,fresh (pi-field ,which ,subject ,dst))
                                        (cons instr acc)))))))
-                  ((and dst (symbol? rhs))
-                   (hash-table-set! roots dst rhs)
-                   (loop (cdr instrs) (cons instr acc)))
-                  ((and dst (pair? rhs) (eq? (car rhs) 'pi) (symbol? (caddr rhs)))
+                  (('assign dst (? symbol? source))
+                   (hash-table-set! roots dst source)
+                   (loop rest (cons instr acc)))
+                  (('assign dst ('pi _ (? symbol? subject)))
                    ;; a branch's pi: the uses below already read dst, and so
                    ;; do reused results that are copies of its subject
-                   (hash-table-set! roots dst (caddr rhs))
-                   (rename! (caddr rhs) dst)
-                   (loop (cdr instrs) (cons instr acc)))
-                  (else (loop (cdr instrs) (cons instr acc))))))))
+                   (hash-table-set! roots dst subject)
+                   (rename! subject dst)
+                   (loop rest (cons instr acc)))
+                  (_ (loop rest (cons instr acc)))))))))
         (for-each
          (lambda (s)
            (let ((succ (vector-ref blocks s)))
@@ -588,66 +594,72 @@
 
 (define (bool-value b) (const (if b #t #f)))
 
-(define foldable-arithmetic
-  `((+ . ,+) (- . ,-) (* . ,*) (= . ,=) (< . ,<) (> . ,>)))
+;; The host procedure that folds the arithmetic primop op, or #f.
+(define (arithmetic-procedure op)
+  (match (assq op `((+ . ,+) (- . ,-) (* . ,*) (= . ,=) (< . ,<) (> . ,>)))
+    ((_ . proc) proc)
+    (#f #f)))
 
-;; The component of a pair value, as (value . name).
+;; The car or cdr (which) of a pair value, as two values: the component's
+;; value and the SSA name known to hold it, or #f.
 (define (component v which)
   (cond
-   ((bot? v) (cons bot #f))
+   ((bot? v) (values bot #f))
    ((cons? v) (if (eq? which 'car)
-                  (cons (cons-car v) (cons-car-name v))
-                  (cons (cons-cdr v) (cons-cdr-name v))))
+                  (values (cons-car v) (cons-car-name v))
+                  (values (cons-cdr v) (cons-cdr-name v))))
    ;; an accessor on '() fails, so a cdr that returns is the cdr of a list pair
-   ((and (eq? v list-value) (eq? which 'cdr)) (cons list-value #f))
-   (else (cons unknown #f))))
+   ((and (eq? v list-value) (eq? which 'cdr)) (values list-value #f))
+   (else (values unknown #f))))
+
+(define (number-const? v)
+  (and (const? v) (number? (const-value v))))
 
 ;; names holds each operand's variable name, or #f for a literal.
 (define (eval-primop op args names)
-  (cond
-   ((any bot? args) bot)
-   ((and (eq? op 'cons) (= (length args) 2))
-    (let ((an (and (not (const? (car args))) (car names)))
-          (dn (and (not (const? (cadr args))) (cadr names))))
-      (limit (make-cons-value (car args) an (cadr args) dn) shape-depth)))
-   ((and (accessor-kind op) (= (length args) 1))
-    (car (component (car args) (accessor-kind op))))
-   ((and (assq op foldable-arithmetic) (= (length args) 2))
-    (if (and (const? (car args)) (const? (cadr args))
-             (number? (const-value (car args)))
-             (number? (const-value (cadr args))))
-        (let ((result ((cdr (assq op foldable-arithmetic))
-                       (const-value (car args)) (const-value (cadr args)))))
-          (if (boolean? result) (bool-value result) (const result)))
-        unknown))
-   ((and (eq? op 'eq?) (= (length args) 2))
-    (if (and (const? (car args)) (const? (cadr args)))
-        (bool-value (equal? (const-value (car args)) (const-value (cadr args))))
-        unknown))
-   ((and (eq? op 'null?) (= (length args) 1))
-    (cond ((nil? (car args)) (bool-value #t))
-          ((or (const? (car args)) (cons? (car args))) (bool-value #f))
-          (else unknown)))
-   ((and (eq? op 'pair?) (= (length args) 1))
-    (cond ((cons? (car args)) (bool-value #t))
-          ((const? (car args)) (bool-value #f))
-          (else unknown)))
-   ((and (eq? op 'symbol?) (= (length args) 1))
-    (cond ((const? (car args))
-           (bool-value (quoted-symbol-expr? (const-value (car args)))))
-          ((or (cons? (car args)) (eq? (car args) list-value)) (bool-value #f))
-          (else unknown)))
-   (else unknown)))
+  (if (any bot? args)
+      bot
+      (match (list op args names)
+        (('cons (a d) (a-name d-name))
+         (limit (make-cons-value a (and (not (const? a)) a-name)
+                                 d (and (not (const? d)) d-name))
+                shape-depth))
+        (((= accessor-kind (? symbol? which)) (v) _)
+         (let-values (((value name) (component v which)))
+           value))
+        (((= arithmetic-procedure (? procedure? proc)) (a b) _)
+         (if (and (number-const? a) (number-const? b))
+             (let ((result (proc (const-value a) (const-value b))))
+               (if (boolean? result) (bool-value result) (const result)))
+             unknown))
+        (('eq? (a b) _)
+         (if (and (const? a) (const? b))
+             (bool-value (equal? (const-value a) (const-value b)))
+             unknown))
+        (('null? (v) _)
+         (cond ((nil? v) (bool-value #t))
+               ((or (const? v) (cons? v)) (bool-value #f))
+               (else unknown)))
+        (('pair? (v) _)
+         (cond ((cons? v) (bool-value #t))
+               ((const? v) (bool-value #f))
+               (else unknown)))
+        (('symbol? (v) _)
+         (cond ((const? v) (bool-value (quoted-symbol-expr? (const-value v))))
+               ((or (cons? v) (eq? v list-value)) (bool-value #f))
+               (else unknown)))
+        (_ unknown))))
 
 ;; (pi-field car x a) or (pi-field cdr x a): x is a pair whose car (or cdr)
-;; is a, with value av. A non-pair x would have stopped the accessor, so nothing flows.
+;; is a, with value av. A non-pair x would have stopped the accessor, so
+;; nothing flows.
 (define (eval-accessor-pi which v name av)
   (if (or (bot? v) (bot? av) (const? v))
       bot
-      (let ((other (component v (if (eq? which 'car) 'cdr 'car))))
+      (let-values (((other other-name) (component v (if (eq? which 'car) 'cdr 'car))))
         (limit (if (eq? which 'car)
-                   (make-cons-value av name (car other) (cdr other))
-                   (make-cons-value (car other) (cdr other) av name))
+                   (make-cons-value av name other other-name)
+                   (make-cons-value other other-name av name))
                shape-depth))))
 
 (define (eval-pi kind v)
@@ -702,16 +714,18 @@
 (define terminator-forms
   '(if goto return tail-call direct-tail-call tail-apply-call tail-callcc-call))
 
+(define (terminator-instr? instr)
+  (match instr
+    ((head . _) (and (memq head terminator-forms) #t))
+    (_ #f)))
+
 (define (append-before-terminator! block instr)
   (let ((instrs (ssa-block-instrs block)))
     (set-ssa-block-instrs!
      block
-     (if (and (pair? instrs) (memq (car (last instrs)) terminator-forms))
+     (if (and (pair? instrs) (terminator-instr? (last instrs)))
          (append (drop-right instrs 1) (list instr (last instrs)))
          (append instrs (list instr))))))
-
-(define (cons-rhs-operands rhs)
-  (and (primop-rhs? rhs) (eq? (cadr rhs) 'cons) (cddr rhs)))
 
 (define (dominates? idom a b)
   (let walk ((x b))
@@ -734,6 +748,19 @@
                         (ssa-block-succs (vector-ref blocks x)))))
         (vector-set! color x 2)
         found))
+    ;; The blocks of the natural loop with header h, as a table.
+    (define (loop-body h)
+      (let ((body (make-hash-table)))
+        (hash-table-set! body h #t)
+        (let walk ((stack (hash-table-ref headers h)))
+          (match stack
+            (() body)
+            ((x . rest)
+             (if (hash-table-exists? body x)
+                 (walk rest)
+                 (begin
+                   (hash-table-set! body x #t)
+                   (walk (append (ssa-block-preds (vector-ref blocks x)) rest)))))))))
     (for-each-index
      (lambda (a block)
        (for-each (lambda (b)
@@ -745,18 +772,8 @@
          (begin
            (for-each
             (lambda (h)
-              (let ((body (make-hash-table)))
-                (hash-table-set! body h #t)
-                (let loop ((stack (hash-table-ref headers h)))
-                  (unless (null? stack)
-                    (if (hash-table-exists? body (car stack))
-                        (loop (cdr stack))
-                        (begin
-                          (hash-table-set! body (car stack) #t)
-                          (loop (append (ssa-block-preds (vector-ref blocks (car stack)))
-                                        (cdr stack)))))))
-                (for-each (lambda (x) (vector-set! depth x (+ 1 (vector-ref depth x))))
-                          (hash-table-keys body))))
+              (for-each (lambda (x) (vector-set! depth x (+ 1 (vector-ref depth x))))
+                        (hash-table-keys (loop-body h))))
             (hash-table-keys headers))
            depth))))
 
@@ -764,8 +781,8 @@
   (let* ((idom (immediate-dominators blocks))
          (depth (loop-depths blocks idom))
          (dom-depth (make-slots (vector-length blocks) #f))
-         (defs (make-hash-table))
-         (phi-defs (make-hash-table))
+         (defs (make-hash-table))       ; name -> its right-hand side
+         (phi-defs (make-hash-table))   ; name -> (phi . block index)
          (fields (make-hash-table equal?))
          (loads (make-hash-table equal?)))
     (define (value-of name) (analysis-value analysis name))
@@ -786,15 +803,16 @@
          (for-each (lambda (phi) (hash-table-set! phi-defs (phi-dst phi) (cons phi b)))
                    (ssa-block-phis block))
          (for-each (lambda (instr)
-                     (when (eq? (car instr) 'assign)
-                       (hash-table-set! defs (cadr instr) (caddr instr))))
+                     (match instr
+                       (('assign dst rhs) (hash-table-set! defs dst rhs))
+                       (_ #f)))
                    (ssa-block-instrs block)))
        blocks))
     ;; (car-operand . cdr-operand) when name is defined by a cons, else #f
     (define (operands-of name)
-      (let* ((rhs (and (symbol? name) (hash-table-ref/default defs name #f)))
-             (ops (and rhs (cons-rhs-operands rhs))))
-        (and ops (cons (car ops) (cadr ops)))))
+      (match (and (symbol? name) (hash-table-ref/default defs name #f))
+        (('primop 'cons a d) (cons a d))
+        (_ #f)))
     ;; Does a cons instruction feed name, possibly through phis?
     (define (web-has-fresh? name)
       (let ((seen (make-hash-table)))
@@ -804,13 +822,14 @@
                (begin
                  (hash-table-set! seen x #t)
                  (or (and (operands-of x) #t)
-                     (let ((entry (hash-table-ref/default phi-defs x #f)))
-                       (and entry (any visit (vector->list (phi-args (car entry))))))))))))
+                     (match (hash-table-ref/default phi-defs x #f)
+                       ((phi . _) (any visit (vector->list (phi-args phi))))
+                       (#f #f))))))))
+    ;; car or cdr when instr reads that field of base, else #f
     (define (read-of instr base)
-      (let ((rhs (instr-rhs instr)))
-        (and (primop-rhs? rhs)
-             (eq? (caddr rhs) base)
-             (accessor-kind (cadr rhs)))))
+      (match (accessor-read (instr-rhs instr))
+        ((which . x) (and (eq? x base) which))
+        (#f #f)))
     (define (component-value value which)
       (if (eq? which 'car) (cons-car value) (cons-cdr value)))
     ;; Reads of name as (dst base which), a base before its readers, and the
@@ -832,61 +851,69 @@
               (when (memq name (instr-uses instr))
                 (let ((which (read-of instr name)))
                   (if which
-                      (set! reads (cons (list (cadr instr) name which) reads))
+                      (set! reads (cons (list (instr-def instr) name which) reads))
                       (set! escapes (cons b escapes))))))
             (ssa-block-instrs block)))
          blocks)
         (let loop ((rs (reverse reads)) (nested '()))
-          (if (null? rs)
-              (cons (append (reverse reads) nested) escapes)
-              (let ((child (component-value value (caddr (car rs)))))
-                (if (cons? child)
-                    (let ((sub (classify (car (car rs)) child)))
-                      (and sub (null? (cdr sub))
-                           (loop (cdr rs) (append nested (car sub)))))
-                    (loop (cdr rs) nested)))))))
+          (match rs
+            (() (cons (append (reverse reads) nested) escapes))
+            (((dst _ which) . rest)
+             (let ((child (component-value value which)))
+               (if (cons? child)
+                   (match (classify dst child)
+                     ((child-reads) (loop rest (append nested child-reads)))
+                     (_ #f))
+                   (loop rest nested))))))))
     ;; The name holding the field at path (a list of car/cdr) of the pair name.
     ;; where: block index at whose end loads may be placed.
     (define (field name path where)
-      (cond
-       ((null? path) name)
-       ((not (symbol? name)) (raise 'scalar-replacement-abort))
-       ((operands-of name)
-        => (lambda (ops)
-             (field (if (eq? (car path) 'car) (car ops) (cdr ops)) (cdr path) where)))
-       ((hash-table-ref/default phi-defs name #f)
-        => (lambda (entry)
-             (let ((key (cons name path)))
-               (or (hash-table-ref/default fields key #f)
-                   (let ((dst (fresh-sroa-name))
-                         (block-index (cdr entry))
-                         (phi (car entry)))
-                     (hash-table-set! fields key dst)
-                     (let* ((preds (ssa-block-preds (vector-ref blocks block-index)))
-                            ;; in predecessor order, so fresh names do not depend on
-                            ;; the order the host's map happens to use
-                            (args (map-in-order (lambda (arg pred) (field arg path pred))
-                                                (vector->list (phi-args phi)) preds))
-                            (block (vector-ref blocks block-index)))
-                       (set-ssa-block-phis!
-                        block
-                        (append (ssa-block-phis block)
-                                (list (make-phi dst dst (list->vector args))))))
-                     dst)))))
-       (else
-        (let ((key (list name path where)))
-          (or (hash-table-ref/default loads key #f)
-              (let ((result
-                     (let chain ((from name) (rest path))
-                       (if (null? rest)
-                           from
-                           (let ((t (fresh-sroa-name)))
-                             (append-before-terminator!
-                              (vector-ref blocks where)
-                              `(assign ,t (primop ,(unsafe-accessor (car rest)) ,from)))
-                             (chain t (cdr rest)))))))
-                (hash-table-set! loads key result)
-                result))))))
+      (match path
+        (() name)
+        ((step . deeper)
+         (cond
+          ((not (symbol? name)) (raise 'scalar-replacement-abort))
+          ((operands-of name)
+           => (match-lambda
+                ((a . d) (field (if (eq? step 'car) a d) deeper where))))
+          ((hash-table-ref/default phi-defs name #f)
+           => (match-lambda
+                ((phi . block-index) (phi-field name path phi block-index))))
+          (else (load-field name path where))))))
+    ;; The field at path of the pair phi defines, as a new phi of the fields
+    ;; at path of its arguments.
+    (define (phi-field name path phi block-index)
+      (let ((key (cons name path)))
+        (or (hash-table-ref/default fields key #f)
+            (let ((dst (fresh-sroa-name)))
+              (hash-table-set! fields key dst)
+              (let* ((block (vector-ref blocks block-index))
+                     ;; in predecessor order, so fresh names do not depend on
+                     ;; the order the host's map happens to use
+                     (args (map-in-order (lambda (arg pred) (field arg path pred))
+                                         (vector->list (phi-args phi))
+                                         (ssa-block-preds block))))
+                (set-ssa-block-phis!
+                 block
+                 (append (ssa-block-phis block)
+                         (list (make-phi dst dst (list->vector args))))))
+              dst))))
+    ;; The field at path of the pair name, loaded at the end of block where.
+    (define (load-field name path where)
+      (let ((key (list name path where)))
+        (or (hash-table-ref/default loads key #f)
+            (let ((result
+                   (let chain ((from name) (steps path))
+                     (match steps
+                       (() from)
+                       ((step . more)
+                        (let ((t (fresh-sroa-name)))
+                          (append-before-terminator!
+                           (vector-ref blocks where)
+                           `(assign ,t (primop ,(unsafe-accessor step) ,from)))
+                          (chain t more)))))))
+              (hash-table-set! loads key result)
+              result))))
     ;; The leaf at path: its literal when the analysis knows it, else a field.
     (define (leaf root value path)
       (if (const? value) (const-value value) (field root path #f)))
@@ -896,10 +923,76 @@
           (let ((a (materialize root (cons-car value) (append path '(car))))
                 (d (materialize root (cons-cdr value) (append path '(cdr))))
                 (name (fresh-sroa-name)))
-            (cons (append (car a) (car d)
-                          (list `(assign ,name (primop cons ,(cdr a) ,(cdr d)))))
-                  name))
+            (match-let (((a-instrs . a-name) a)
+                        ((d-instrs . d-name) d))
+              (cons (append a-instrs d-instrs
+                            (list `(assign ,name (primop cons ,a-name ,d-name))))
+                    name)))
           (cons '() (leaf root value path))))
+    ;; A copy of every block's phis and instructions, and putting it back.
+    (define (snapshot-blocks)
+      (vector-map (lambda (block) (cons (ssa-block-phis block) (ssa-block-instrs block)))
+                  blocks))
+    (define (restore-blocks! saved)
+      (for-each-index
+       (lambda (i block)
+         (match (vector-ref saved i)
+           ((phis . instrs)
+            (set-ssa-block-phis! block phis)
+            (set-ssa-block-instrs! block instrs))))
+       blocks))
+    ;; Splits the phi name, whose analysis value is the cons value, into
+    ;; field phis. reads are its component reads (see classify); target is
+    ;; the block that rebuilds the pair for its whole uses, or #f when it has
+    ;; none.
+    (define (replace-phi! name value reads target)
+      (let ((virtual (make-hash-table))   ; name -> (value . path)
+            (copies (make-hash-table))    ; read -> the field or literal it becomes
+            (gone (make-hash-table)))     ; reads of component pairs
+        (hash-table-set! virtual name (cons value '()))
+        (for-each
+         (match-lambda
+           ((dst base which)
+            (match-let* (((base-value . base-path) (hash-table-ref virtual base))
+                         (child (component-value base-value which))
+                         (path (append base-path (list which))))
+              (if (cons? child)
+                  (begin (hash-table-set! virtual dst (cons child path))
+                         (hash-table-set! gone dst #t))
+                  (hash-table-set! copies dst (leaf name child path))))))
+         reads)
+        (match-let (((built . whole) (if target (materialize name value '()) (cons '() #f))))
+          (define (rewrite instr)
+            (let ((dst (instr-def instr)))
+              (cond
+               ((and dst (hash-table-exists? gone dst)) '())
+               ((and dst (hash-table-exists? copies dst))
+                (list `(assign ,dst ,(hash-table-ref copies dst))))
+               (target
+                (list (map-instr-uses (lambda (v) (if (eq? v name) whole v)) instr)))
+               (else (list instr)))))
+          (for-each-index
+           (lambda (i block)
+             (set-ssa-block-phis!
+              block
+              (filter (lambda (p) (not (eq? (phi-dst p) name))) (ssa-block-phis block)))
+             (set-ssa-block-instrs!
+              block
+              (append (if (and target (= i target)) built '())
+                      (append-map rewrite (ssa-block-instrs block)))))
+           blocks)
+          (when target
+            (for-each-index
+             (lambda (i block)
+               (for-each
+                (lambda (phi)
+                  (for-each-phi-arg
+                   (lambda (slot arg pred)
+                     (when (eq? arg name)
+                       (vector-set! (phi-args phi) slot whole)))
+                   block phi))
+                (ssa-block-phis block)))
+             blocks)))))
     (define (try-phi! b phi)
       (let* ((name (phi-dst phi))
              (value (value-of name))
@@ -907,75 +1000,25 @@
                          (> (vector-ref depth b) 0)
                          (web-has-fresh? name)
                          (classify name value))))
-        (when found
-          (let* ((reads (car found))
-                 (escapes (cdr found))
-                 (target (and (pair? escapes) (fold common-dominator (car escapes) (cdr escapes)))))
-            (when (or (not target) (< (vector-ref depth target) (vector-ref depth b)))
-              (set! fields (make-hash-table equal?))
-              (set! loads (make-hash-table equal?))
-              ;; Building the fields adds phis and loads before anything is
-              ;; rewritten; if that finds a shape it cannot handle (a literal
-              ;; where a pair should flow), put the blocks back and skip this phi.
-              (let ((saved (vector-map (lambda (blk) (cons (ssa-block-phis blk)
-                                                           (ssa-block-instrs blk)))
-                                       blocks)))
-               (guard (e ((eq? e 'scalar-replacement-abort)
-                          (for-each-index
-                           (lambda (i blk)
-                             (set-ssa-block-phis! blk (car (vector-ref saved i)))
-                             (set-ssa-block-instrs! blk (cdr (vector-ref saved i))))
-                           blocks)
-                          (refresh-defs!)))
-              (let ((virtual (make-hash-table))   ; name -> (value . path)
-                    (copies (make-hash-table))
-                    (gone (make-hash-table)))
-                (hash-table-set! virtual name (cons value '()))
-                (for-each
-                 (lambda (read)
-                   (let* ((base (hash-table-ref virtual (cadr read)))
-                          (child (component-value (car base) (caddr read)))
-                          (path (append (cdr base) (list (caddr read)))))
-                     (if (cons? child)
-                         (begin (hash-table-set! virtual (car read) (cons child path))
-                                (hash-table-set! gone (car read) #t))
-                         (hash-table-set! copies (car read) (leaf name child path)))))
-                 reads)
-                (let ((materialized (and target (materialize name value '()))))
-                  (for-each-index
-                   (lambda (i block)
-                     (set-ssa-block-phis!
-                      block
-                      (filter (lambda (p) (not (eq? (phi-dst p) name))) (ssa-block-phis block)))
-                     (set-ssa-block-instrs!
-                      block
-                      (append
-                       (if (and target (= i target)) (car materialized) '())
-                       (append-map
-                        (lambda (instr)
-                          (cond
-                           ((and (eq? (car instr) 'assign) (hash-table-exists? gone (cadr instr))) '())
-                           ((and (eq? (car instr) 'assign) (hash-table-exists? copies (cadr instr)))
-                            (list `(assign ,(cadr instr) ,(hash-table-ref copies (cadr instr)))))
-                           (target (list (map-instr-uses
-                                          (lambda (v) (if (eq? v name) (cdr materialized) v))
-                                          instr)))
-                           (else (list instr))))
-                        (ssa-block-instrs block)))))
-                   blocks)
-                  (when target
-                    (for-each-index
-                     (lambda (i block)
-                       (for-each
-                        (lambda (phi)
-                          (for-each-phi-arg
-                           (lambda (slot arg pred)
-                             (when (eq? arg name)
-                               (vector-set! (phi-args phi) slot (cdr materialized))))
-                           block phi))
-                        (ssa-block-phis block)))
-                     blocks)))
-                (refresh-defs!)))))))))
+        (match found
+          (#f #f)
+          ((reads . escapes)
+           (let ((target (match escapes
+                           (() #f)
+                           ((first . more) (fold common-dominator first more)))))
+             (when (or (not target) (< (vector-ref depth target) (vector-ref depth b)))
+               (set! fields (make-hash-table equal?))
+               (set! loads (make-hash-table equal?))
+               ;; Building the fields adds phis and loads before anything is
+               ;; rewritten; if that finds a shape it cannot handle (a literal
+               ;; where a pair should flow), put the blocks back and skip this
+               ;; phi.
+               (let ((saved (snapshot-blocks)))
+                 (guard (e ((eq? e 'scalar-replacement-abort)
+                            (restore-blocks! saved)
+                            (refresh-defs!)))
+                   (replace-phi! name value reads target)
+                   (refresh-defs!)))))))))
     (when depth
       (refresh-defs!)
       (for-each-index
@@ -1014,9 +1057,8 @@
   (set! ipa-returns (make-hash-table))
   (set! ipa-active #t)
   (for-each (lambda (name) (hash-table-set! ipa-returns name bot)) all)
-  (for-each (lambda (entry)
-              (hash-table-set! ipa-seeds (car entry)
-                               (make-slots (cdr entry) bot)))
+  (for-each (match-lambda
+              ((name . arity) (hash-table-set! ipa-seeds name (make-slots arity bot))))
             closed))
 
 (define (ipa-clear!)
@@ -1037,29 +1079,31 @@
         (unless (hash-table-ref/default ipa-called callee #f)
           (hash-table-set! ipa-called callee #t)
           (set! ipa-changed #t))
-        (do ((i 0 (+ i 1)) (args args (cdr args)))
-            ((or (= i (vector-length seed)) (null? args)))
-          (let* ((old (vector-ref seed i))
-                 (merged (join old (value-of (car args)))))
-            (unless (eq? old merged)
-              (vector-set! seed i merged)
-              (set! ipa-changed #t)))))))
+        (for-each (lambda (i arg)
+                    (let* ((old (vector-ref seed i))
+                           (merged (join old (value-of arg))))
+                      (unless (eq? old merged)
+                        (vector-set! seed i merged)
+                        (set! ipa-changed #t))))
+                  (iota (min (vector-length seed) (length args)))
+                  args))))
   (define (note-return! v) (when name (ipa-join! ipa-returns name v)))
   (for-each-index
    (lambda (b block)
      (when (vector-ref (analysis-visited analysis) b)
        (for-each
         (lambda (instr)
-          (let ((rhs (instr-rhs instr)))
-            (cond
-             ((and (pair? rhs) (eq? (car rhs) 'direct-call))
-              (note-call! (cadr rhs) (cddr rhs)))
-             ((eq? (car instr) 'direct-tail-call)
-              (note-call! (cadr instr) (cddr instr))
-              (note-return! (hash-table-ref/default ipa-returns (cadr instr) unknown)))
-             ((eq? (car instr) 'return) (note-return! (value-of (cadr instr))))
-             ((memq (car instr) '(tail-call tail-apply-call tail-callcc-call))
-              (note-return! unknown)))))
+          (match instr
+            (('assign _ ('direct-call callee . args))
+             (note-call! callee args))
+            (('direct-tail-call callee . args)
+             (note-call! callee args)
+             (note-return! (hash-table-ref/default ipa-returns callee unknown)))
+            (('return v)
+             (note-return! (value-of v)))
+            (((or 'tail-call 'tail-apply-call 'tail-callcc-call) . _)
+             (note-return! unknown))
+            (_ #f)))
         (ssa-block-instrs block))))
    blocks))
 
@@ -1075,8 +1119,15 @@
 
 (define (edge-key from to) (cons from to))
 
+(define (ends-in-branch? instrs)
+  (match (and (pair? instrs) (last instrs))
+    (('if . _) #t)
+    (_ #f)))
+
+;; name, when given, is the procedure's label, for its interprocedural seeds.
 (define (analyze ssa . maybe-name)
-  (let* ((blocks (ssa-proc-blocks ssa))
+  (let* ((name (match maybe-name ((name) name) (() #f)))
+         (blocks (ssa-proc-blocks ssa))
          (values (make-hash-table))
          (visited (make-slots (vector-length blocks) #f))
          (edges (make-hash-table))
@@ -1104,46 +1155,46 @@
     (define (executable? from to)
       (hash-table-ref/default edges (edge-key from to) #f))
     (define (eval-rhs rhs)
-      (cond
-       ((symbol? rhs) (value-of rhs))
-       ((literal-expr? rhs) (const rhs))
-       ((primop-rhs? rhs)
-        (eval-primop (cadr rhs) (map value-of (cddr rhs)) (map operand-name (cddr rhs))))
-       ((and (pair? rhs) (eq? (car rhs) 'global))
-        (hash-table-ref/default quote-cell-values (cadr rhs) unknown))
-       ((and ipa-active (pair? rhs) (eq? (car rhs) 'direct-call))
-        (hash-table-ref/default ipa-returns (cadr rhs) unknown))
-       ((and (pair? rhs) (eq? (car rhs) 'pi-field))
-        (eval-accessor-pi (cadr rhs) (value-of (caddr rhs))
-                          (cadddr rhs) (value-of (cadddr rhs))))
-       ((and (pair? rhs) (eq? (car rhs) 'pi))
-        (eval-pi (cadr rhs) (value-of (caddr rhs))))
-       (else unknown)))
+      (match rhs
+        ((? symbol?) (value-of rhs))
+        ((? literal-expr?) (const rhs))
+        (('primop op . args)
+         (eval-primop op (map value-of args) (map operand-name args)))
+        (('global label)
+         (hash-table-ref/default quote-cell-values label unknown))
+        (('direct-call callee . _)
+         (if ipa-active
+             (hash-table-ref/default ipa-returns callee unknown)
+             unknown))
+        (('pi-field which x field)
+         (eval-accessor-pi which (value-of x) field (value-of field)))
+        (('pi kind x)
+         (eval-pi kind (value-of x)))
+        (_ unknown)))
     (define (visit-phi! b phi)
-      (let ((preds (ssa-block-preds (vector-ref blocks b)))
-            (args (phi-args phi)))
-        (update! (phi-dst phi)
-                 (let loop ((slot 0) (preds preds) (acc bot))
-                   (if (null? preds)
-                       acc
-                       (loop (+ slot 1) (cdr preds)
-                             (if (executable? (car preds) b)
-                                 (join acc (value-of (vector-ref args slot)))
-                                 acc)))))))
+      (update! (phi-dst phi)
+               (fold (lambda (pred arg acc)
+                       (if (executable? pred b)
+                           (join acc (value-of arg))
+                           acc))
+                     bot
+                     (ssa-block-preds (vector-ref blocks b))
+                     (vector->list (phi-args phi)))))
     (define (visit-instr! b instr)
       (set! iterations (+ iterations 1))
-      (case (car instr)
-        ((assign) (update! (cadr instr) (eval-rhs (caddr instr))))
-        ((if)
-         (let ((v (value-of (cadr instr)))
+      (match instr
+        (('assign dst rhs) (update! dst (eval-rhs rhs)))
+        (('if test _ _)
+         (let ((v (value-of test))
                (succs (ssa-block-succs (vector-ref blocks b))))
-           (cond
-            ((bot? v) #f)
-            ((truthy? v) (mark-edge! b (car succs)))
-            (else (mark-edge! b (cadr succs))))
+           (match-let (((then-block else-block) succs))
+             (cond
+              ((bot? v) #f)
+              ((truthy? v) (mark-edge! b then-block))
+              (else (mark-edge! b else-block))))
            (when (eq? v unknown)
              (for-each (lambda (s) (mark-edge! b s)) succs))))
-        (else #f)))
+        (_ #f)))
     (define (visit-item! b item)
       (if (phi? item) (visit-phi! b item) (visit-instr! b item)))
     (define (visit-block! b)
@@ -1152,7 +1203,7 @@
         (vector-set! visited b #t)
         (for-each (lambda (phi) (visit-phi! b phi)) (ssa-block-phis block))
         (for-each (lambda (instr) (visit-instr! b instr)) instrs)
-        (unless (and (pair? instrs) (eq? (car (last instrs)) 'if))
+        (unless (ends-in-branch? instrs)
           (for-each (lambda (s) (mark-edge! b s)) (ssa-block-succs block)))))
     (define (note-use! var site)
       (when (symbol? var)
@@ -1170,33 +1221,36 @@
                                (instr-uses instr))))
                  (ssa-block-instrs block)))
      blocks)
-    (let ((seed (and ipa-active (pair? maybe-name) (car maybe-name)
-                     (or ipa-solving (hash-table-ref/default ipa-called (car maybe-name) #f))
-                     (hash-table-ref/default ipa-seeds (car maybe-name) #f))))
-      (do ((params (ssa-proc-param-names ssa) (cdr params))
-           (i 0 (+ i 1)))
-          ((null? params))
-        (hash-table-set! values (car params)
-                         (if (and seed (< i (vector-length seed)))
-                             (vector-ref seed i)
-                             unknown))))
+    (let ((seed (and ipa-active name
+                     (or ipa-solving (hash-table-ref/default ipa-called name #f))
+                     (hash-table-ref/default ipa-seeds name #f)))
+          (params (ssa-proc-param-names ssa)))
+      (for-each (lambda (param i)
+                  (hash-table-set! values param
+                                   (if (and seed (< i (vector-length seed)))
+                                       (vector-ref seed i)
+                                       unknown)))
+                params
+                (iota (length params))))
     (visit-block! 0)
+    ;; Flow edges first; then SSA use sites, each a (block . phi-or-instr).
     (let loop ()
-      (cond
-       ((pair? flow-list)
-        (let* ((edge (car flow-list)) (to (cdr edge)))
-          (set! flow-list (cdr flow-list))
-          (if (vector-ref visited to)
-              (for-each (lambda (phi) (visit-phi! to phi))
-                        (ssa-block-phis (vector-ref blocks to)))
-              (visit-block! to))
-          (loop)))
-       ((pair? ssa-list)
-        (let ((site (car ssa-list)))
-          (set! ssa-list (cdr ssa-list))
-          (when (vector-ref visited (car site))
-            (visit-item! (car site) (cdr site)))
-          (loop)))))
+      (match flow-list
+        (((_ . to) . rest)
+         (set! flow-list rest)
+         (if (vector-ref visited to)
+             (for-each (lambda (phi) (visit-phi! to phi))
+                       (ssa-block-phis (vector-ref blocks to)))
+             (visit-block! to))
+         (loop))
+        (()
+         (match ssa-list
+           (((b . item) . rest)
+            (set! ssa-list rest)
+            (when (vector-ref visited b)
+              (visit-item! b item))
+            (loop))
+           (() #f)))))
     ;; An executed branch with no live edge (its test never got a value) keeps
     ;; both edges rather than leaving the block without successors.
     (for-each-index
@@ -1220,12 +1274,14 @@
        (when (vector-ref (analysis-visited analysis) b)
          (for-each
           (lambda (instr)
-            (when (and (eq? (car instr) 'set-global!) (quote-cell? (cadr instr)))
-              (let ((v (analysis-value analysis (caddr instr))))
-                (hash-table-update!/default
-                 stored (cadr instr)
-                 (lambda (old) (join old (strip-names (if (bot? v) unknown v))))
-                 bot))))
+            (match instr
+              (('set-global! (? quote-cell? cell) operand)
+               (let ((v (analysis-value analysis operand)))
+                 (hash-table-update!/default
+                  stored cell
+                  (lambda (old) (join old (strip-names (if (bot? v) unknown v))))
+                  bot)))
+              (_ #f)))
           (ssa-block-instrs block))))
      blocks)
     (hash-table-walk
@@ -1249,28 +1305,32 @@
 
 (define (rewrite-instr analysis instr)
   (define (value-of var) (analysis-value analysis var))
-  (case (car instr)
-    ((assign)
-     (let ((dst (cadr instr)) (rhs (caddr instr)))
-       (cond
-        ((refinement-subject rhs)
-         => (lambda (subject) `(assign ,dst ,subject)))
-        ((literal-expr? rhs) instr)
-        ((and (const? (value-of dst))
-              (or (symbol? rhs)
-                  (and (primop-rhs? rhs) (memq (cadr rhs) foldable-primops))))
-         `(assign ,dst ,(const-value (value-of dst))))
-        ((and (primop-rhs? rhs)
-              (accessor-kind (cadr rhs))
-              (symbol? (caddr rhs))
-              (cons? (analysis-value analysis (caddr rhs))))
-         (let* ((which (accessor-kind (cadr rhs)))
-                (name (cdr (component (analysis-value analysis (caddr rhs)) which))))
-           (if name
-               `(assign ,dst ,name)
-               `(assign ,dst (primop ,(unsafe-accessor which) ,(caddr rhs))))))
-        (else instr))))
-    (else instr)))
+  (define (foldable-rhs? rhs)
+    (match rhs
+      ((? symbol?) #t)
+      (('primop op . _) (and (memq op foldable-primops) #t))
+      (_ #f)))
+  ;; For a car or cdr of a known pair: a copy of the component's name when
+  ;; the analysis knows one, else the unchecked accessor. #f otherwise.
+  (define (known-pair-read rhs)
+    (match (accessor-read rhs)
+      ((which . x)
+       (and (cons? (value-of x))
+            (let-values (((value name) (component (value-of x) which)))
+              (or name `(primop ,(unsafe-accessor which) ,x)))))
+      (#f #f)))
+  (match instr
+    (('assign dst rhs)
+     (cond
+      ((refinement-subject rhs)
+       => (lambda (subject) `(assign ,dst ,subject)))
+      ((literal-expr? rhs) instr)
+      ((and (const? (value-of dst)) (foldable-rhs? rhs))
+       `(assign ,dst ,(const-value (value-of dst))))
+      ((known-pair-read rhs)
+       => (lambda (new-rhs) `(assign ,dst ,new-rhs)))
+      (else instr)))
+    (_ instr)))
 
 ;; Drops blocks that cannot execute and edges that are never taken, keeping the
 ;; layout order of the rest, and turns decided branches into jumps.
@@ -1294,36 +1354,31 @@
        (let* ((block (vector-ref blocks b))
               (old-succs (ssa-block-succs block))
               (live-succs (filter (lambda (s) (live-edge? b s)) old-succs))
-              (instrs (ssa-block-instrs block))
-              (last-instr (and (pair? instrs) (last instrs))))
-         (when (and last-instr (eq? (car last-instr) 'if)
-                    (= (length live-succs) 1))
-           (let ((label (if (eqv? (car live-succs) (car old-succs))
-                            (caddr last-instr)
-                            (cadddr last-instr))))
-             (set-ssa-block-instrs!
-              block
-              (append (drop-right instrs 1) (list `(goto ,label))))))
-         (let* ((old-preds (ssa-block-preds block))
-                (keep-slot? (map (lambda (p) (and (live-edge? p b) #t)) old-preds)))
+              (instrs (ssa-block-instrs block)))
+         ;; a branch with one live arm becomes a jump to it
+         (match (list (and (pair? instrs) (last instrs)) live-succs old-succs)
+           ((('if _ then-label else-label) (live) (then-block _))
+            (set-ssa-block-instrs!
+             block
+             (append (drop-right instrs 1)
+                     (list `(goto ,(if (eqv? live then-block) then-label else-label))))))
+           (_ #f))
+         (let ((old-preds (ssa-block-preds block)))
            (for-each
             (lambda (phi)
-              (let ((args (phi-args phi)))
-                (let ((filtered
-                       (let loop ((slot 0) (keep keep-slot?) (acc '()))
-                         (cond ((null? keep) (reverse acc))
-                               ((car keep)
-                                (loop (+ slot 1) (cdr keep)
-                                      (cons (vector-ref args slot) acc)))
-                               (else (loop (+ slot 1) (cdr keep) acc))))))
-                  (set-ssa-block-phis!
-                   block
-                   (map (lambda (p)
-                          (if (eq? p phi)
-                              (make-phi (phi-dst p) (phi-var p)
-                                        (list->vector filtered))
-                              p))
-                        (ssa-block-phis block))))))
+              (let ((filtered
+                     (fold-right (lambda (p arg acc)
+                                   (if (live-edge? p b) (cons arg acc) acc))
+                                 '()
+                                 old-preds
+                                 (vector->list (phi-args phi)))))
+                (set-ssa-block-phis!
+                 block
+                 (map (lambda (p)
+                        (if (eq? p phi)
+                            (make-phi (phi-dst p) (phi-var p) (list->vector filtered))
+                            p))
+                      (ssa-block-phis block)))))
             (ssa-block-phis block))
            (set-ssa-block-preds!
             block
@@ -1346,17 +1401,14 @@
   '(+ - * = < > eq? null? pair? symbol? car cdr unsafe-car unsafe-cdr))
 
 (define (removable-rhs? rhs remove-allocation?)
-  (cond
-   ((symbol? rhs) #t)
-   ((literal-expr? rhs) #t)
-   ((not (pair? rhs)) #f)
-   (else
-    (case (car rhs)
-      ((pi pi-field global closure-env-ref unbox) #t)
-      ((primop)
-       (or (and (memq (cadr rhs) pure-primops) #t)
-           (and remove-allocation? (eq? (cadr rhs) 'cons))))
-      (else #f)))))
+  (match rhs
+    ((? symbol?) #t)
+    ((? literal-expr?) #t)
+    (((or 'pi 'pi-field 'global 'closure-env-ref 'unbox) . _) #t)
+    (('primop op . _)
+     (or (and (memq op pure-primops) #t)
+         (and remove-allocation? (eq? op 'cons))))
+    (_ #f)))
 
 (define (remove-dead-definitions! blocks remove-allocation?)
   ;; Mark what essential instructions need, through phis as well, so that
@@ -1366,8 +1418,9 @@
         (instr-of (make-hash-table))
         (work '()))
     (define (removable? instr)
-      (and (eq? (car instr) 'assign)
-           (removable-rhs? (caddr instr) remove-allocation?)))
+      (match instr
+        (('assign _ rhs) (removable-rhs? rhs remove-allocation?))
+        (_ #f)))
     (define (mark! var)
       (when (and (symbol? var) (not (hash-table-exists? live var)))
         (hash-table-set! live var #t)
@@ -1378,20 +1431,21 @@
                  (ssa-block-phis block))
        (for-each (lambda (instr)
                    (if (removable? instr)
-                       (hash-table-set! instr-of (cadr instr) instr)
+                       (hash-table-set! instr-of (instr-def instr) instr)
                        (for-each mark! (instr-uses instr))))
                  (ssa-block-instrs block)))
      blocks)
     (let loop ()
-      (unless (null? work)
-        (let ((var (car work)))
-          (set! work (cdr work))
-          (cond
-           ((hash-table-ref/default phi-of var #f)
-            => (lambda (phi) (for-each mark! (vector->list (phi-args phi)))))
-           ((hash-table-ref/default instr-of var #f)
-            => (lambda (instr) (for-each mark! (instr-uses instr)))))
-          (loop))))
+      (match work
+        (() #f)
+        ((var . rest)
+         (set! work rest)
+         (cond
+          ((hash-table-ref/default phi-of var #f)
+           => (lambda (phi) (for-each mark! (vector->list (phi-args phi)))))
+          ((hash-table-ref/default instr-of var #f)
+           => (lambda (instr) (for-each mark! (instr-uses instr)))))
+         (loop))))
     (for-each-index
      (lambda (b block)
        (set-ssa-block-phis!
@@ -1402,7 +1456,7 @@
         block
         (filter (lambda (instr)
                   (not (and (removable? instr)
-                            (not (hash-table-exists? live (cadr instr))))))
+                            (not (hash-table-exists? live (instr-def instr))))))
                 (ssa-block-instrs block))))
      blocks)))
 
@@ -1418,8 +1472,9 @@
     (for-each-index
      (lambda (b block)
        (for-each (lambda (instr)
-                   (when (and (eq? (car instr) 'assign) (symbol? (caddr instr)))
-                     (hash-table-set! source (cadr instr) (caddr instr))))
+                   (match instr
+                     (('assign dst (? symbol? from)) (hash-table-set! source dst from))
+                     (_ #f)))
                  (ssa-block-instrs block)))
      blocks)
     (for-each-index
@@ -1467,17 +1522,15 @@
 ;; entry? marks the program's entry procedure: what it stores in hoisted quote
 ;; cells is recorded for the procedures processed after it.
 (define (sccp-ssa ssa . options)
-  (run-sccp ssa
-            (if (and (pair? options) (car options)) (car options) remove-dead-allocation)
-            (and (pair? options) (pair? (cdr options)) (cadr options))
-            #f #f))
+  (match-let (((remove-allocation? entry? . _) (append options '(#f #f))))
+    (run-sccp ssa (or remove-allocation? remove-dead-allocation) entry? #f #f)))
 
 ;; name: the procedure's label when its parameters have interprocedural seeds;
 ;; pis-done?: insert-pis! and the quote cells were handled by sccp-program.
 (define (run-sccp ssa remove-allocation? entry? name pis-done?)
   (let* ((ssa (if pis-done? ssa (thread-constant-branches-ssa ssa)))
          (blocks (ssa-proc-blocks ssa)))
-    (unless pis-done? (insert-pis! blocks))
+    (unless pis-done? (insert-pis! blocks #t))
     (when (and entry? (not pis-done?))
       (reset-quote-cells!)
       (harvest-quote-cells! (analyze ssa) blocks))
@@ -1519,20 +1572,14 @@
 
 ;; counts for car, cdr, cons, pair?, null? (unsafe accessors count as car/cdr)
 (define (count-ops blocks)
-  (let ((counts (map (lambda (op) (cons op 0)) stat-ops)))
-    (for-each-index
-     (lambda (b block)
-       (for-each
-        (lambda (instr)
-          (let ((rhs (instr-rhs instr)))
-            (when (primop-rhs? rhs)
-              (let* ((op (cadr rhs))
-                     (op (or (accessor-kind op) op))
-                     (entry (assq op counts)))
-                (when entry (set-cdr! entry (+ 1 (cdr entry))))))))
-        (ssa-block-instrs block)))
-     blocks)
-    (map cdr counts)))
+  (define (instr-op instr)
+    (match (instr-rhs instr)
+      (('primop op . _) (or (accessor-kind op) op))
+      (_ #f)))
+  (let ((ops (append-map (lambda (block) (filter-map instr-op (ssa-block-instrs block)))
+                         (vector->list blocks))))
+    (map (lambda (op) (length (filter (lambda (o) (eq? o op)) ops)))
+         stat-ops)))
 
 (define (report-stats name analysis before after jiffies)
   (let ((unknowns 0) (consts 0) (pairs 0) (structs 0))
@@ -1566,13 +1613,13 @@
 ;; order of specs.
 (define (sccp-program entry-cfg specs closed)
   (let* ((entry-ssa (thread-constant-branches-ssa (check-ssa (cfg->ssa '() entry-cfg))))
-         (ssas (map (lambda (spec)
-                      (thread-constant-branches-ssa
-                       (check-ssa (cfg->ssa (cadr spec) (caddr spec)))))
+         (ssas (map (match-lambda
+                      ((_ params cfg)
+                       (thread-constant-branches-ssa (check-ssa (cfg->ssa params cfg)))))
                     specs))
-         (names (map car specs)))
+         (names (map (match-lambda ((name _ _) name)) specs)))
     (ipa-reset! closed names)
-    (for-each (lambda (ssa) (insert-pis! (ssa-proc-blocks ssa))) (cons entry-ssa ssas))
+    (for-each (lambda (ssa) (insert-pis! (ssa-proc-blocks ssa) #t)) (cons entry-ssa ssas))
     (reset-quote-cells!)
     ;; the quote cells are written first and do not depend on any call result
     (harvest-quote-cells! (analyze entry-ssa) (ssa-proc-blocks entry-ssa))
@@ -1597,9 +1644,8 @@
               (map (lambda (out) (ssa->cfg (check-ssa out))) outs)))))
 
 (define (sccp-cfg params cfg . maybe-entry?)
-  (ssa->cfg (check-ssa (sccp-ssa (check-ssa (cfg->ssa params cfg))
-                                 #f
-                                 (and (pair? maybe-entry?) (car maybe-entry?))))))
+  (let ((entry? (match maybe-entry? ((entry?) entry?) (() #f))))
+    (ssa->cfg (check-ssa (sccp-ssa (check-ssa (cfg->ssa params cfg)) #f entry?)))))
 
 ;; The control for measurements: the same SSA round trip and cleanup (pi nodes,
 ;; copy propagation, dead definition removal) with the analysis switched off,
