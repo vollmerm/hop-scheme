@@ -53,6 +53,7 @@
           (hop match)
           (hop utils)
           (hop pass cfg)
+          (hop ir)
           (hop pass ssa))
   (begin
 
@@ -711,19 +712,11 @@
   (set! sroa-count (+ sroa-count 1))
   (string->symbol (string-append "sr." (number->string sroa-count) "~1")))
 
-(define terminator-forms
-  '(if goto return tail-call direct-tail-call tail-apply-call tail-callcc-call))
-
-(define (terminator-instr? instr)
-  (match instr
-    ((head . _) (and (memq head terminator-forms) #t))
-    (_ #f)))
-
 (define (append-before-terminator! block instr)
   (let ((instrs (ssa-block-instrs block)))
     (set-ssa-block-instrs!
      block
-     (if (and (pair? instrs) (terminator-instr? (last instrs)))
+     (if (and (pair? instrs) (terminator? (last instrs)))
          (append (drop-right instrs 1) (list instr (last instrs)))
          (append instrs (list instr))))))
 

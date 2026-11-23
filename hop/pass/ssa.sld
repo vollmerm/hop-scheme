@@ -39,9 +39,6 @@
           set-ssa-block-phis!
           set-ssa-block-succs!
           set-ssa-block-preds!
-          map-instr-uses
-          instr-uses
-          instr-def
           immediate-dominators
           dominator-children
           ssa-proc?
@@ -63,6 +60,7 @@
                 last list-index reduce)
           (srfi 69)
           (hop match)
+          (hop ir)
           (hop utils)
           (hop pass cfg))
   (begin
@@ -118,75 +116,6 @@
     (lambda ()
       (set! count (+ count 1))
       (symbol-append prefix (number->string count)))))
-
-;;; --- Instruction operands ---
-;;; The positions of each TAC instruction that hold variable references, as
-;;; opposed to labels, procedure names, arities, and literals.
-
-(define terminator-heads
-  '(if goto return tail-call direct-tail-call tail-apply-call tail-callcc-call))
-
-(define (terminator? instr)
-  (match instr
-    ((head . _) (and (memq head terminator-heads) #t))
-    (_ #f)))
-
-(define (map-operand f operand)
-  (if (symbol? operand) (f operand) operand))
-
-(define (map-operands f operands)
-  (map (lambda (operand) (map-operand f operand)) operands))
-
-(define (map-rhs-uses f rhs)
-  (match rhs
-    ((? symbol?) (f rhs))
-    ((not (? pair?)) rhs)
-    (((or 'quote 'global) . _) rhs)
-    (('primop op . args)
-     `(primop ,op ,@(map-operands f args)))
-    (((and head (or 'cons 'box 'unbox 'car 'cdr 'pair? 'null?
-                    'closure-call 'apply-call 'callcc-call))
-      . args)
-     `(,head ,@(map-operands f args)))
-    (('closure-env-ref env . slots)
-     `(closure-env-ref ,(map-operand f env) ,@slots))
-    (('pi kind x)
-     `(pi ,kind ,(map-operand f x)))
-    (('pi-field which x field)
-     `(pi-field ,which ,(map-operand f x) ,(map-operand f field)))
-    (((and head (or 'make-closure 'make-variadic-closure)) label arity . captured)
-     `(,head ,label ,arity ,@(map-operands f captured)))
-    (('direct-call label . args)
-     `(direct-call ,label ,@(map-operands f args)))
-    (_ (error "SSA: unknown assignment right-hand side" rhs))))
-
-;; Rebuilds instr with f applied to each variable it reads.
-(define (map-instr-uses f instr)
-  (match instr
-    (('assign dst rhs)
-     `(assign ,dst ,(map-rhs-uses f rhs)))
-    (('if test then-label else-label)
-     `(if ,(map-operand f test) ,then-label ,else-label))
-    (((or 'goto 'label) . _)
-     instr)
-    (((and head (or 'return 'set-box! 'tail-call 'tail-apply-call 'tail-callcc-call))
-      . args)
-     `(,head ,@(map-operands f args)))
-    (('direct-tail-call label . args)
-     `(direct-tail-call ,label ,@(map-operands f args)))
-    (('set-global! name . args)
-     `(set-global! ,name ,@(map-operands f args)))
-    (_ (error "SSA: unknown TAC instruction" instr))))
-
-(define (instr-uses instr)
-  (let ((uses '()))
-    (map-instr-uses (lambda (var) (set! uses (cons var uses)) var) instr)
-    (reverse uses)))
-
-(define (instr-def instr)
-  (match instr
-    (('assign dst _) dst)
-    (_ #f)))
 
 ;;; --- Building blocks from a CFG ---
 

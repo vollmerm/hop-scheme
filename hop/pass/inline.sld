@@ -24,6 +24,7 @@
           (srfi 69)
           (hop utils)
           (hop pass tac)
+          (hop ir)
           (hop pass ssa))
   (begin
 
@@ -86,14 +87,7 @@
                       ((eq? (car instr) 'label) (note! labels (cadr instr)))))
               callee-instrs)
     (define (rename instr)
-      (case (car instr)
-        ((label) `(label ,(label (cadr instr))))
-        ((goto) `(goto ,(label (cadr instr))))
-        ((if) `(if ,(var (cadr instr)) ,(label (caddr instr)) ,(label (cadddr instr))))
-        ((assign)
-         (let ((renamed-uses (map-instr-uses var instr)))
-           `(assign ,(var (cadr instr)) ,(caddr renamed-uses))))
-        (else (map-instr-uses var instr))))
+      (map-operands tac-instruction instr var var label))
     (define (as-call instr)
       ;; The ordinary-call form of a tail call, assigned to result.
       (let ((call (rename instr)))

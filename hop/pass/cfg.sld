@@ -15,6 +15,7 @@
           (hop compat)
           (scheme cxr)
           (srfi 69)
+          (hop ir)
           (hop utils))
   (begin
 
@@ -26,10 +27,6 @@
   (successors basic-block-successors set-basic-block-successors!))
 
 (define (build-cfg tac-instrs)
-  (define (terminator? instr)
-    (and (pair? instr)
-         (memq (car instr) '(if goto return tail-call direct-tail-call tail-apply-call tail-callcc-call))))
-
   (define (is-leader? index instrs)
     (let ((instr (list-ref instrs index)))
       (or (= index 0)
