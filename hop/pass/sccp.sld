@@ -1,32 +1,36 @@
 (define-library (hop pass sccp)
-  ;;; Pass 5.5: sparse conditional propagation over SSA (the k=0 baseline)
+  ;;; Pass 5.5: the cons analysis, sparse conditional propagation over SSA
   ;;;
-  ;;; Wegman-Zadeck propagation of a small lattice over the SSA form of one
-  ;;; procedure (see (hop pass ssa)):
-  ;;;
-  ;;;   bot       not computed yet (the block or definition is unreachable)
-  ;;;   (const c) the literal c; '() is (const ()), a quoted symbol is a const
-  ;;;   pair      known to be a cons cell, contents unknown
-  ;;;   list      a proper list: '() or a pair whose cdr is a list
-  ;;;   unknown   anything
+  ;;; Wegman-Zadeck propagation over the SSA form of one procedure (see
+  ;;; (hop pass ssa)), or over all the procedures of a unit with sccp-program.
+  ;;; The lattice (see "Lattice" below) describes constants, proper lists, and
+  ;;; pairs whose car and cdr are described in turn, to a depth bound k.
   ;;;
   ;;; Values flow along executable edges only, so a branch on a known value
   ;;; makes the other arm dead and keeps its values out of joins.
   ;;;
-  ;;; Before the analysis, pi nodes record what a branch learned: at the head of
-  ;;; the then-arm of (if (pair? x) ...) or (if (null? x) ...) a fresh name for
-  ;;; x is bound by (pi pair x) or (pi null x), and uses of x dominated by that
-  ;;; arm read the fresh name; the else-arm gets (pi non-pair x) or
-  ;;; (pi non-null x), which turns a list into '() or a list pair. This only
-  ;;; applies to arms with a single predecessor, so the refinement is not lost
-  ;;; to a join. Likewise a car or
-  ;;; cdr of x that succeeds is followed by (pi car x a) or (pi cdr x a): x is
-  ;;; a pair whose car (cdr) is a, and a repeated accessor of x becomes a copy
-  ;;; of a. Pi nodes become plain copies afterwards.
+  ;;; Before the analysis, refinement nodes record what is known about a
+  ;;; variable x at a point in the program:
+  ;;;
+  ;;;   (pi kind x)           at the head of an arm of (if (pair? x) ...) or
+  ;;;                         (if (null? x) ...); kind is pair or non-pair,
+  ;;;                         null or non-null. On a list, non-pair gives '()
+  ;;;                         and non-null gives a list pair. Only arms with a
+  ;;;                         single predecessor get one, so the refinement is
+  ;;;                         not lost to a join.
+  ;;;   (pi-field which x a)  after (assign a (primop car x)) succeeds (or the
+  ;;;                         cdr equivalent, with which = cdr): x is a pair
+  ;;;                         whose car is a. A repeated accessor of x becomes
+  ;;;                         a copy of a.
+  ;;;
+  ;;; Each one binds a fresh name for x, and the uses of x it dominates read
+  ;;; that name. After the analysis they become plain copies of x.
   ;;;
   ;;; The rewrite replaces constant definitions with literals, makes car/cdr of
-  ;;; a known pair unsafe, turns decided branches into jumps, drops dead edges
-  ;;; and blocks, and removes definitions nobody reads.
+  ;;; a known pair unsafe or a copy of a known component, turns decided
+  ;;; branches into jumps, drops dead edges and blocks, and removes definitions
+  ;;; nobody reads. Scalar replacement can then split a loop-carried pair into
+  ;;; its fields.
   (export sccp-cfg
           sccp-ssa
           sccp-program
@@ -46,6 +50,7 @@
           (scheme time)
           (scheme write)
           (srfi 69)
+          (hop match)
           (hop utils)
           (hop pass cfg)
           (hop pass ssa))
@@ -366,7 +371,7 @@
 
 ;; After (assign a (primop car x)) succeeds, x is a pair whose car is a (a
 ;; failed accessor does not return). The instruction is followed by
-;; (assign x' (pi car x a)), and the uses of x it dominates read x': the rest
+;; (assign x' (pi-field car x a)), and the uses of x it dominates read x': the rest
 ;; of the block, the blocks it dominates, and phi arguments on edges leaving
 ;; the block. A later (cdr x') is then unsafe.
 ;;
@@ -420,7 +425,7 @@
                            (hash-table-set! roots fresh subject)
                            (rename! subject fresh)
                            (loop (cdr instrs)
-                                 (cons `(assign ,fresh (pi ,which ,subject ,dst))
+                                 (cons `(assign ,fresh (pi-field ,which ,subject ,dst))
                                        (cons instr acc)))))))
                   ((and dst (symbol? rhs))
                    (hash-table-set! roots dst rhs)
@@ -634,8 +639,8 @@
           (else unknown)))
    (else unknown)))
 
-;; (pi car x a) or (pi cdr x a): x is a pair whose car (or cdr) is a, with
-;; value av. A non-pair x would have stopped the accessor, so nothing flows.
+;; (pi-field car x a) or (pi-field cdr x a): x is a pair whose car (or cdr)
+;; is a, with value av. A non-pair x would have stopped the accessor, so nothing flows.
 (define (eval-accessor-pi which v name av)
   (if (or (bot? v) (bot? av) (const? v))
       bot
@@ -1108,7 +1113,7 @@
         (hash-table-ref/default quote-cell-values (cadr rhs) unknown))
        ((and ipa-active (pair? rhs) (eq? (car rhs) 'direct-call))
         (hash-table-ref/default ipa-returns (cadr rhs) unknown))
-       ((and (pair? rhs) (eq? (car rhs) 'pi) (pair? (cdddr rhs)))
+       ((and (pair? rhs) (eq? (car rhs) 'pi-field))
         (eval-accessor-pi (cadr rhs) (value-of (caddr rhs))
                           (cadddr rhs) (value-of (cadddr rhs))))
        ((and (pair? rhs) (eq? (car rhs) 'pi))
@@ -1235,14 +1240,21 @@
 
 ;;; --- Rewriting ---
 
+;; x when rhs is a refinement node (pi kind x) or (pi-field which x a).
+(define (refinement-subject rhs)
+  (match rhs
+    (('pi _ subject) subject)
+    (('pi-field _ subject _) subject)
+    (_ #f)))
+
 (define (rewrite-instr analysis instr)
   (define (value-of var) (analysis-value analysis var))
   (case (car instr)
     ((assign)
      (let ((dst (cadr instr)) (rhs (caddr instr)))
        (cond
-        ((and (pair? rhs) (eq? (car rhs) 'pi))
-         `(assign ,dst ,(caddr rhs)))
+        ((refinement-subject rhs)
+         => (lambda (subject) `(assign ,dst ,subject)))
         ((literal-expr? rhs) instr)
         ((and (const? (value-of dst))
               (or (symbol? rhs)
@@ -1340,7 +1352,7 @@
    ((not (pair? rhs)) #f)
    (else
     (case (car rhs)
-      ((pi global closure-env-ref unbox) #t)
+      ((pi pi-field global closure-env-ref unbox) #t)
       ((primop)
        (or (and (memq (cadr rhs) pure-primops) #t)
            (and remove-allocation? (eq? (cadr rhs) 'cons))))
@@ -1600,10 +1612,10 @@
        (set-ssa-block-instrs!
         block
         (map (lambda (instr)
-               (let ((rhs (instr-rhs instr)))
-                 (if (and (pair? rhs) (eq? (car rhs) 'pi))
-                     `(assign ,(cadr instr) ,(caddr rhs))
-                     instr)))
+               (match instr
+                 (('assign dst (= refinement-subject (? symbol? subject)))
+                  `(assign ,dst ,subject))
+                 (_ instr)))
              (ssa-block-instrs block))))
      blocks)
     (propagate-copies! blocks)
