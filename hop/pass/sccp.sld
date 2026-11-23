@@ -493,37 +493,47 @@
 (define cons-table (make-hash-table))
 (define (value-table-size) node-count)
 
+(define-record-type <const-value>
+  (make-const-value literal id)
+  const?
+  (literal const-value)
+  (id const-id))
+
+;; A pair whose car and cdr are described by values. car-name and cdr-name are
+;; SSA names known to hold the components, or #f. depth is the nesting depth
+;; of cons values below and including this one.
+(define-record-type <cons-value>
+  (make-cons-node car car-name cdr cdr-name depth id)
+  cons?
+  (car cons-car)
+  (car-name cons-car-name)
+  (cdr cons-cdr)
+  (cdr-name cons-cdr-name)
+  (depth cons-depth)
+  (id cons-id))
+
 (define (const c)
   (or (hash-table-ref/default const-table c #f)
-      (let ((node (vector 'const c (next-id!))))
+      (let ((node (make-const-value c (next-id!))))
         (hash-table-set! const-table c node)
         node)))
-(define (const? v) (and (vector? v) (eq? (vector-ref v 0) 'const)))
-(define (const-value v) (vector-ref v 1))
 (define nil-value (const '()))
 (define (nil? v) (and (const? v) (null? (const-value v))))
 
-;; #(cons car car-name cdr cdr-name depth id)
-(define (cons? v) (and (vector? v) (eq? (vector-ref v 0) 'cons)))
-(define (cons-car v) (vector-ref v 1))
-(define (cons-car-name v) (vector-ref v 2))
-(define (cons-cdr v) (vector-ref v 3))
-(define (cons-cdr-name v) (vector-ref v 4))
-(define (cons-depth v) (vector-ref v 5))
 (define (value-depth v) (if (cons? v) (cons-depth v) 0))
 (define (value-id v)
   (cond ((eq? v unknown) 0)
         ((eq? v bot) -1)
         ((eq? v list-value) -2)
-        ((const? v) (vector-ref v 2))
-        (else (vector-ref v 6))))
+        ((const? v) (const-id v))
+        (else (cons-id v))))
 
 (define (make-cons-value a an d dn)
   (let ((key (list (value-id a) an (value-id d) dn)))
     (or (hash-table-ref/default cons-table key #f)
-        (let ((node (vector 'cons a an d dn
-                            (+ 1 (max (value-depth a) (value-depth d)))
-                            (next-id!))))
+        (let ((node (make-cons-node a an d dn
+                                    (+ 1 (max (value-depth a) (value-depth d)))
+                                    (next-id!))))
           (hash-table-set! cons-table key node)
           node))))
 
