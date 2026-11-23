@@ -57,12 +57,12 @@
           display-ssa)
   (import (scheme base)
           (hop compat)
-          (scheme cxr)
           (scheme write)
           (only (srfi 1)
                 delete-duplicates drop-right filter-map find fold iota
                 last list-index reduce)
           (srfi 69)
+          (hop match)
           (hop utils)
           (hop pass cfg))
   (begin
@@ -127,7 +127,9 @@
   '(if goto return tail-call direct-tail-call tail-apply-call tail-callcc-call))
 
 (define (terminator? instr)
-  (and (pair? instr) (memq (car instr) terminator-heads) #t))
+  (match instr
+    ((head . _) (and (memq head terminator-heads) #t))
+    (_ #f)))
 
 (define (map-operand f operand)
   (if (symbol? operand) (f operand) operand))
@@ -136,42 +138,43 @@
   (map (lambda (operand) (map-operand f operand)) operands))
 
 (define (map-rhs-uses f rhs)
-  (cond
-   ((symbol? rhs) (f rhs))
-   ((not (pair? rhs)) rhs)
-   (else
-    (case (car rhs)
-      ((quote global) rhs)
-      ((primop)
-       `(primop ,(cadr rhs) ,@(map-operands f (cddr rhs))))
-      ((cons box unbox car cdr pair? null? closure-call apply-call callcc-call)
-       `(,(car rhs) ,@(map-operands f (cdr rhs))))
-      ((closure-env-ref)
-       `(closure-env-ref ,(map-operand f (cadr rhs)) ,@(cddr rhs)))
-      ((pi)
-       `(pi ,(cadr rhs) ,@(map-operands f (cddr rhs))))
-      ((make-closure make-variadic-closure)
-       `(,(car rhs) ,(cadr rhs) ,(caddr rhs) ,@(map-operands f (cdddr rhs))))
-      ((direct-call)
-       `(direct-call ,(cadr rhs) ,@(map-operands f (cddr rhs))))
-      (else (error "SSA: unknown assignment right-hand side" rhs))))))
+  (match rhs
+    ((? symbol?) (f rhs))
+    ((not (? pair?)) rhs)
+    (((or 'quote 'global) . _) rhs)
+    (('primop op . args)
+     `(primop ,op ,@(map-operands f args)))
+    (((and head (or 'cons 'box 'unbox 'car 'cdr 'pair? 'null?
+                    'closure-call 'apply-call 'callcc-call))
+      . args)
+     `(,head ,@(map-operands f args)))
+    (('closure-env-ref env . slots)
+     `(closure-env-ref ,(map-operand f env) ,@slots))
+    (('pi kind . args)
+     `(pi ,kind ,@(map-operands f args)))
+    (((and head (or 'make-closure 'make-variadic-closure)) label arity . captured)
+     `(,head ,label ,arity ,@(map-operands f captured)))
+    (('direct-call label . args)
+     `(direct-call ,label ,@(map-operands f args)))
+    (_ (error "SSA: unknown assignment right-hand side" rhs))))
 
 ;; Rebuilds instr with f applied to each variable it reads.
 (define (map-instr-uses f instr)
-  (case (car instr)
-    ((assign)
-     `(assign ,(cadr instr) ,(map-rhs-uses f (caddr instr))))
-    ((if)
-     `(if ,(map-operand f (cadr instr)) ,(caddr instr) ,(cadddr instr)))
-    ((goto label)
+  (match instr
+    (('assign dst rhs)
+     `(assign ,dst ,(map-rhs-uses f rhs)))
+    (('if test then-label else-label)
+     `(if ,(map-operand f test) ,then-label ,else-label))
+    (((or 'goto 'label) . _)
      instr)
-    ((return set-box! tail-call tail-apply-call tail-callcc-call)
-     `(,(car instr) ,@(map-operands f (cdr instr))))
-    ((direct-tail-call)
-     `(direct-tail-call ,(cadr instr) ,@(map-operands f (cddr instr))))
-    ((set-global!)
-     `(set-global! ,(cadr instr) ,@(map-operands f (cddr instr))))
-    (else (error "SSA: unknown TAC instruction" instr))))
+    (((and head (or 'return 'set-box! 'tail-call 'tail-apply-call 'tail-callcc-call))
+      . args)
+     `(,head ,@(map-operands f args)))
+    (('direct-tail-call label . args)
+     `(direct-tail-call ,label ,@(map-operands f args)))
+    (('set-global! name . args)
+     `(set-global! ,name ,@(map-operands f args)))
+    (_ (error "SSA: unknown TAC instruction" instr))))
 
 (define (instr-uses instr)
   (let ((uses '()))
@@ -179,16 +182,16 @@
     (reverse uses)))
 
 (define (instr-def instr)
-  (and (eq? (car instr) 'assign) (cadr instr)))
+  (match instr
+    (('assign dst _) dst)
+    (_ #f)))
 
 ;;; --- Building blocks from a CFG ---
 
 (define (strip-label instrs)
-  (if (and (pair? instrs)
-           (pair? (car instrs))
-           (eq? (car (car instrs)) 'label))
-      (cdr instrs)
-      instrs))
+  (match instrs
+    ((('label . _) . rest) rest)
+    (_ instrs)))
 
 ;; The blocks reachable from block 0, renumbered, as <ssa-block>s with no phis
 ;; or predecessors yet.
@@ -348,13 +351,15 @@
     (for-each-block
      (lambda (b block)
        (let scan ((instrs (ssa-block-instrs block)) (defined '()))
-         (unless (null? instrs)
-           (for-each (lambda (var)
-                       (unless (memq var defined)
-                         (hash-table-set! table var #t)))
-                     (instr-uses (car instrs)))
-           (let ((var (instr-def (car instrs))))
-             (scan (cdr instrs) (if var (cons var defined) defined))))))
+         (match instrs
+           (() #f)
+           ((instr . rest)
+            (for-each (lambda (var)
+                        (unless (memq var defined)
+                          (hash-table-set! table var #t)))
+                      (instr-uses instr))
+            (let ((var (instr-def instr)))
+              (scan rest (if var (cons var defined) defined)))))))
      blocks)
     table))
 
@@ -369,13 +374,15 @@
 ;; defining blocks.
 (define (place-phis! blocks frontier var def-blocks)
   (let place ((work def-blocks) (has-phi '()))
-    (unless (null? work)
-      (let ((new-blocks (filter (lambda (d) (not (memv d has-phi)))
-                                (vector-ref frontier (car work)))))
-        (for-each (lambda (d) (add-phi! (vector-ref blocks d) var)) new-blocks)
-        (place (append (cdr work)
-                       (filter (lambda (d) (not (memv d def-blocks))) new-blocks))
-               (append new-blocks has-phi))))))
+    (match work
+      (() #f)
+      ((b . rest)
+       (let ((new-blocks (filter (lambda (d) (not (memv d has-phi)))
+                                 (vector-ref frontier b))))
+         (for-each (lambda (d) (add-phi! (vector-ref blocks d) var)) new-blocks)
+         (place (append rest
+                        (filter (lambda (d) (not (memv d def-blocks))) new-blocks))
+                (append new-blocks has-phi)))))))
 
 (define (insert-phis! blocks frontier param-names)
   (let ((cross-block (variables-live-across-blocks blocks)))
@@ -397,12 +404,14 @@
   (let ((reaching (make-hash-table))   ; variable -> its current names, innermost first
         (versions (make-hash-table)))  ; variable -> number of names made so far
     (define (current var)
-      (let ((names (hash-table-ref/default reaching var '())))
-        (and (pair? names) (car names))))
+      (match (hash-table-ref/default reaching var '())
+        ((name . _) name)
+        (() #f)))
     (define (push! var name)
       (hash-table-set! reaching var (cons name (hash-table-ref/default reaching var '()))))
     (define (pop! var)
-      (hash-table-set! reaching var (cdr (hash-table-ref reaching var))))
+      (match (hash-table-ref reaching var)
+        ((_ . outer) (hash-table-set! reaching var outer))))
     (define (new-name! var)
       (let ((version (+ 1 (hash-table-ref/default versions var 0))))
         (hash-table-set! versions var version)
@@ -412,11 +421,9 @@
     (define (rename-use var)
       (or (current var) var))
     (define (rename-instr! instr)
-      (let ((renamed (map-instr-uses rename-use instr))
-            (var (instr-def instr)))
-        (if var
-            `(assign ,(new-name! var) ,(caddr renamed))
-            renamed)))
+      (match (map-instr-uses rename-use instr)
+        (('assign var rhs) `(assign ,(new-name! var) ,rhs))
+        (renamed renamed)))
     (define (fill-phi-args! pred-index target)
       (let ((slot (list-index (lambda (p) (= p pred-index)) (ssa-block-preds target))))
         (for-each (lambda (phi)
@@ -511,16 +518,17 @@
             (else (dominates? a (vector-ref idom b)))))
     ;; position is the index of the reading instruction in its block.
     (define (check-use! name b position)
-      (let ((site (hash-table-ref/default sites name #f)))
-        (cond
-         ((not site)
-          (report! "use of undefined name " name " in " (block-name b)))
-         ((= (car site) b)
-          (unless (< (cdr site) position)
-            (report! "use of " name " before its definition in " (block-name b))))
-         ((not (dominates? (car site) b))
-          (report! "definition of " name " does not dominate its use in "
-                   (block-name b))))))
+      (match (hash-table-ref/default sites name #f)
+        (#f
+         (report! "use of undefined name " name " in " (block-name b)))
+        ((def-block . def-position)
+         (cond
+          ((= def-block b)
+           (unless (< def-position position)
+             (report! "use of " name " before its definition in " (block-name b))))
+          ((not (dominates? def-block b))
+           (report! "definition of " name " does not dominate its use in "
+                    (block-name b)))))))
     (for-each-block
      (lambda (b block)
        ;; A phi argument is read at the end of its predecessor.
@@ -564,13 +572,12 @@
 
 ;; Rewrites the (if test then else) branch so its edge to old goes to new.
 (define (retarget-branch branch old new)
-  (let ((test (cadr branch))
-        (then-label (caddr branch))
-        (else-label (cadddr branch)))
-    (cond
-     ((eq? then-label old) `(if ,test ,new ,else-label))
-     ((eq? else-label old) `(if ,test ,then-label ,new))
-     (else (error "SSA: branch does not target the expected label" branch old)))))
+  (match branch
+    (('if test then-label else-label)
+     (cond
+      ((eq? then-label old) `(if ,test ,new ,else-label))
+      ((eq? else-label old) `(if ,test ,then-label ,new))
+      (else (error "SSA: branch does not target the expected label" branch old))))))
 
 ;; Routes the edge from block p into block b through a new block at index
 ;; new-index, and returns that block. Phi arguments in b stay lined up with
@@ -603,7 +610,7 @@
      (lambda (b block)
        (unless (null? (ssa-block-phis block))
          (for-each (lambda (p)
-                     (when (pair? (cdr (ssa-block-succs (vector-ref blocks p))))
+                     (when (> (length (ssa-block-succs (vector-ref blocks p))) 1)
                        (set! edge-blocks
                              (append edge-blocks
                                      (list (split-edge! blocks p b
