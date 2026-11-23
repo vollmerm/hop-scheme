@@ -3,10 +3,9 @@
 ;;; This code is by Alex Shinn and is in the public domain. It is the version
 ;;; distributed with Guile 3.0 (ice-9/match.upstream.scm), packaged here as an
 ;;; R7RS library so that Chicken and Guile run the same matcher. Changes from
-;;; that copy: a failed match calls R7RS `error`, malformed patterns are
-;;; reported with R7RS `syntax-error`, and record patterns ($ rec field ...)
-;;; are rejected at expansion time, since R7RS records have no portable
-;;; field-by-index access.
+;;; that copy: a failed match calls R7RS `error`, and record patterns
+;;; ($ rec field ...) are rejected at expansion time, since R7RS records have
+;;; no portable field-by-index access.
 ;;;
 ;;; Quick reference (see the upstream documentation for the full syntax):
 ;;;
@@ -30,7 +29,7 @@
   ;; as internal, so Chicken gets them as ordinary exports.
   (cond-expand
    (chicken
-    (export match-next match-one match-two match-quasiquote
+    (export match-syntax-error match-next match-one match-two match-quasiquote
             match-quasiquote-step match-drop-ids match-tuck-ids
             match-drop-first-arg match-gen-or match-gen-or-step
             match-gen-ellipsis match-verify-no-ellipsis match-gen-search
@@ -44,6 +43,12 @@
   (import (scheme base))
   (begin
 
+;; Has no rules, so any use stops expansion with an error that shows the
+;; form, message included. (Chicken compiles R7RS syntax-error as an
+;; ordinary call, which would only fail at run time.)
+(define-syntax match-syntax-error
+  (syntax-rules ()))
+
 ;; The basic interface.  MATCH just performs some basic syntax
 ;; validation, binds the match expression to a temporary variable `v',
 ;; and passes it on to MATCH-NEXT.  It's a constant throughout the
@@ -53,9 +58,9 @@
 (define-syntax match
   (syntax-rules ()
     ((match)
-     (syntax-error "missing match expression"))
+     (match-syntax-error "missing match expression"))
     ((match atom)
-     (syntax-error "no match clauses"))
+     (match-syntax-error "no match clauses"))
     ((match (app ...) (pat . body) ...)
      (let ((v (app ...)))
        (match-next v ((app ...) (set! (app ...))) (pat . body) ...)))
@@ -160,13 +165,13 @@
     ((match-two v (p *** q) g+s sk fk i)
      (match-extract-vars p (match-gen-search v p q g+s sk fk i) i ()))
     ((match-two v (p *** . q) g+s sk fk i)
-     (syntax-error "invalid use of ***" (p *** . q)))
+     (match-syntax-error "invalid use of ***" (p *** . q)))
     ((match-two v (p ..1) g+s sk fk i)
      (if (pair? v)
          (match-one v (p ___) g+s sk fk i)
          fk))
     ((match-two v ($ rec p ...) g+s sk fk i)
-     (syntax-error "record ($) patterns are not supported" ($ rec p ...)))
+     (match-syntax-error "record ($) patterns are not supported" ($ rec p ...)))
     ((match-two v (p . q) g+s sk fk i)
      (if (pair? v)
          (let ((w (car v)) (x (cdr v)))
@@ -366,13 +371,13 @@
     ((_ (x . y) sk)
      (match-check-ellipsis
       x
-      (syntax-error
+      (match-syntax-error
        "multiple ellipsis patterns not allowed at same level")
       (match-verify-no-ellipsis y sk)))
     ((_ () sk)
      sk)
     ((_ x sk)
-     (syntax-error "dotted tail not allowed after ellipsis" x))))
+     (match-syntax-error "dotted tail not allowed after ellipsis" x))))
 
 ;; To implement the tree search, we use two recursive procedures.  TRY
 ;; attempts to match Y once, and on success it calls the normal SK on
